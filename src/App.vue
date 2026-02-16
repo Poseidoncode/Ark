@@ -684,10 +684,10 @@ const handleClickOutside = (event: MouseEvent) => {
         </div>
       </div>
       <div class="flex items-center gap-3 text-sm">
-        <button v-if="repoInfo" @click="triggerCloneModal" class="px-4 py-2 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Clone</button>
-        <button v-if="repoInfo" @click="handleFetch" class="px-4 py-2 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Fetch</button>
-        <button @click="showSettingsModal = true" class="px-4 py-2 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Settings</button>
-        <button @click="toggleTheme" class="p-2 rounded-lg border border-border hover:bg-muted transition-safe text-lg" :title="settings?.theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'">
+        <button v-if="repoInfo" @click="triggerCloneModal" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Clone</button>
+        <button v-if="repoInfo" @click="handleFetch" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Fetch</button>
+        <button @click="showSettingsModal = true" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Settings</button>
+        <button @click="toggleTheme" class="h-9 w-9 flex items-center justify-center rounded-lg border border-border hover:bg-muted transition-safe text-lg" :title="settings?.theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'">
           {{ settings?.theme === 'dark' ? '🌙' : '☀️' }}
         </button>
       </div>
