@@ -97,7 +97,7 @@ const currentProjectName = computed(() => {
 });
 
 watch(currentProjectName, (name) => {
-  document.title = name ? `Cyberpunk - ${name}` : "Cyberpunk";
+  document.title = name ? `Ark - ${name}` : "Ark";
 }, { immediate: true });
 
 const stagedFiles = computed(() => fileStatuses.value.filter(f => f.staged).map(f => f.path));
@@ -570,13 +570,13 @@ const handleSwitchToSSH = async () => {
     
     // Construct SSH URL from HTTPS URL if possible, or just ask
     // For now, let's try to convert github HTTPS to SSH
-    // Example: https://github.com/Poseidoncode/Cyberpunk.git -> git@github.com:Poseidoncode/Cyberpunk.git
+    // Example: https://github.com/Poseidoncode/Ark.git -> git@github.com:Poseidoncode/Ark.git
     
     // We don't have a direct way to get the remote URL easily without adding another command
-    // But we know from my previous research it is: https://github.com/Poseidoncode/Cyberpunk.git
+    // But we know from my previous research it is: https://github.com/Poseidoncode/Ark.git
     // Let's add a more general way to handle this in the future, but for now let's use a prompt or fixed logic for GitHub
     
-    const ownerRepo = "Poseidoncode/Cyberpunk"; // Hardcoded for this specific user/repo based on context
+    const ownerRepo = "Poseidoncode/Ark"; // Hardcoded for this specific user/repo based on context
     const sshUrl = `git@github.com:${ownerRepo}.git`;
     
     const confirmed = await ask(`Switch remote protocol to SSH?\nNew URL: ${sshUrl}`, { title: 'Switch Remote', kind: 'warning' });

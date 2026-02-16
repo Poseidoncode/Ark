@@ -1,10 +1,10 @@
-# Cyberpunk Project Management Makefile
+# Ark Project Management Makefile
 
 .PHONY: help setup dev build dmg clean check format lint
 
 # 預設目標：顯示說明
 help:
-	@echo "Cyberpunk - Enterprise-Grade Git Terminal"
+	@echo "Ark - Enterprise-Grade Git Terminal"
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Targets:"
@@ -25,7 +25,7 @@ setup:
 
 # 啟動開發伺服器
 dev:
-	@echo "🚀 Starting Cyberpunk in dev mode..."
+	@echo "🚀 Starting Ark in dev mode..."
 	npm run tauri dev
 # 打包生產版本 (.app)
 build:
@@ -33,7 +33,7 @@ build:
 	npm run tauri build -- --ci
 
 # 打包 DMG 安裝映像
-APP_NAME := Cyberpunk
+APP_NAME := Ark
 APP_PATH := src-tauri/target/release/bundle/macos/$(APP_NAME).app
 DMG_PATH := src-tauri/target/release/bundle/dmg/$(APP_NAME).dmg
 
