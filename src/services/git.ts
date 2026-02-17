@@ -314,6 +314,9 @@ export const gitService = {
   /**
    * 取得遠端 url
    */
+  async getRemoteUrl(name: string = "origin"): Promise<string> {
+    return await invoke("get_remote_url", { name });
+  },
   /**
    * 取得目前已開啟的倉庫資訊（若有）
    */

@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, watch, computed } from 'vue';
 import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type Settings, type DiffInfo, type StageResult } from './services/git';
 import { open, ask, message } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
+import { homeDir } from '@tauri-apps/api/path';
 import DiffViewer from './components/DiffViewer.vue';
 
 const repoInfo = ref<RepositoryInfo | null>(null);
@@ -237,18 +238,16 @@ watch(selectedCommit, async (newCommit) => {
   }
 });
 
-watch(cloneUrl, (newUrl) => {
+watch(cloneUrl, async (newUrl) => {
   if (newUrl) {
     // Try to extract repo name from URL
-    // e.g. https://github.com/Poseidoncode/OpenWorld.git -> OpenWorld
+    // e.g. https://github.com/user/repo.git -> repo
     const match = newUrl.match(/\/([^\/]+?)(\.git)?$/);
     if (match && match[1]) {
       const repoName = match[1];
       
       // Default base path: Documents/github in user's home
-      // Since we don't have easy access to $HOME here without a backend call, 
-      // let's try to see if we can get it from repoInfo or just use a sensible default.
-      // Better yet, let's keep the existing logic but FALLBACK to a standard path if null.
+      // Dynamically get user's home directory instead of hardcoding
       let basePath = "";
       if (repoInfo.value) {
         basePath = repoInfo.value.path.substring(0, repoInfo.value.path.lastIndexOf('/'));
@@ -257,10 +256,15 @@ watch(cloneUrl, (newUrl) => {
         basePath = lastRepo.substring(0, lastRepo.lastIndexOf('/'));
       }
 
-      // If still no basePath or it doesn't look like a github dir, we could hardcode, 
-      // but the user's home is usually /Users/poseidomhung
+      // If still no basePath or it doesn't look like a github dir, use dynamic home path
       if (!basePath || !basePath.includes('github')) {
-        basePath = "/Users/poseidomhung/Documents/github";
+        try {
+          const home = await homeDir();
+          basePath = `${home}Documents/github`;
+        } catch {
+          // Fallback to empty - user will need to browse manually
+          basePath = "";
+        }
       }
       
       clonePath.value = `${basePath}/${repoName}`;
@@ -568,16 +572,42 @@ const handleSwitchToSSH = async () => {
     loading.value = true;
     error.value = null;
     
-    // Construct SSH URL from HTTPS URL if possible, or just ask
-    // For now, let's try to convert github HTTPS to SSH
-    // Example: https://github.com/Poseidoncode/Ark.git -> git@github.com:Poseidoncode/Ark.git
+    // Dynamically get the remote URL instead of hardcoding
+    const currentUrl = await gitService.getRemoteUrl("origin");
     
-    // We don't have a direct way to get the remote URL easily without adding another command
-    // But we know from my previous research it is: https://github.com/Poseidoncode/Ark.git
-    // Let's add a more general way to handle this in the future, but for now let's use a prompt or fixed logic for GitHub
+    if (!currentUrl) {
+      await message("No remote 'origin' found", { title: 'Error', kind: 'error' });
+      return;
+    }
     
-    const ownerRepo = "Poseidoncode/Ark"; // Hardcoded for this specific user/repo based on context
-    const sshUrl = `git@github.com:${ownerRepo}.git`;
+    // Parse the current URL to extract owner/repo
+    // Supports: https://github.com/owner/repo.git or git@github.com:owner/repo.git
+    let ownerRepo = "";
+    let sshUrl = "";
+    
+    if (currentUrl.startsWith("https://")) {
+      // HTTPS URL: extract owner/repo from path
+      const match = currentUrl.match(/github\.com\/([^\/]+\/[^\/]+)/);
+      if (match) {
+        ownerRepo = match[1].replace(/\.git$/, '');
+      }
+      sshUrl = `git@github.com:${ownerRepo}.git`;
+    } else if (currentUrl.startsWith("git@")) {
+      // Already SSH, nothing to do
+      await message("Remote is already using SSH protocol", { title: 'Info', kind: 'info' });
+      loading.value = false;
+      return;
+    } else {
+      await message("Unsupported remote URL format", { title: 'Error', kind: 'error' });
+      loading.value = false;
+      return;
+    }
+    
+    if (!ownerRepo) {
+      await message("Could not parse repository from remote URL", { title: 'Error', kind: 'error' });
+      loading.value = false;
+      return;
+    }
     
     const confirmed = await ask(`Switch remote protocol to SSH?\nNew URL: ${sshUrl}`, { title: 'Switch Remote', kind: 'warning' });
     if (confirmed) {
