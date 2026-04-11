@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
@@ -17,15 +20,20 @@
     "vue-virtual-scroller": "^2.0.0-beta.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@tailwindcss/postcss": "^4.1.18",
     "@tauri-apps/cli": "^2",
+    "@testing-library/vue": "^8.1.0",
     "@types/node": "^25.1.0",
     "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/test-utils": "^2.4.6",
     "autoprefixer": "^10.4.23",
+    "jsdom": "^29.0.2",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",
+    "vitest": "^4.1.4",
     "vue-tsc": "^2.1.10"
   }
 }

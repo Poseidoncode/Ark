@@ -61,10 +61,16 @@ pub struct Settings {
     pub user_name: String,
     pub user_email: String,
     pub ssh_key_path: Option<String>,
-    pub ssh_passphrase: Option<String>,
     pub theme: String,
     pub recent_repositories: Vec<String>,
     pub last_opened_repository: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SettingsPayload {
+    #[serde(flatten)]
+    pub settings: Settings,
+    pub ssh_passphrase: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

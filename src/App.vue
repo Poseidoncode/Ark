@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue';
-import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type Settings, type DiffInfo, type StageResult } from './services/git';
+import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type SettingsPayload, type DiffInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
 import Toast from './components/Toast.vue';
@@ -17,7 +17,7 @@ const branches = ref<BranchInfo[]>([]);
 const commits = ref<CommitInfo[]>([]);
 const stashes = ref<StashInfo[]>([]);
 const conflicts = ref<ConflictInfo[]>([]);
-const settings = ref<Settings | null>(null);
+const settings = ref<SettingsPayload | null>(null);
 const recentRepoInfos = ref<RepositoryInfo[]>([]);
 const diffs = ref<DiffInfo[]>([]);
 

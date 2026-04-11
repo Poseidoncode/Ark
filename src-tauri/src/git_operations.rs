@@ -1,5 +1,7 @@
 use git2::{BranchType, DiffOptions, Repository, Signature, StashFlags, StatusOptions};
-use std::path::Path;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::models::{
@@ -68,6 +70,38 @@ fn is_safe_git_arg(arg: &str) -> bool {
         && !arg.contains('\\')
 }
 
+fn shell_escape_single_quotes(value: &str) -> String {
+    value.replace('\'', "'\\''")
+}
+
+fn build_git_ssh_command(ssh_key_path: Option<&str>) -> Result<Option<String>, String> {
+    let Some(key) = ssh_key_path else {
+        return Ok(None);
+    };
+
+    if key.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let expanded_path = if key.starts_with("~/") {
+        let home =
+            std::env::var("HOME").map_err(|_| "Could not find HOME directory".to_string())?;
+        key.replacen("~", &home, 1)
+    } else {
+        key.to_string()
+    };
+
+    if !Path::new(&expanded_path).exists() {
+        return Err(format!("SSH key file does not exist: {}", expanded_path));
+    }
+
+    let escaped_path = shell_escape_single_quotes(&expanded_path);
+    Ok(Some(format!(
+        "ssh -i '{}' -o IdentitiesOnly=yes",
+        escaped_path
+    )))
+}
+
 pub fn clone_repository(
     url: &str,
     path: &str,
@@ -79,22 +113,8 @@ pub fn clone_repository(
     }
 
     let mut envs = Vec::new();
-    if let Some(key) = ssh_key_path {
-        if !key.trim().is_empty() {
-            let expanded_path = if key.starts_with("~/") {
-                let home = std::env::var("HOME")
-                    .map_err(|_| "Could not find HOME directory".to_string())?;
-                key.replacen("~", &home, 1)
-            } else {
-                key.to_string()
-            };
-            // Escape double quotes in path to prevent injection in GIT_SSH_COMMAND
-            let escaped_path = expanded_path.replace('"', "\\\"");
-            envs.push((
-                "GIT_SSH_COMMAND",
-                format!("ssh -i \"{}\" -o IdentitiesOnly=yes", escaped_path),
-            ));
-        }
+    if let Some(command) = build_git_ssh_command(ssh_key_path)? {
+        envs.push(("GIT_SSH_COMMAND", command));
     }
     run_git_command(vec!["clone", "--", url, path], None, envs)?;
     open_repository(path)
@@ -214,6 +234,103 @@ pub fn get_status(repo: &Repository) -> Result<Vec<FileStatus>, String> {
     Ok(file_statuses)
 }
 
+fn validate_repo_path(repo: &Repository, path: &str) -> Result<PathBuf, String> {
+    if path.is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+
+    if path.starts_with('/') || path.starts_with('\\') || Path::new(path).is_absolute() {
+        return Err("Absolute paths are not allowed".to_string());
+    }
+
+    let relative_path = Path::new(path);
+    if relative_path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("Path traversal is not allowed".to_string());
+    }
+
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve repository path: {}", e))?;
+    let full_path = workdir.join(relative_path);
+
+    let mut current = workdir.to_path_buf();
+    for component in relative_path.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(part) => {
+                current.push(part);
+
+                match fs::symlink_metadata(&current) {
+                    Ok(_) => {
+                        let canonical_path = current
+                            .canonicalize()
+                            .map_err(|e| format!("Failed to resolve path '{}': {}", path, e))?;
+
+                        if !canonical_path.starts_with(&canonical_workdir) {
+                            return Err(format!("Path '{}' resolves outside the repository", path));
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        let parent = current.parent().unwrap_or(workdir);
+                        let canonical_parent = parent.canonicalize().map_err(|e| {
+                            format!("Failed to resolve parent for '{}': {}", path, e)
+                        })?;
+
+                        if !canonical_parent.starts_with(&canonical_workdir) {
+                            return Err(format!("Path '{}' resolves outside the repository", path));
+                        }
+
+                        break;
+                    }
+                    Err(err) => {
+                        return Err(format!("Failed to inspect path '{}': {}", path, err));
+                    }
+                }
+            }
+            Component::ParentDir => return Err("Path traversal is not allowed".to_string()),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("Absolute paths are not allowed".to_string())
+            }
+        }
+    }
+
+    Ok(full_path)
+}
+
+fn validate_workdir_entries(repo: &Repository) -> Result<(), String> {
+    fn visit(repo: &Repository, root: &Path, dir: &Path) -> Result<(), String> {
+        for entry in fs::read_dir(dir).map_err(|e| format!("Failed to scan repository: {}", e))? {
+            let entry = entry.map_err(|e| format!("Failed to read repository entry: {}", e))?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| "Failed to normalize repository entry".to_string())?;
+
+            if relative == Path::new(".git") {
+                continue;
+            }
+
+            let relative_str = relative.to_string_lossy().replace('\\', "/");
+            validate_repo_path(repo, &relative_str)?;
+
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|e| format!("Failed to inspect repository entry: {}", e))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                visit(repo, root, &path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    visit(repo, workdir, workdir)
+}
+
 pub fn stage_files(repo: &Repository, paths: Vec<String>) -> Result<StageResult, String> {
     let mut index = repo
         .index()
@@ -224,15 +341,25 @@ pub fn stage_files(repo: &Repository, paths: Vec<String>) -> Result<StageResult,
     let mut warnings = Vec::new();
 
     for path in paths {
-        let full_path = workdir.join(&path);
+        let full_path = match validate_repo_path(repo, &path) {
+            Ok(full_path) => full_path,
+            Err(err) => {
+                warnings.push(format!("Skipped '{}': {}", path, err));
+                continue;
+            }
+        };
+        let relative_path = full_path
+            .strip_prefix(workdir)
+            .map_err(|_| format!("Validated path '{}' is outside the repository", path))?;
+
         if full_path.exists() {
-            match index.add_path(Path::new(&path)) {
+            match index.add_path(relative_path) {
                 Ok(_) => staged.push(path),
                 Err(e) => warnings.push(format!("Failed to stage '{}': {}", path, e)),
             }
         } else {
             // File was deleted externally — clean up index entry and record warning
-            let _ = index.remove_path(Path::new(&path));
+            let _ = index.remove_path(relative_path);
             warnings.push(format!(
                 "Skipped '{}': file not found (removed from index)",
                 path
@@ -248,16 +375,31 @@ pub fn stage_files(repo: &Repository, paths: Vec<String>) -> Result<StageResult,
 }
 
 pub fn unstage_files(repo: &Repository, paths: Vec<String>) -> Result<(), String> {
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let validated_paths = paths
+        .iter()
+        .map(|path| {
+            let full_path = validate_repo_path(repo, path)?;
+            let relative_path = full_path
+                .strip_prefix(workdir)
+                .map_err(|_| format!("Validated path '{}' is outside the repository", path))?;
+            Ok(relative_path.to_string_lossy().into_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     let head = repo.head().ok();
     let commit = head.and_then(|h| h.peel_to_commit().ok());
 
     if let Some(c) = commit {
         // Try bulk reset first; if it fails, fall back to per-file reset
         if repo
-            .reset_default(Some(c.as_object()), paths.iter().map(|s| s.as_str()))
+            .reset_default(
+                Some(c.as_object()),
+                validated_paths.iter().map(|s| s.as_str()),
+            )
             .is_err()
         {
-            for path in &paths {
+            for path in &validated_paths {
                 let _ = repo.reset_default(Some(c.as_object()), std::iter::once(path.as_str()));
             }
         }
@@ -266,7 +408,7 @@ pub fn unstage_files(repo: &Repository, paths: Vec<String>) -> Result<(), String
         let mut index = repo
             .index()
             .map_err(|e| format!("Failed to get index: {}", e))?;
-        for path in paths {
+        for path in validated_paths {
             index.remove_path(Path::new(&path)).ok();
         }
         index
@@ -420,19 +562,26 @@ pub fn revert_commit(repo: &Repository, sha: &str) -> Result<(), String> {
 }
 
 pub fn discard_changes(repo: &Repository, path: &str) -> Result<(), String> {
+    let workdir = repo.workdir().ok_or("No workdir")?;
+    let full_path = validate_repo_path(repo, path)?;
+    let relative_path = full_path
+        .strip_prefix(workdir)
+        .map_err(|_| format!("Validated path '{}' is outside the repository", path))?;
+
     let mut checkout_opts = git2::build::CheckoutBuilder::new();
-    checkout_opts.force().path(path);
+    checkout_opts.force().path(relative_path);
 
     // Attempt checkout from HEAD
     if repo.checkout_head(Some(&mut checkout_opts)).is_err() {
         // If checkout head fails (e.g. untracked file), try to remove it
-        let full_path = repo.workdir().ok_or("No workdir")?.join(path);
         if full_path.exists() {
-            if full_path.is_file() {
-                std::fs::remove_file(full_path)
-                    .map_err(|e| format!("Failed to delete file: {}", e))?;
-            } else if full_path.is_dir() {
-                std::fs::remove_dir_all(full_path)
+            let metadata = fs::symlink_metadata(&full_path)
+                .map_err(|e| format!("Failed to inspect path '{}': {}", path, e))?;
+
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(full_path).map_err(|e| format!("Failed to delete file: {}", e))?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(full_path)
                     .map_err(|e| format!("Failed to delete dir: {}", e))?;
             }
         }
@@ -442,6 +591,22 @@ pub fn discard_changes(repo: &Repository, path: &str) -> Result<(), String> {
 }
 
 pub fn discard_all_changes(repo: &Repository) -> Result<(), String> {
+    validate_workdir_entries(repo)?;
+
+    let mut status_opts = StatusOptions::new();
+    status_opts.include_untracked(true);
+    status_opts.recurse_untracked_dirs(true);
+
+    let statuses = repo
+        .statuses(Some(&mut status_opts))
+        .map_err(|e| format!("Failed to get status: {}", e))?;
+
+    for entry in statuses.iter() {
+        if let Some(path) = entry.path() {
+            validate_repo_path(repo, path)?;
+        }
+    }
+
     let _ = create_safety_ref(repo, "discard-all");
     let mut checkout_opts = git2::build::CheckoutBuilder::new();
     checkout_opts.force();
@@ -764,18 +929,8 @@ pub fn push_changes(
         .to_str()
         .ok_or("Invalid path")?;
     let mut envs = Vec::new();
-    if let Some(key) = ssh_key_path {
-        if !key.trim().is_empty() {
-            let expanded_path = if key.starts_with("~/") {
-                key.replacen("~", &std::env::var("HOME").unwrap_or_default(), 1)
-            } else {
-                key.to_string()
-            };
-            envs.push((
-                "GIT_SSH_COMMAND",
-                format!("ssh -i \"{}\" -o IdentitiesOnly=yes", expanded_path),
-            ));
-        }
+    if let Some(command) = build_git_ssh_command(ssh_key_path)? {
+        envs.push(("GIT_SSH_COMMAND", command));
     }
 
     run_git_command(vec!["push", "origin", "HEAD"], Some(path), envs)?;
@@ -793,18 +948,8 @@ pub fn pull_changes(
         .to_str()
         .ok_or("Invalid path")?;
     let mut envs = Vec::new();
-    if let Some(key) = ssh_key_path {
-        if !key.trim().is_empty() {
-            let expanded_path = if key.starts_with("~/") {
-                key.replacen("~", &std::env::var("HOME").unwrap_or_default(), 1)
-            } else {
-                key.to_string()
-            };
-            envs.push((
-                "GIT_SSH_COMMAND",
-                format!("ssh -i \"{}\" -o IdentitiesOnly=yes", expanded_path),
-            ));
-        }
+    if let Some(command) = build_git_ssh_command(ssh_key_path)? {
+        envs.push(("GIT_SSH_COMMAND", command));
     }
 
     let head = repo
@@ -896,14 +1041,79 @@ pub fn get_conflicts(repo: &Repository) -> Result<Vec<ConflictInfo>, String> {
     Ok(conflicts)
 }
 
-pub fn resolve_conflict(repo: &Repository, path: &str, _use_ours: bool) -> Result<(), String> {
+pub fn resolve_conflict(repo: &Repository, path: &str, use_ours: bool) -> Result<(), String> {
     let mut index = repo
         .index()
         .map_err(|e| format!("Failed to get index: {}", e))?;
 
+    let mut selected_blob_id = None;
+    let mut conflict_found = false;
+
+    for conflict in index
+        .conflicts()
+        .map_err(|e| format!("Failed to get conflicts: {}", e))?
+    {
+        let conflict = conflict.map_err(|e| format!("Conflict error: {}", e))?;
+        let conflict_path = conflict
+            .ancestor
+            .as_ref()
+            .or(conflict.our.as_ref())
+            .or(conflict.their.as_ref())
+            .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
+            .unwrap_or_default();
+
+        if conflict_path != path {
+            continue;
+        }
+
+        conflict_found = true;
+        selected_blob_id = if use_ours {
+            conflict.our.as_ref().map(|entry| entry.id)
+        } else {
+            conflict.their.as_ref().map(|entry| entry.id)
+        };
+        break;
+    }
+
+    if !conflict_found {
+        return Err(format!("Failed to resolve '{}': conflict not found", path));
+    }
+
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let file_path = workdir.join(path);
+
+    match selected_blob_id {
+        Some(blob_id) => {
+            let blob = repo
+                .find_blob(blob_id)
+                .map_err(|e| format!("Failed to read conflicted blob: {}", e))?;
+
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to prepare conflicted file path: {}", e))?;
+            }
+
+            fs::write(&file_path, blob.content())
+                .map_err(|e| format!("Failed to write resolved file: {}", e))?;
+        }
+        None => {
+            if file_path.exists() {
+                fs::remove_file(&file_path)
+                    .map_err(|e| format!("Failed to remove resolved file: {}", e))?;
+            }
+        }
+    }
+
     index
-        .add_path(Path::new(path))
-        .map_err(|e| format!("Failed to resolve: {}", e))?;
+        .remove_path(Path::new(path))
+        .map_err(|e| format!("Failed to clear conflict: {}", e))?;
+
+    if selected_blob_id.is_some() {
+        index
+            .add_path(Path::new(path))
+            .map_err(|e| format!("Failed to resolve: {}", e))?;
+    }
+
     index
         .write()
         .map_err(|e| format!("Failed to write index: {}", e))?;
@@ -926,18 +1136,8 @@ pub fn fetch_changes(
         .to_str()
         .ok_or("Invalid path")?;
     let mut envs = Vec::new();
-    if let Some(key) = ssh_key_path {
-        if !key.trim().is_empty() {
-            let expanded_path = if key.starts_with("~/") {
-                key.replacen("~", &std::env::var("HOME").unwrap_or_default(), 1)
-            } else {
-                key.to_string()
-            };
-            envs.push((
-                "GIT_SSH_COMMAND",
-                format!("ssh -i \"{}\" -o IdentitiesOnly=yes", expanded_path),
-            ));
-        }
+    if let Some(command) = build_git_ssh_command(ssh_key_path)? {
+        envs.push(("GIT_SSH_COMMAND", command));
     }
 
     run_git_command(vec!["fetch", "origin"], Some(path), envs)?;
@@ -961,20 +1161,708 @@ pub fn set_remote_url(repo: &Repository, name: &str, url: &str) -> Result<(), St
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     fn get_temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut path = std::env::temp_dir();
         path.push("tauri_git_test");
         path.push(format!(
-            "{}",
+            "{}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn configure_git_identity(path: &std::path::Path) {
+        run_git_command(
+            vec!["config", "user.name", "Test User"],
+            Some(path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        run_git_command(
+            vec!["config", "user.email", "test@example.com"],
+            Some(path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+    }
+
+    fn create_dummy_key(dir: &std::path::Path, file_name: &str) -> PathBuf {
+        let key_path = dir.join(file_name);
+        fs::write(&key_path, "dummy-private-key").unwrap();
+        key_path
+    }
+
+    fn init_bare_remote(path: &std::path::Path) {
+        run_git_command(vec!["init", "--bare"], Some(path.to_str().unwrap()), vec![]).unwrap();
+    }
+
+    fn init_working_repo(path: &std::path::Path) -> Repository {
+        let repo = Repository::init(path).unwrap();
+        configure_git_identity(path);
+        repo
+    }
+
+    fn commit_file(path: &std::path::Path, name: &str, contents: &str, message: &str) {
+        fs::write(path.join(name), contents).unwrap();
+        run_git_command(vec!["add", name], Some(path.to_str().unwrap()), vec![]).unwrap();
+        run_git_command(
+            vec!["commit", "-m", message],
+            Some(path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+    }
+
+    fn write_file(path: &Path, name: &str, contents: &str) {
+        fs::write(path.join(name), contents).unwrap();
+    }
+
+    fn append_file(path: &Path, name: &str, contents: &str) {
+        let target = path.join(name);
+        let existing = fs::read_to_string(&target).unwrap_or_default();
+        fs::write(target, format!("{existing}{contents}")).unwrap();
+    }
+
+    fn stage_all_changes(repo: &Repository) {
+        let paths = get_status(repo)
+            .unwrap()
+            .into_iter()
+            .map(|status| status.path)
+            .collect::<Vec<_>>();
+        let result = stage_files(repo, paths).unwrap();
+        assert!(
+            result.warnings.is_empty(),
+            "unexpected staging warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    fn current_branch_name(repo: &Repository) -> String {
+        repo.head().unwrap().shorthand().unwrap().to_string()
+    }
+
+    fn create_committed_repo() -> (PathBuf, Repository, String) {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+        commit_file(&root, "base.txt", "base\n", "Initial commit");
+        let branch = current_branch_name(&repo);
+        (root, repo, branch)
+    }
+
+    fn create_merge_conflict_repo() -> (PathBuf, Repository, String) {
+        let (root, repo, default_branch) = create_committed_repo();
+
+        run_git_command(
+            vec!["checkout", "-b", "feature/conflict"],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        write_file(&root, "base.txt", "feature version\n");
+        stage_all_changes(&repo);
+        create_commit(&repo, "Feature change").unwrap();
+
+        run_git_command(
+            vec!["checkout", &default_branch],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        write_file(&root, "base.txt", "main version\n");
+        stage_all_changes(&repo);
+        create_commit(&repo, "Main change").unwrap();
+
+        let merge_result = run_git_command(
+            vec!["merge", "feature/conflict"],
+            Some(root.to_str().unwrap()),
+            vec![],
+        );
+        assert!(merge_result.is_err(), "merge should produce a conflict");
+
+        drop(repo);
+        let conflicted_repo = Repository::open(&root).unwrap();
+
+        (root, conflicted_repo, default_branch)
+    }
+
+    #[test]
+    fn test_stage_files_rejects_path_traversal_outside_repository() {
+        let root = get_temp_dir();
+        let sandbox_root = root.join("sandbox");
+        let repo_path = sandbox_root.join("level1/level2/repo");
+        let escaped_dir = sandbox_root.join("etc");
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&escaped_dir).unwrap();
+        fs::write(escaped_dir.join("passwd"), "not-a-real-passwd").unwrap();
+
+        let repo = init_working_repo(&repo_path);
+        commit_file(&repo_path, "tracked.txt", "tracked", "Initial commit");
+
+        let result = stage_files(&repo, vec!["../../../etc/passwd".to_string()]).unwrap();
+
+        assert!(
+            result.staged.is_empty(),
+            "path traversal should not stage files outside the repository"
+        );
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("Path traversal is not allowed"),
+            "unexpected warning: {}",
+            result.warnings[0]
+        );
+
+        let statuses = get_status(&repo).unwrap();
+        assert!(!statuses.iter().any(|status| status.path.contains("passwd")));
+        assert_eq!(
+            fs::read_to_string(escaped_dir.join("passwd")).unwrap(),
+            "not-a-real-passwd"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_discard_changes_ignores_absolute_path_outside_repo() {
+        let root = get_temp_dir();
+        let repo_path = root.join("repo");
+        let outside_path = root.join("outside.txt");
+        let repo = init_working_repo(&repo_path);
+        commit_file(&repo_path, "tracked.txt", "tracked", "Initial commit");
+        fs::write(&outside_path, "top-secret").unwrap();
+
+        let err = discard_changes(&repo, outside_path.to_str().unwrap())
+            .expect_err("absolute paths outside the repository should be rejected");
+
+        assert!(
+            err.contains("Absolute paths are not allowed"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            outside_path.exists(),
+            "absolute paths should not delete files outside the repository"
+        );
+        assert_eq!(fs::read_to_string(&outside_path).unwrap(), "top-secret");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unstage_files_on_symlink_does_not_modify_symlink_target() {
+        let root = get_temp_dir();
+        let repo_path = root.join("repo");
+        let repo = init_working_repo(&repo_path);
+        commit_file(&repo_path, "tracked.txt", "tracked", "Initial commit");
+
+        let outside_target = root.join("secret.txt");
+        fs::write(&outside_target, "classified").unwrap();
+        let link_path = repo_path.join("linked-secret.txt");
+        symlink(&outside_target, &link_path).unwrap();
+
+        let stage_result = stage_files(&repo, vec!["linked-secret.txt".to_string()]).unwrap();
+        assert!(stage_result.staged.is_empty());
+        assert_eq!(stage_result.warnings.len(), 1);
+        assert!(
+            stage_result.warnings[0].contains("outside the repository"),
+            "unexpected warning: {}",
+            stage_result.warnings[0]
+        );
+
+        let err = unstage_files(&repo, vec!["linked-secret.txt".to_string()])
+            .expect_err("symlinks escaping the repository should be rejected");
+        assert!(
+            err.contains("outside the repository"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(fs::read_to_string(&outside_target).unwrap(), "classified");
+        assert!(
+            link_path.exists(),
+            "unstage should not remove the symlink itself"
+        );
+
+        let statuses = get_status(&repo).unwrap();
+        assert!(statuses
+            .iter()
+            .any(|status| status.path == "linked-secret.txt" && !status.staged));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stage_files_rejects_new_file_inside_symlinked_parent_outside_repo() {
+        let root = get_temp_dir();
+        let repo_path = root.join("repo");
+        let outside_dir = root.join("outside-dir");
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let repo = init_working_repo(&repo_path);
+        commit_file(&repo_path, "tracked.txt", "tracked", "Initial commit");
+
+        let linked_dir = repo_path.join("linked-dir");
+        symlink(&outside_dir, &linked_dir).unwrap();
+
+        let result = stage_files(&repo, vec!["linked-dir/new.txt".to_string()]).unwrap();
+
+        assert!(result.staged.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("outside the repository"),
+            "unexpected warning: {}",
+            result.warnings[0]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discard_all_changes_rejects_symlinked_untracked_path_outside_repo() {
+        let root = get_temp_dir();
+        let repo_path = root.join("repo");
+        let outside_target = root.join("outside.txt");
+        let repo = init_working_repo(&repo_path);
+        commit_file(&repo_path, "tracked.txt", "tracked", "Initial commit");
+        fs::write(&outside_target, "classified").unwrap();
+
+        symlink(&outside_target, repo_path.join("linked-secret.txt")).unwrap();
+
+        let err = discard_all_changes(&repo)
+            .expect_err("discard_all_changes should reject paths escaping the repository");
+
+        assert!(
+            err.contains("outside the repository"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read_to_string(&outside_target).unwrap(), "classified");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_is_safe_git_arg_blocks_common_injection_tokens() {
+        for value in [
+            "",
+            "-branch",
+            "feature branch",
+            "feature;branch",
+            "feature|branch",
+            "feature&&branch",
+            "feature`branch",
+            "feature$branch",
+            r"feature\\branch",
+        ] {
+            assert!(!is_safe_git_arg(value), "expected '{value}' to be rejected");
+        }
+    }
+
+    #[test]
+    fn test_is_safe_git_arg_allows_newlines_and_bidi_controls_currently() {
+        assert!(
+            is_safe_git_arg("feature\nname"),
+            "current validator unexpectedly started rejecting newlines"
+        );
+        assert!(
+            is_safe_git_arg("feature\u{202e}name"),
+            "current validator unexpectedly started rejecting bidi control characters"
+        );
+    }
+
+    #[test]
+    fn test_create_and_checkout_branch_reject_special_character_injection_attempts() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+        commit_file(&root, "tracked.txt", "tracked", "Initial commit");
+
+        for value in ["feature;rm", "feature|cat", "feature&&cat"] {
+            let create_err = create_branch(&repo, value, None).unwrap_err();
+            assert_eq!(create_err, "Invalid branch name");
+
+            let checkout_err = checkout_branch(&repo, value).unwrap_err();
+            assert_eq!(checkout_err, "Invalid branch name");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_clone_repository_rejects_url_injection_attempts() {
+        let root = get_temp_dir();
+        let clone_path = root.join("clone");
+
+        for url in [
+            "ssh://example.com/repo.git;touch-pwned",
+            "https://example.com/repo.git injected",
+            "--upload-pack=sh",
+        ] {
+            let err = match clone_repository(url, clone_path.to_str().unwrap(), None, None) {
+                Ok(_) => panic!("expected invalid clone URL to be rejected: {url}"),
+                Err(err) => err,
+            };
+            assert_eq!(err, "Invalid clone URL");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_create_commit_treats_injection_like_commit_messages_as_literal_text() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+        fs::write(root.join("tracked.txt"), "payload").unwrap();
+
+        let stage_result = stage_files(&repo, vec!["tracked.txt".to_string()]).unwrap();
+        assert_eq!(stage_result.staged, vec!["tracked.txt".to_string()]);
+
+        let message = "ship feature && touch /tmp/pwned ; echo nope";
+        create_commit(&repo, message).unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), message);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_create_branch_rejects_invalid_and_nonexistent_start_sha_values() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+        commit_file(&root, "tracked.txt", "tracked", "Initial commit");
+
+        let invalid_sha_err = create_branch(&repo, "from-invalid-sha", Some("not-a-sha"))
+            .expect_err("invalid SHA should be rejected");
+        assert!(
+            invalid_sha_err.to_lowercase().contains("oid")
+                || invalid_sha_err.to_lowercase().contains("invalid")
+                || invalid_sha_err.to_lowercase().contains("length")
+        );
+
+        let missing_sha = "0123456789012345678901234567890123456789";
+        let missing_sha_err = create_branch(&repo, "from-missing-sha", Some(missing_sha))
+            .expect_err("nonexistent SHA should be rejected");
+        assert!(missing_sha_err.contains("Commit not found"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_get_commit_diff_rejects_invalid_and_nonexistent_sha_values() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+        commit_file(&root, "tracked.txt", "tracked", "Initial commit");
+
+        let invalid_sha_err = get_commit_diff(&repo, "not-a-sha").unwrap_err();
+        assert!(
+            invalid_sha_err.to_lowercase().contains("oid")
+                || invalid_sha_err.to_lowercase().contains("invalid")
+                || invalid_sha_err.to_lowercase().contains("length")
+        );
+
+        let missing_sha = "0123456789012345678901234567890123456789";
+        let missing_sha_err = get_commit_diff(&repo, missing_sha).unwrap_err();
+        assert!(missing_sha_err.contains("Commit not found"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_create_branch_with_extremely_long_name_is_rejected() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+        commit_file(&root, "tracked.txt", "tracked", "Initial commit");
+
+        let long_name = format!("feature-{}", "a".repeat(512));
+        let err = create_branch(&repo, &long_name, None).unwrap_err();
+        assert!(
+            err == "Invalid branch name" || err.contains("Failed to create branch"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn set_bare_remote_head(path: &std::path::Path, branch_name: &str) {
+        run_git_command(
+            vec!["symbolic-ref", "HEAD", &format!("refs/heads/{branch_name}")],
+            Some(path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+    }
+
+    fn head_oid(repo: &Repository) -> git2::Oid {
+        repo.head().unwrap().target().unwrap()
+    }
+
+    fn safety_ref_names(repo: &Repository, action_name: &str) -> Vec<String> {
+        let pattern = format!("refs/safety/{action_name}/*");
+        let refs = repo.references_glob(&pattern).unwrap();
+        refs.filter_map(|reference| {
+            reference
+                .ok()
+                .and_then(|reference| reference.name().map(|name| name.to_string()))
+        })
+        .collect()
+    }
+
+    fn single_safety_ref_name(repo: &Repository, action_name: &str) -> String {
+        let refs = safety_ref_names(repo, action_name);
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly one safety ref for {action_name}"
+        );
+        refs[0].clone()
+    }
+
+    fn hard_reset_to_ref(repo: &Repository, ref_name: &str) {
+        let target = repo.revparse_single(ref_name).unwrap();
+        repo.reset(&target, git2::ResetType::Hard, None).unwrap();
+    }
+
+    fn assert_repo_is_clean(repo: &Repository) {
+        let statuses = repo.statuses(None).unwrap();
+        assert!(statuses.is_empty(), "repository should be clean");
+    }
+
+    #[test]
+    fn test_build_git_ssh_command_returns_none_for_missing_or_blank_key() {
+        assert_eq!(build_git_ssh_command(None).unwrap(), None);
+        assert_eq!(build_git_ssh_command(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn test_build_git_ssh_command_expands_home_and_shell_escapes_key_path() {
+        let _lock = env_lock().lock().unwrap();
+        let root = get_temp_dir();
+        let home_dir = root.join("home");
+        let ssh_dir = home_dir.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+
+        let key_name = "team member's key";
+        let key_path = create_dummy_key(&ssh_dir, key_name);
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home_dir);
+
+        let command = build_git_ssh_command(Some("~/.ssh/team member's key"))
+            .unwrap()
+            .expect("ssh command should be built");
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert!(command.starts_with("ssh -i '") && command.ends_with(" -o IdentitiesOnly=yes"));
+        assert!(command.contains(home_dir.to_string_lossy().as_ref()));
+        assert!(command.contains("team member"));
+        assert!(command.contains("'\\''s key"));
+        assert!(key_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_build_git_ssh_command_rejects_missing_key_file() {
+        let missing_key = get_temp_dir().join("missing-key");
+        let err = build_git_ssh_command(Some(missing_key.to_str().unwrap())).unwrap_err();
+        assert!(
+            err.contains("SSH key file does not exist"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(missing_key.parent().unwrap());
+    }
+
+    #[test]
+    fn test_clone_repository_rejects_missing_ssh_key_file() {
+        let root = get_temp_dir();
+        let origin_path = root.join("origin.git");
+        let clone_path = root.join("clone");
+        fs::create_dir_all(&origin_path).unwrap();
+        init_bare_remote(&origin_path);
+
+        let missing_key = root.join("missing-key");
+        let err = match clone_repository(
+            origin_path.to_str().unwrap(),
+            clone_path.to_str().unwrap(),
+            Some(missing_key.to_str().unwrap()),
+            Some("secret-passphrase"),
+        ) {
+            Ok(_) => panic!("clone_repository unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("SSH key file does not exist"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_clone_repository_supports_safe_ssh_key_path_for_local_transport() {
+        let root = get_temp_dir();
+        let seed_path = root.join("seed");
+        let origin_path = root.join("origin.git");
+        let clone_path = root.join("clone");
+        let key_path = create_dummy_key(&root, "enterprise team's key");
+
+        let seed_repo = init_working_repo(&seed_path);
+        commit_file(&seed_path, "README.md", "seed", "Initial commit");
+
+        fs::create_dir_all(&origin_path).unwrap();
+        init_bare_remote(&origin_path);
+        run_git_command(
+            vec!["remote", "add", "origin", origin_path.to_str().unwrap()],
+            Some(seed_path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        push_changes(
+            &seed_repo,
+            Some(key_path.to_str().unwrap()),
+            Some("ignored-passphrase"),
+        )
+        .unwrap();
+        let branch_name = seed_repo.head().unwrap().shorthand().unwrap().to_string();
+        set_bare_remote_head(&origin_path, &branch_name);
+
+        let clone_repo = clone_repository(
+            origin_path.to_str().unwrap(),
+            clone_path.to_str().unwrap(),
+            Some(key_path.to_str().unwrap()),
+            Some("ignored-passphrase"),
+        )
+        .unwrap();
+
+        let head = clone_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap().trim(), "Initial commit");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_push_and_fetch_changes_support_safe_ssh_key_path() {
+        let root = get_temp_dir();
+        let origin_path = root.join("origin.git");
+        let local_path = root.join("local");
+        let peer_path = root.join("peer");
+        let key_path = create_dummy_key(&root, "ops team's key");
+
+        fs::create_dir_all(&origin_path).unwrap();
+        init_bare_remote(&origin_path);
+
+        let local_repo = init_working_repo(&local_path);
+        run_git_command(
+            vec!["remote", "add", "origin", origin_path.to_str().unwrap()],
+            Some(local_path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+
+        commit_file(&local_path, "push.txt", "v1", "Initial push");
+        push_changes(
+            &local_repo,
+            Some(key_path.to_str().unwrap()),
+            Some("ignored-passphrase"),
+        )
+        .unwrap();
+
+        run_git_command(
+            vec![
+                "clone",
+                origin_path.to_str().unwrap(),
+                peer_path.to_str().unwrap(),
+            ],
+            None,
+            vec![],
+        )
+        .unwrap();
+        configure_git_identity(&peer_path);
+        let peer_repo = Repository::open(&peer_path).unwrap();
+
+        fetch_changes(
+            &peer_repo,
+            Some(key_path.to_str().unwrap()),
+            Some("ignored-passphrase"),
+        )
+        .unwrap();
+
+        let fetch_head = peer_repo.find_reference("refs/remotes/origin/HEAD");
+        assert!(
+            fetch_head.is_ok()
+                || peer_repo
+                    .find_reference("refs/remotes/origin/master")
+                    .is_ok()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_pull_changes_supports_safe_ssh_key_path() {
+        let root = get_temp_dir();
+        let origin_path = root.join("origin");
+        let local_path = root.join("local");
+        let key_path = create_dummy_key(&root, "release team's key");
+
+        fs::create_dir_all(&origin_path).unwrap();
+        let _ = Repository::init(&origin_path).unwrap();
+        configure_git_identity(&origin_path);
+        run_git_command(
+            vec!["commit", "--allow-empty", "-m", "Initial commit"],
+            Some(origin_path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+
+        run_git_command(
+            vec![
+                "clone",
+                origin_path.to_str().unwrap(),
+                local_path.to_str().unwrap(),
+            ],
+            None,
+            vec![],
+        )
+        .unwrap();
+        configure_git_identity(&local_path);
+        let local_repo = Repository::open(&local_path).unwrap();
+
+        commit_file(&origin_path, "new_file.txt", "content", "Feature commit");
+
+        pull_changes(
+            &local_repo,
+            Some(key_path.to_str().unwrap()),
+            Some("ignored-passphrase"),
+        )
+        .unwrap();
+
+        let head = local_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap().trim(), "Feature commit");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1116,6 +2004,278 @@ mod tests {
     }
 
     #[test]
+    fn test_amend_commit_creates_safety_ref_and_supports_manual_restore() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        commit_file(&root, "file.txt", "v1", "Initial commit");
+        let original_head = head_oid(&repo);
+
+        fs::write(root.join("file.txt"), "v2").unwrap();
+        run_git_command(
+            vec!["add", "file.txt"],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+
+        amend_last_commit(&repo, "Amended commit").unwrap();
+
+        let safety_ref = single_safety_ref_name(&repo, "amend");
+        assert_eq!(
+            repo.find_reference(&safety_ref).unwrap().target().unwrap(),
+            original_head
+        );
+        assert_ne!(head_oid(&repo), original_head);
+
+        hard_reset_to_ref(&repo, &safety_ref);
+
+        assert_eq!(head_oid(&repo), original_head);
+        assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), "v1");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_cherry_pick_creates_safety_ref_and_cleans_up_state_on_success() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        commit_file(&root, "shared.txt", "base\n", "Base commit");
+        let main_branch = repo.head().unwrap().shorthand().unwrap().to_string();
+
+        run_git_command(
+            vec!["checkout", "-b", "feature"],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        commit_file(&root, "feature.txt", "picked\n", "Feature commit");
+        let picked_sha = head_oid(&repo).to_string();
+
+        run_git_command(
+            vec!["checkout", &main_branch],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        let pre_cherry_pick_head = head_oid(&repo);
+
+        cherry_pick(&repo, &picked_sha).unwrap();
+
+        let safety_ref = single_safety_ref_name(&repo, "cherry-pick");
+        assert_eq!(
+            repo.find_reference(&safety_ref).unwrap().target().unwrap(),
+            pre_cherry_pick_head
+        );
+        assert!(!repo.path().join("CHERRY_PICK_HEAD").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("feature.txt")).unwrap(),
+            "picked\n"
+        );
+        assert_repo_is_clean(&repo);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_cherry_pick_conflict_preserves_state_until_manual_recovery() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        commit_file(&root, "shared.txt", "base\n", "Base commit");
+        let main_branch = repo.head().unwrap().shorthand().unwrap().to_string();
+
+        run_git_command(
+            vec!["checkout", "-b", "feature"],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        commit_file(&root, "shared.txt", "feature\n", "Feature change");
+        let picked_sha = head_oid(&repo).to_string();
+
+        run_git_command(
+            vec!["checkout", &main_branch],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        commit_file(&root, "shared.txt", "main\n", "Main change");
+        let pre_cherry_pick_head = head_oid(&repo);
+
+        let err = cherry_pick(&repo, &picked_sha).unwrap_err();
+        assert!(err.contains("conflicts"), "unexpected error: {err}");
+
+        let safety_ref = single_safety_ref_name(&repo, "cherry-pick");
+        assert_eq!(
+            repo.find_reference(&safety_ref).unwrap().target().unwrap(),
+            pre_cherry_pick_head
+        );
+        assert!(repo.path().join("CHERRY_PICK_HEAD").exists());
+        assert!(repo.index().unwrap().has_conflicts());
+
+        hard_reset_to_ref(&repo, &safety_ref);
+        repo.cleanup_state().unwrap();
+
+        assert_eq!(head_oid(&repo), pre_cherry_pick_head);
+        assert!(!repo.path().join("CHERRY_PICK_HEAD").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("shared.txt")).unwrap(),
+            "main\n"
+        );
+        assert_repo_is_clean(&repo);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_revert_commit_creates_safety_ref_and_cleans_up_state_on_success() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        commit_file(&root, "shared.txt", "v1\n", "Base commit");
+        commit_file(&root, "shared.txt", "v2\n", "Second commit");
+        let commit_to_revert = head_oid(&repo).to_string();
+        let pre_revert_head = head_oid(&repo);
+
+        revert_commit(&repo, &commit_to_revert).unwrap();
+
+        let safety_ref = single_safety_ref_name(&repo, "revert");
+        assert_eq!(
+            repo.find_reference(&safety_ref).unwrap().target().unwrap(),
+            pre_revert_head
+        );
+        assert!(!repo.path().join("REVERT_HEAD").exists());
+        assert_eq!(fs::read_to_string(root.join("shared.txt")).unwrap(), "v1\n");
+        assert_repo_is_clean(&repo);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_revert_conflict_preserves_state_until_manual_recovery() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        commit_file(&root, "shared.txt", "base\n", "Base commit");
+        commit_file(&root, "shared.txt", "feature\n", "Feature commit");
+        let commit_to_revert = head_oid(&repo).to_string();
+        commit_file(&root, "shared.txt", "main\n", "Main commit");
+        let pre_revert_head = head_oid(&repo);
+
+        let err = revert_commit(&repo, &commit_to_revert).unwrap_err();
+        assert!(err.contains("conflicts"), "unexpected error: {err}");
+
+        let safety_ref = single_safety_ref_name(&repo, "revert");
+        assert_eq!(
+            repo.find_reference(&safety_ref).unwrap().target().unwrap(),
+            pre_revert_head
+        );
+        assert!(repo.path().join("REVERT_HEAD").exists());
+        assert!(repo.index().unwrap().has_conflicts());
+
+        hard_reset_to_ref(&repo, &safety_ref);
+        repo.cleanup_state().unwrap();
+
+        assert_eq!(head_oid(&repo), pre_revert_head);
+        assert!(!repo.path().join("REVERT_HEAD").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("shared.txt")).unwrap(),
+            "main\n"
+        );
+        assert_repo_is_clean(&repo);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_clone_repository_failure_does_not_leave_openable_destination() {
+        let root = get_temp_dir();
+        let missing_origin = root.join("missing-origin.git");
+        let clone_path = root.join("clone");
+
+        let err = match clone_repository(
+            missing_origin.to_str().unwrap(),
+            clone_path.to_str().unwrap(),
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("clone_repository unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("does not exist")
+                || err.contains("repository")
+                || err.contains("not found"),
+            "unexpected error: {err}"
+        );
+        assert!(open_repository(clone_path.to_str().unwrap()).is_err());
+        assert!(!clone_path.join(".git").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_clone_repository_reports_permission_denied_for_unwritable_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = get_temp_dir();
+        let origin_path = root.join("origin.git");
+        let unwritable_parent = root.join("unwritable");
+        let clone_path = unwritable_parent.join("clone");
+
+        fs::create_dir_all(&origin_path).unwrap();
+        init_bare_remote(&origin_path);
+        fs::create_dir_all(&unwritable_parent).unwrap();
+
+        let original_permissions = fs::metadata(&unwritable_parent).unwrap().permissions();
+        let mut restricted_permissions = original_permissions.clone();
+        restricted_permissions.set_mode(0o500);
+        fs::set_permissions(&unwritable_parent, restricted_permissions).unwrap();
+
+        let err = match clone_repository(
+            origin_path.to_str().unwrap(),
+            clone_path.to_str().unwrap(),
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("clone_repository unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        let mut restored_permissions = fs::metadata(&unwritable_parent).unwrap().permissions();
+        restored_permissions.set_mode(original_permissions.mode());
+        fs::set_permissions(&unwritable_parent, restored_permissions).unwrap();
+
+        assert!(
+            err.contains("Permission denied") || err.contains("could not create work tree dir"),
+            "unexpected error: {err}"
+        );
+        assert!(open_repository(clone_path.to_str().unwrap()).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_open_repository_reports_invalid_path() {
+        let missing_path = get_temp_dir().join("missing-repo");
+        let err = match open_repository(missing_path.to_str().unwrap()) {
+            Ok(_) => panic!("open_repository unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("Failed to open repository"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(missing_path.parent().unwrap());
+    }
+
+    #[test]
     fn test_discard_all_changes() {
         let root = get_temp_dir();
         let _ = Repository::init(&root).unwrap();
@@ -1146,6 +2306,284 @@ mod tests {
 
         let content = fs::read_to_string(root.join("file.txt")).unwrap();
         assert_eq!(content, "v1");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_branch_operations_create_checkout_and_list_successfully() {
+        let (root, repo, default_branch) = create_committed_repo();
+
+        create_branch(&repo, "release-2026", None).unwrap();
+        assert_eq!(current_branch_name(&repo), "release-2026");
+
+        let branches = get_branches(&repo).unwrap();
+        assert!(branches.iter().any(|branch| branch.name == default_branch));
+        assert!(branches
+            .iter()
+            .any(|branch| branch.name == "release-2026" && branch.is_current));
+
+        checkout_branch(&repo, &default_branch).unwrap();
+        assert_eq!(current_branch_name(&repo), default_branch);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_branch_operations_reject_invalid_inputs_and_missing_targets() {
+        let (root, repo, _) = create_committed_repo();
+
+        let invalid_name_error = create_branch(&repo, "bad branch", None).unwrap_err();
+        assert!(invalid_name_error.contains("Invalid branch name"));
+
+        let bad_sha_error = create_branch(&repo, "hotfix-1", Some("deadbeef")).unwrap_err();
+        assert!(bad_sha_error.contains("Commit not found") || bad_sha_error.contains("too short"));
+
+        let missing_branch_error = checkout_branch(&repo, "missing-branch").unwrap_err();
+        assert!(missing_branch_error.contains("Failed to find branch"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_create_commit_history_and_diff_cover_success_and_boundary_cases() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        write_file(&root, "notes.txt", "line one\nline two\n");
+        stage_all_changes(&repo);
+        let first_sha = create_commit(&repo, "Initial enterprise commit").unwrap();
+
+        let first_history = get_commit_history(&repo, 10).unwrap();
+        assert_eq!(first_history.len(), 1);
+        assert_eq!(first_history[0].message, "Initial enterprise commit");
+        assert!(first_history[0].parents.is_empty());
+        assert!(!first_history[0].is_pushed);
+
+        let first_diff = get_commit_diff(&repo, &first_sha).unwrap();
+        assert_eq!(first_diff.len(), 1);
+        assert_eq!(first_diff[0].path, "notes.txt");
+        assert!(first_diff[0].additions >= 2);
+        assert!(first_diff[0].diff_text.contains("+line one"));
+
+        append_file(&root, "notes.txt", "line three\n");
+        stage_all_changes(&repo);
+        let second_sha = create_commit(&repo, "Second enterprise commit").unwrap();
+
+        let limited_history = get_commit_history(&repo, 1).unwrap();
+        assert_eq!(limited_history.len(), 1);
+        assert_eq!(limited_history[0].sha, second_sha);
+        assert_eq!(limited_history[0].message, "Second enterprise commit");
+        assert_eq!(limited_history[0].parents.len(), 1);
+
+        let second_diff = get_commit_diff(&repo, &second_sha).unwrap();
+        assert_eq!(second_diff.len(), 1);
+        assert!(second_diff[0].diff_text.contains("+line three"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_commit_operations_report_errors_for_empty_history_and_invalid_sha() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        let amend_error = amend_last_commit(&repo, "No commit yet").unwrap_err();
+        assert!(amend_error.contains("Failed to get HEAD"));
+
+        let history_error = get_commit_history(&repo, 10).unwrap_err();
+        assert!(history_error.contains("Failed to push HEAD"));
+
+        let diff_error = get_commit_diff(&repo, "deadbeef").unwrap_err();
+        assert!(diff_error.contains("Commit not found") || diff_error.contains("too short"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_create_commit_supports_empty_initial_commit_boundary() {
+        let root = get_temp_dir();
+        let repo = init_working_repo(&root);
+
+        let commit_sha = create_commit(&repo, "Empty initial commit").unwrap();
+        let history = get_commit_history(&repo, 1).unwrap();
+
+        assert_eq!(history[0].sha, commit_sha);
+        assert_eq!(history[0].message, "Empty initial commit");
+        assert!(get_commit_diff(&repo, &commit_sha).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_stash_operations_save_list_and_pop_tracked_and_untracked_changes() {
+        let (root, mut repo, _) = create_committed_repo();
+
+        write_file(&root, "base.txt", "updated tracked content\n");
+        write_file(&root, "draft.txt", "untracked draft\n");
+
+        stash_save(&mut repo, Some("enterprise-wip")).unwrap();
+
+        let stashes = stash_list(&mut repo).unwrap();
+        assert_eq!(stashes.len(), 1);
+        assert!(stashes[0].message.contains("enterprise-wip"));
+        assert_eq!(fs::read_to_string(root.join("base.txt")).unwrap(), "base\n");
+        assert!(!root.join("draft.txt").exists());
+
+        stash_pop(&mut repo, 0).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("base.txt")).unwrap(),
+            "updated tracked content\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("draft.txt")).unwrap(),
+            "untracked draft\n"
+        );
+        assert!(stash_list(&mut repo).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_stash_operations_handle_empty_and_clean_repository_cases() {
+        let (root, mut repo, _) = create_committed_repo();
+
+        assert!(stash_list(&mut repo).unwrap().is_empty());
+
+        let stash_error = stash_save(&mut repo, Some("nothing to stash")).unwrap_err();
+        assert!(stash_error.contains("Failed to stash"));
+
+        let pop_error = stash_pop(&mut repo, 0).unwrap_err();
+        assert!(pop_error.contains("Failed to pop stash"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_conflict_detection_and_resolution_workflow() {
+        let (root, repo, _) = create_merge_conflict_repo();
+
+        let conflicts = get_conflicts(&repo).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "base.txt");
+        assert_eq!(conflicts[0].our_status, "modified");
+        assert_eq!(conflicts[0].their_status, "modified");
+
+        resolve_conflict(&repo, "base.txt", true).unwrap();
+
+        assert!(get_conflicts(&repo).unwrap().is_empty());
+        assert!(!repo.index().unwrap().has_conflicts());
+        assert_eq!(
+            fs::read_to_string(root.join("base.txt")).unwrap(),
+            "main version\n"
+        );
+        assert!(repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("base.txt"), 0)
+            .is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_resolve_conflict_can_choose_theirs_version() {
+        let (root, repo, _) = create_merge_conflict_repo();
+
+        resolve_conflict(&repo, "base.txt", false).unwrap();
+
+        assert!(get_conflicts(&repo).unwrap().is_empty());
+        assert!(!repo.index().unwrap().has_conflicts());
+        assert_eq!(
+            fs::read_to_string(root.join("base.txt")).unwrap(),
+            "feature version\n"
+        );
+        assert!(repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("base.txt"), 0)
+            .is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_conflict_operations_report_empty_and_missing_path_cases() {
+        let (root, repo, _) = create_committed_repo();
+
+        assert!(get_conflicts(&repo).unwrap().is_empty());
+
+        let resolve_error = resolve_conflict(&repo, "missing.txt", true).unwrap_err();
+        assert!(resolve_error.contains("Failed to resolve"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_cherry_pick_success_and_error_cases() {
+        let (root, repo, default_branch) = create_committed_repo();
+
+        run_git_command(
+            vec!["checkout", "-b", "feature/cherry-pick"],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        write_file(&root, "picked.txt", "picked change\n");
+        stage_all_changes(&repo);
+        let picked_sha = create_commit(&repo, "Cherry target commit").unwrap();
+
+        run_git_command(
+            vec!["checkout", &default_branch],
+            Some(root.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+
+        cherry_pick(&repo, &picked_sha).unwrap();
+        assert_eq!(
+            repo.head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .message()
+                .unwrap(),
+            "Cherry target commit"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("picked.txt")).unwrap(),
+            "picked change\n"
+        );
+
+        let invalid_sha_error = cherry_pick(&repo, "deadbeef").unwrap_err();
+        assert!(
+            invalid_sha_error.contains("Commit not found")
+                || invalid_sha_error.contains("too short")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_revert_commit_success_and_error_cases() {
+        let (root, repo, _) = create_committed_repo();
+
+        write_file(&root, "base.txt", "version two\n");
+        stage_all_changes(&repo);
+        let change_sha = create_commit(&repo, "Promote version two").unwrap();
+
+        revert_commit(&repo, &change_sha).unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), "Revert \"Promote version two\"");
+        assert_eq!(fs::read_to_string(root.join("base.txt")).unwrap(), "base\n");
+
+        let invalid_sha_error = revert_commit(&repo, "deadbeef").unwrap_err();
+        assert!(
+            invalid_sha_error.contains("Commit not found")
+                || invalid_sha_error.contains("too short")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

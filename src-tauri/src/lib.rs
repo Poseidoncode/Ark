@@ -1,14 +1,20 @@
+mod credential_store;
 mod git_operations;
 mod models;
 
 use models::{
     BranchInfo, BranchOptions, CloneOptions, CommitInfo, CommitOptions, ConflictInfo, DiffInfo,
-    FileStatus, RepositoryInfo, Settings, StageResult, StashInfo, StashOptions,
+    FileStatus, RepositoryInfo, Settings, SettingsPayload, StageResult, StashInfo, StashOptions,
 };
 use notify::{Config, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
 
+use crate::credential_store::CredentialStore;
+
+#[derive(Debug)]
 pub enum AppError {
     Git(String),
     Io(String),
@@ -59,6 +65,10 @@ struct App(Mutex<AppState>);
 
 type AppResult<T> = Result<T, AppError>;
 
+fn require_open_repository(repo: Option<&git2::Repository>) -> AppResult<&git2::Repository> {
+    repo.ok_or(AppError::Git("No repository open".to_string()))
+}
+
 fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> Option<notify::RecommendedWatcher> {
     let path = std::path::Path::new(repo_path);
     let git_path = path.join(".git");
@@ -107,32 +117,212 @@ fn get_settings_path(app_handle: &tauri::AppHandle) -> AppResult<std::path::Path
     Ok(path.join("settings.json"))
 }
 
-fn save_settings_to_disk(state: &AppState, app_handle: &tauri::AppHandle) -> AppResult<()> {
-    let path = get_settings_path(app_handle)?;
-    let json = serde_json::to_string_pretty(&state.settings).map_err(|e| AppError::Config(e.to_string()))?;
-    std::fs::write(path, json).map_err(|e| AppError::Io(e.to_string()))?;
-    Ok(())
-}
-
-fn load_settings_from_disk(app_handle: &tauri::AppHandle) -> Settings {
-    if let Ok(path) = get_settings_path(app_handle) {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(settings) = serde_json::from_str(&content) {
-                    return settings;
-                }
-            }
-        }
-    }
+fn default_settings() -> Settings {
     Settings {
         user_name: String::new(),
         user_email: String::new(),
         ssh_key_path: None,
-        ssh_passphrase: None,
         theme: "dark".to_string(),
         recent_repositories: Vec::new(),
         last_opened_repository: None,
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DiskSettings {
+    user_name: String,
+    user_email: String,
+    ssh_key_path: Option<String>,
+    theme: String,
+    recent_repositories: Vec<String>,
+    last_opened_repository: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyDiskSettings {
+    user_name: String,
+    user_email: String,
+    ssh_key_path: Option<String>,
+    ssh_passphrase: Option<String>,
+    theme: String,
+    recent_repositories: Vec<String>,
+    last_opened_repository: Option<String>,
+}
+
+impl From<Settings> for DiskSettings {
+    fn from(settings: Settings) -> Self {
+        Self {
+            user_name: settings.user_name,
+            user_email: settings.user_email,
+            ssh_key_path: settings.ssh_key_path,
+            theme: settings.theme,
+            recent_repositories: settings.recent_repositories,
+            last_opened_repository: settings.last_opened_repository,
+        }
+    }
+}
+
+impl From<DiskSettings> for Settings {
+    fn from(settings: DiskSettings) -> Self {
+        Self {
+            user_name: settings.user_name,
+            user_email: settings.user_email,
+            ssh_key_path: settings.ssh_key_path,
+            theme: settings.theme,
+            recent_repositories: settings.recent_repositories,
+            last_opened_repository: settings.last_opened_repository,
+        }
+    }
+}
+
+impl From<LegacyDiskSettings> for Settings {
+    fn from(settings: LegacyDiskSettings) -> Self {
+        Self {
+            user_name: settings.user_name,
+            user_email: settings.user_email,
+            ssh_key_path: settings.ssh_key_path,
+            theme: settings.theme,
+            recent_repositories: settings.recent_repositories,
+            last_opened_repository: settings.last_opened_repository,
+        }
+    }
+}
+
+fn settings_payload_from_settings(settings: Settings) -> AppResult<SettingsPayload> {
+    let ssh_passphrase = settings
+        .ssh_key_path
+        .as_deref()
+        .map(CredentialStore::get_passphrase)
+        .transpose()
+        .map_err(AppError::Config)?
+        .flatten();
+
+    Ok(SettingsPayload {
+        settings,
+        ssh_passphrase,
+    })
+}
+
+fn persist_passphrase(
+    old_key_path: Option<&str>,
+    new_key_path: Option<&str>,
+    passphrase: Option<&str>,
+) -> AppResult<()> {
+    if old_key_path != new_key_path {
+        if let Some(old_key_path) = old_key_path {
+            CredentialStore::delete_passphrase(old_key_path).map_err(AppError::Config)?;
+        }
+    }
+
+    match (new_key_path, passphrase) {
+        (Some(key_path), Some(passphrase)) if !passphrase.is_empty() => {
+            CredentialStore::set_passphrase(key_path, passphrase).map_err(AppError::Config)?;
+        }
+        (Some(key_path), _) => {
+            CredentialStore::delete_passphrase(key_path).map_err(AppError::Config)?;
+        }
+        (None, Some(passphrase)) if !passphrase.is_empty() => {
+            return Err(AppError::Config(
+                "SSH key path is required to store passphrase".to_string(),
+            ));
+        }
+        (None, _) => {}
+    }
+
+    Ok(())
+}
+
+fn save_settings_payload_to_path(payload: &SettingsPayload, path: &Path) -> AppResult<()> {
+    persist_passphrase(
+        None,
+        payload.settings.ssh_key_path.as_deref(),
+        payload.ssh_passphrase.as_deref(),
+    )?;
+
+    let json = serde_json::to_string_pretty(&DiskSettings::from(payload.settings.clone()))
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    std::fs::write(path, json).map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(())
+}
+
+fn migrate_legacy_passphrase(path: &Path, legacy: LegacyDiskSettings) -> AppResult<Settings> {
+    if let (Some(key_path), Some(passphrase)) = (
+        legacy.ssh_key_path.as_deref(),
+        legacy.ssh_passphrase.as_deref(),
+    ) {
+        if !passphrase.is_empty() {
+            CredentialStore::set_passphrase(key_path, passphrase).map_err(AppError::Config)?;
+        }
+    }
+
+    let settings = Settings::from(legacy);
+    let json = serde_json::to_string_pretty(&DiskSettings::from(settings.clone()))
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    std::fs::write(path, json).map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(settings)
+}
+
+fn load_settings_from_path(path: &Path) -> AppResult<Settings> {
+    if !path.exists() {
+        return Ok(default_settings());
+    }
+
+    let content = std::fs::read_to_string(path).map_err(|e| AppError::Io(e.to_string()))?;
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+        if value.get("ssh_passphrase").is_some() {
+            let legacy = serde_json::from_value::<LegacyDiskSettings>(value)
+                .map_err(|e| AppError::Config(e.to_string()))?;
+            return migrate_legacy_passphrase(path, legacy);
+        }
+    }
+
+    if let Ok(settings) = serde_json::from_str::<DiskSettings>(&content) {
+        return Ok(settings.into());
+    }
+
+    if let Ok(legacy) = serde_json::from_str::<LegacyDiskSettings>(&content) {
+        return migrate_legacy_passphrase(path, legacy);
+    }
+
+    Ok(default_settings())
+}
+
+fn get_ssh_credentials(settings: &Settings) -> AppResult<(Option<String>, Option<String>)> {
+    let ssh_key = settings.ssh_key_path.clone();
+    let ssh_passphrase = match ssh_key.as_deref() {
+        Some(key_path) => CredentialStore::get_passphrase(key_path).map_err(AppError::Config)?,
+        None => None,
+    };
+
+    Ok((ssh_key, ssh_passphrase))
+}
+
+fn save_settings_to_disk(state: &AppState, app_handle: &tauri::AppHandle) -> AppResult<()> {
+    let path = get_settings_path(app_handle)?;
+    save_settings_payload_to_path(
+        &SettingsPayload {
+            settings: state.settings.clone(),
+            ssh_passphrase: state
+                .settings
+                .ssh_key_path
+                .as_deref()
+                .map(CredentialStore::get_passphrase)
+                .transpose()
+                .map_err(AppError::Config)?
+                .flatten(),
+        },
+        &path,
+    )
+}
+
+fn load_settings_from_disk(app_handle: &tauri::AppHandle) -> Settings {
+    if let Ok(path) = get_settings_path(app_handle) {
+        if let Ok(settings) = load_settings_from_path(&path) {
+            return settings;
+        }
+    }
+    default_settings()
 }
 
 #[tauri::command]
@@ -181,7 +371,7 @@ async fn clone_repository(
 ) -> AppResult<String> {
     let (ssh_key, ssh_pass) = {
         let state_lock = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-        (state_lock.settings.ssh_key_path.clone(), state_lock.settings.ssh_passphrase.clone())
+        get_ssh_credentials(&state_lock.settings)?
     };
 
     let url = options.url.clone();
@@ -224,7 +414,7 @@ async fn clone_repository(
 #[tauri::command]
 fn get_repository_status(state: State<'_, App>) -> AppResult<Vec<FileStatus>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    let repo = require_open_repository(state.repo.as_ref())?;
     git_operations::get_status(repo).map_err(AppError::Git)
 }
 
@@ -308,7 +498,8 @@ async fn push_changes(state: State<'_, App>) -> AppResult<()> {
         let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
         let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
-        (path, state.settings.ssh_key_path.clone(), state.settings.ssh_passphrase.clone())
+        let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
+        (path, ssh_key, ssh_pass)
     };
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -329,7 +520,8 @@ async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
         let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
         let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
-        (path, state.settings.ssh_key_path.clone(), state.settings.ssh_passphrase.clone())
+        let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
+        (path, ssh_key, ssh_pass)
     };
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -350,7 +542,8 @@ async fn fetch_changes(state: State<'_, App>) -> AppResult<()> {
         let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
         let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
-        (path, state.settings.ssh_key_path.clone(), state.settings.ssh_passphrase.clone())
+        let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
+        (path, ssh_key, ssh_pass)
     };
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -403,21 +596,21 @@ fn resolve_conflict(state: State<'_, App>, path: String, use_ours: bool) -> AppR
 #[tauri::command]
 fn amend_commit(state: State<'_, App>, message: String) -> AppResult<String> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    let repo = require_open_repository(state.repo.as_ref())?;
     git_operations::amend_last_commit(repo, &message).map_err(AppError::Git)
 }
 
 #[tauri::command]
 fn cherry_pick(state: State<'_, App>, sha: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    let repo = require_open_repository(state.repo.as_ref())?;
     git_operations::cherry_pick(repo, &sha).map_err(AppError::Git)
 }
 
 #[tauri::command]
 fn revert_commit(state: State<'_, App>, sha: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    let repo = require_open_repository(state.repo.as_ref())?;
     git_operations::revert_commit(repo, &sha).map_err(AppError::Git)
 }
 
@@ -429,19 +622,25 @@ fn discard_all_changes(state: State<'_, App>) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn get_settings(state: State<'_, App>) -> AppResult<Settings> {
+fn get_settings(state: State<'_, App>) -> AppResult<SettingsPayload> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    Ok(state.settings.clone())
+    settings_payload_from_settings(state.settings.clone())
 }
 
 #[tauri::command]
 fn save_settings(
     state: State<'_, App>,
     app_handle: tauri::AppHandle,
-    settings: Settings,
+    settings: SettingsPayload,
 ) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    state.settings = settings;
+    let previous_key_path = state.settings.ssh_key_path.clone();
+    persist_passphrase(
+        previous_key_path.as_deref(),
+        settings.settings.ssh_key_path.as_deref(),
+        settings.ssh_passphrase.as_deref(),
+    )?;
+    state.settings = settings.settings;
     save_settings_to_disk(&state, &app_handle)?;
     Ok(())
 }
@@ -607,4 +806,109 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn get_temp_dir() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ark-settings-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_require_open_repository_returns_no_repository_open_error() {
+        let err = match require_open_repository(None) {
+            Ok(_) => panic!("require_open_repository unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        let serialized = serde_json::to_string(&err).unwrap();
+
+        assert_eq!(serialized, "\"Git Error: No repository open\"");
+    }
+
+    #[test]
+    fn test_save_settings_to_path_omits_passphrase_from_json_and_stores_keyring_secret() {
+        crate::credential_store::CredentialStore::clear_all();
+
+        let root = get_temp_dir();
+        let settings_path = root.join("settings.json");
+        let key_path = root.join("id_ed25519");
+
+        let settings = models::SettingsPayload {
+            settings: Settings {
+                user_name: "Ark User".to_string(),
+                user_email: "ark@example.com".to_string(),
+                ssh_key_path: Some(key_path.to_string_lossy().to_string()),
+                theme: "dark".to_string(),
+                recent_repositories: vec!["/tmp/repo".to_string()],
+                last_opened_repository: Some("/tmp/repo".to_string()),
+            },
+            ssh_passphrase: Some("super-secret".to_string()),
+        };
+
+        save_settings_payload_to_path(&settings, &settings_path).unwrap();
+
+        let disk_json = fs::read_to_string(&settings_path).unwrap();
+        assert!(!disk_json.contains("ssh_passphrase"));
+        assert!(!disk_json.contains("super-secret"));
+
+        let stored = crate::credential_store::CredentialStore::get_passphrase(
+            key_path.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("super-secret"));
+    }
+
+    #[test]
+    fn test_load_settings_from_path_migrates_legacy_plaintext_passphrase_to_keyring() {
+        crate::credential_store::CredentialStore::clear_all();
+
+        let root = get_temp_dir();
+        let settings_path = root.join("settings.json");
+        let key_path = root.join("id_rsa");
+
+        fs::write(
+            &settings_path,
+            serde_json::json!({
+                "user_name": "Legacy User",
+                "user_email": "legacy@example.com",
+                "ssh_key_path": key_path.to_string_lossy().to_string(),
+                "ssh_passphrase": "legacy-secret",
+                "theme": "dark",
+                "recent_repositories": ["/tmp/legacy"],
+                "last_opened_repository": "/tmp/legacy"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let loaded = load_settings_from_path(&settings_path).unwrap();
+
+        assert_eq!(loaded.user_name, "Legacy User");
+        assert_eq!(loaded.ssh_key_path.as_deref(), Some(key_path.to_string_lossy().as_ref()));
+
+        let stored = crate::credential_store::CredentialStore::get_passphrase(
+            key_path.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("legacy-secret"));
+
+        let migrated_json = fs::read_to_string(&settings_path).unwrap();
+        assert!(!migrated_json.contains("ssh_passphrase"));
+        assert!(!migrated_json.contains("legacy-secret"));
+    }
+
 }

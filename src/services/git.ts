@@ -82,10 +82,13 @@ export interface Settings {
   user_name: string;
   user_email: string;
   ssh_key_path: string | null;
-  ssh_passphrase: string | null;
   theme: string;
   recent_repositories: string[];
   last_opened_repository: string | null;
+}
+
+export interface SettingsPayload extends Settings {
+  ssh_passphrase: string | null;
 }
 
 /**
@@ -294,14 +297,14 @@ export const gitService = {
   /**
    * 讀取偏好/設定
    */
-  async getSettings(): Promise<Settings> {
+  async getSettings(): Promise<SettingsPayload> {
     return await invoke("get_settings");
   },
 
   /**
    * 儲存偏好/設定
    */
-  async saveSettings(settings: Settings): Promise<void> {
+  async saveSettings(settings: SettingsPayload): Promise<void> {
     return await invoke("save_settings", { settings });
   },
 
@@ -338,4 +341,3 @@ export const gitService = {
     return await invoke("reveal_in_finder", { path });
   }
 };
-
