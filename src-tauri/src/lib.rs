@@ -271,7 +271,7 @@ fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
 fn create_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::create_branch(repo, &options.name).map_err(AppError::Git)
+    git_operations::create_branch(repo, &options.name, options.start_sha.as_deref()).map_err(AppError::Git)
 }
 
 #[tauri::command]
@@ -514,6 +514,40 @@ fn get_current_repo_info(state: State<'_, App>) -> AppResult<Option<RepositoryIn
     }
 }
 
+#[tauri::command]
+fn reveal_in_finder(path: String) -> AppResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| AppError::Io(e.to_string()))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| AppError::Io(e.to_string()))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let p = std::path::Path::new(&path);
+        let dir = if p.is_dir() {
+            p
+        } else {
+            p.parent().unwrap_or(p)
+        };
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| AppError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -569,6 +603,7 @@ pub fn run() {
             get_remote_url,
             get_current_repo_info,
             get_repositories_info,
+            reveal_in_finder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

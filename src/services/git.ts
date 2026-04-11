@@ -193,9 +193,10 @@ export const gitService = {
   /**
    * 建立新分支
    * @param name 分支名稱
+   * @param startSha 起始 commit SHA (可選，預設為 HEAD)
    */
-  async createBranch(name: string): Promise<void> {
-    return await invoke("create_branch", { options: { name } });
+  async createBranch(name: string, startSha?: string): Promise<void> {
+    return await invoke("create_branch", { options: { name, start_sha: startSha } });
   },
 
   /**
@@ -329,5 +330,12 @@ export const gitService = {
   async getRepositoriesInfo(paths: string[]): Promise<RepositoryInfo[]> {
     return await invoke("get_repositories_info", { paths });
   },
+
+  /**
+   * Reveal file in Finder/Explorer
+   */
+  async revealInFinder(path: string): Promise<void> {
+    return await invoke("reveal_in_finder", { path });
+  }
 };
 

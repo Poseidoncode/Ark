@@ -82,6 +82,7 @@ pub struct CommitOptions {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BranchOptions {
     pub name: String,
+    pub start_sha: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

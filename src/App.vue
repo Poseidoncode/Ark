@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue';
 import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type Settings, type DiffInfo, type StageResult } from './services/git';
-import { open, ask, message } from '@tauri-apps/plugin-dialog';
+import { open, ask } from '@tauri-apps/plugin-dialog';
+import { useToast } from './composables/useToast';
+import Toast from './components/Toast.vue';
+import { useContextMenu } from './composables/useContextMenu';
+import ContextMenu from './components/ContextMenu.vue';
+import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import { listen } from '@tauri-apps/api/event';
 import { homeDir } from '@tauri-apps/api/path';
 import DiffViewer from './components/DiffViewer.vue';
@@ -22,7 +27,26 @@ const selectedCommit = ref<CommitInfo | null>(null);
 const selectedCommitFile = ref<string | null>(null);
 const view = ref<"changes" | "history" | "stashes" | "conflicts">("changes");
 const loading = ref(false);
+const loadingMessage = ref("");
+const isMajorOperation = ref(false);
+const lastFailedOperation = ref<(() => Promise<void>) | null>(null);
+
+const retryLastOperation = async () => {
+  if (lastFailedOperation.value) {
+    const op = lastFailedOperation.value;
+    // Keep reference in case it fails again, the function itself will reset it if needed
+    // or we just call op()
+    await op();
+  }
+};
+
+const clearError = () => {
+  error.value = null;
+  lastFailedOperation.value = null;
+};
 const error = ref<string | null>(null);
+const toast = useToast();
+const { showContextMenu } = useContextMenu();
 
 // Modal State
 const showCloneModal = ref(false);
@@ -131,6 +155,144 @@ const toggleAllStaged = async () => {
   } catch (err) {
     error.value = err as string;
   }
+};
+
+const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
+  showContextMenu(event, [
+    {
+      label: 'Copy SHA',
+      action: async () => {
+        await navigator.clipboard.writeText(commit.sha.substring(0, 7));
+        toast.success('SHA copied', { title: 'Copied' });
+      }
+    },
+    {
+      label: 'Copy Full SHA',
+      action: async () => {
+        await navigator.clipboard.writeText(commit.sha);
+        toast.success('Full SHA copied', { title: 'Copied' });
+      }
+    },
+    { divider: true },
+    {
+      label: 'Create Branch from Commit',
+      action: async () => {
+        const name = prompt(`Enter new branch name from ${commit.sha.substring(0, 7)}:`);
+        if (name && name.trim()) {
+          try {
+            loading.value = true;
+            await gitService.createBranch(name.trim(), commit.sha);
+            await refreshRepo();
+            toast.success(`Created branch ${name}`, { title: 'Success' });
+          } catch (e) {
+            error.value = String(e);
+          } finally {
+            loading.value = false;
+          }
+        }
+      }
+    },
+    {
+      label: 'Cherry-pick Commit',
+      action: () => handleCherryPick(commit.sha)
+    },
+    {
+      label: 'Revert Commit',
+      danger: true,
+      action: () => handleRevertCommit(commit.sha)
+    },
+    { divider: true },
+    {
+      label: 'View on GitHub',
+      action: async () => {
+        try {
+          let url = await gitService.getRemoteUrl("origin");
+          if (url) {
+            // handle ssh vs https
+            if (url.startsWith('git@github.com:')) {
+               url = url.replace('git@github.com:', 'https://github.com/').replace(/\.git$/, '');
+            } else if (url.startsWith('https://')) {
+               url = url.replace(/\.git$/, '');
+            }
+            await openUrl(`${url}/commit/${commit.sha}`);
+          } else {
+            toast.error("No origin remote found", { title: "Error" });
+          }
+        } catch (e) {
+          error.value = String(e);
+        }
+      }
+    },
+    { divider: true },
+    {
+      label: 'Reveal in Finder/Explorer',
+      action: async () => {
+        if (repoInfo.value) {
+          try {
+            await gitService.revealInFinder(repoInfo.value.path);
+          } catch (e) {
+            error.value = String(e);
+          }
+        }
+      }
+    }
+  ]);
+};
+
+const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
+  showContextMenu(event, [
+    {
+      label: file.staged ? 'Unstage File' : 'Stage File',
+      action: () => toggleStaged(file)
+    },
+    { divider: true },
+    {
+      label: 'Discard Changes',
+      danger: true,
+      action: () => handleDiscardChanges(file.path)
+    },
+    { divider: true },
+    {
+      label: 'Reveal in Finder/Explorer',
+      action: async () => {
+        if (repoInfo.value) {
+          try {
+            await gitService.revealInFinder(`${repoInfo.value.path}/${file.path}`);
+          } catch (e) {
+            error.value = String(e);
+          }
+        }
+      }
+    },
+    {
+      label: 'Open in Editor',
+      action: async () => {
+        if (repoInfo.value) {
+          try {
+            await openPath(`${repoInfo.value.path}/${file.path}`);
+          } catch (e) {
+            error.value = String(e);
+          }
+        }
+      }
+    }
+  ]);
+};
+
+const onFileHeaderContextMenu = (event: MouseEvent) => {
+  if (fileStatuses.value.length === 0) return;
+  showContextMenu(event, [
+    {
+      label: allStaged.value ? 'Unstage All' : 'Stage All',
+      action: () => toggleAllStaged()
+    },
+    { divider: true },
+    {
+      label: 'Discard All Changes',
+      danger: true,
+      action: () => handleDiscardAllChanges()
+    }
+  ]);
 };
 
 const fetchSettings = async () => {
@@ -275,6 +437,8 @@ watch(cloneUrl, async (newUrl) => {
 const handleOpenRepo = async (path?: string) => {
   try {
     loading.value = true;
+    loadingMessage.value = "Opening repository...";
+    isMajorOperation.value = true;
     error.value = null;
 
     let selectedPath = path;
@@ -296,10 +460,15 @@ const handleOpenRepo = async (path?: string) => {
       selectedFile.value = null;
       selectedCommit.value = null;
     }
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleOpenRepo(path);
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
     showRecentRepos.value = false;
   }
 };
@@ -340,10 +509,15 @@ const handleCloneRepo = async () => {
     repoInfo.value = info;
     fetchSettings();
     selectedFile.value = null;
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleCloneRepo();
+    setTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -371,13 +545,20 @@ const handleDiscardChanges = async (path: string) => {
   if (!confirmed) return;
   try {
     loading.value = true;
+    loadingMessage.value = "Discarding changes...";
+    isMajorOperation.value = false;
     await gitService.discardChanges(path);
     if (selectedFile.value === path) selectedFile.value = null;
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleDiscardChanges(path);
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -389,42 +570,58 @@ const handleDiscardAllChanges = async () => {
   if (!confirmed) return;
   try {
     loading.value = true;
+    loadingMessage.value = "Discarding all changes...";
+    isMajorOperation.value = false;
     await gitService.discardAllChanges();
     selectedFile.value = null;
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleDiscardAllChanges();
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
 const handleCommit = async () => {
   if (!commitMessage.value.trim()) {
-    await message("Please enter a commit message", { title: 'Commit Error', kind: 'error' });
+    toast.error("Please enter a commit message", { title: "Commit Error" });
     return;
   }
   if (!amendCommit.value && stagedFiles.value.length === 0) {
-    await message("Please select files to commit", { title: 'Commit Error', kind: 'error' });
+    toast.error("Please select files to commit", { title: "Commit Error" });
     return;
   }
 
   try {
     loading.value = true;
+    loadingMessage.value = "Creating commit...";
+    isMajorOperation.value = true;
     error.value = null;
     if (amendCommit.value) {
       await gitService.amendCommit(commitMessage.value);
+      toast.success("Commit amended successfully!", { title: "Success" });
       amendCommit.value = false;
     } else {
       await gitService.createCommit(commitMessage.value, stagedFiles.value);
+      toast.success("Commit created successfully!", { title: "Success" });
     }
     commitMessage.value = "";
     selectedFile.value = null;
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleCommit();
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -433,13 +630,20 @@ const handleCherryPick = async (sha: string) => {
   if (!confirmed) return;
   try {
     loading.value = true;
+    loadingMessage.value = "Cherry-picking commit...";
+    isMajorOperation.value = false;
     await gitService.cherryPick(sha);
     await refreshRepo();
-    await message("Cherry-pick successful", { title: 'Success' });
+    toast.success("Cherry-pick successful", { title: "Success" });
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleCherryPick(sha);
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -448,52 +652,81 @@ const handleRevertCommit = async (sha: string) => {
   if (!confirmed) return;
   try {
     loading.value = true;
+    loadingMessage.value = "Reverting commit...";
+    isMajorOperation.value = false;
     await gitService.revertCommit(sha);
     await refreshRepo();
-    await message("Revert successful", { title: 'Success' });
+    toast.success("Revert successful", { title: "Success" });
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleRevertCommit(sha);
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
 const handlePush = async () => {
   try {
     loading.value = true;
+    loadingMessage.value = "Pushing changes to remote...";
+    isMajorOperation.value = true;
     error.value = null;
     await gitService.push();
-    await message("Pushed successfully!", { title: 'Success' });
+    toast.success("Pushed successfully!", { title: "Success" });
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handlePush();
+    setTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
 const handlePull = async () => {
   try {
     loading.value = true;
+    loadingMessage.value = "Pulling from remote...";
+    isMajorOperation.value = true;
     error.value = null;
     await gitService.pull();
+    toast.success("Pulled successfully!", { title: "Success" });
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handlePull();
+    setTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
 const handleFetch = async () => {
   try {
     loading.value = true;
+    loadingMessage.value = "Fetching from remote...";
+    isMajorOperation.value = false;
     error.value = null;
     await gitService.fetch();
-    await message("Fetch completed!", { title: 'Success' });
+    toast.success("Fetch completed!", { title: "Success" });
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleFetch();
+    setTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -501,52 +734,86 @@ const handleStashSave = async () => {
   const message = prompt("Optional stash message:");
   try {
     loading.value = true;
+    loadingMessage.value = "Saving stash...";
+    isMajorOperation.value = false;
     await gitService.stashSave(message || undefined);
     selectedFile.value = null;
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleStashSave();
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
 const handleStashPop = async (index: number) => {
   try {
     loading.value = true;
-    await gitService.stashPop(index);
+    loadingMessage.value = "Popping stash...";
+    isMajorOperation.value = false;
+    loadingMessage.value = "Popping stash...";
+    isMajorOperation.value = false;
+    error.value = null;await gitService.stashPop(index);
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleStashPop(index);
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
 const handleResolve = async (path: string, ours: boolean) => {
   try {
     loading.value = true;
-    await gitService.resolveConflict(path, ours);
+    loadingMessage.value = "Resolving conflict...";
+    isMajorOperation.value = false;
+    loadingMessage.value = "Resolving conflict...";
+    isMajorOperation.value = false;
+    error.value = null;await gitService.resolveConflict(path, ours);
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleResolve(path, ours);
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
 const checkoutBranch = async (branchName: string) => {
   try {
     loading.value = true;
-    await gitService.checkoutBranch(branchName);
+    loadingMessage.value = "Checking out branch...";
+    isMajorOperation.value = false;
+    loadingMessage.value = "Checking out branch...";
+    isMajorOperation.value = false;
+    error.value = null;await gitService.checkoutBranch(branchName);
     showBranchModal.value = false;
     selectedFile.value = null;
     selectedCommit.value = null;
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await checkoutBranch(branchName);
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -554,14 +821,21 @@ const handleCreateBranch = async () => {
   if (!newBranchName.value.trim()) return;
   try {
     loading.value = true;
+    loadingMessage.value = "Creating branch...";
+    isMajorOperation.value = false;
     await gitService.createBranch(newBranchName.value.trim());
     newBranchName.value = "";
     showBranchModal.value = false;
     await refreshRepo();
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleCreateBranch();
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -570,13 +844,15 @@ const handleSwitchToSSH = async () => {
   // Actually, I should probably just use the remote name 'origin'
   try {
     loading.value = true;
+    loadingMessage.value = "Switching remote to SSH...";
+    isMajorOperation.value = false;
     error.value = null;
     
     // Dynamically get the remote URL instead of hardcoding
     const currentUrl = await gitService.getRemoteUrl("origin");
     
     if (!currentUrl) {
-      await message("No remote 'origin' found", { title: 'Error', kind: 'error' });
+      toast.error("No remote 'origin' found", { title: "Error" });
       return;
     }
     
@@ -594,17 +870,17 @@ const handleSwitchToSSH = async () => {
       sshUrl = `git@github.com:${ownerRepo}.git`;
     } else if (currentUrl.startsWith("git@")) {
       // Already SSH, nothing to do
-      await message("Remote is already using SSH protocol", { title: 'Info', kind: 'info' });
+      toast.info("Remote is already using SSH protocol", { title: "Info" });
       loading.value = false;
       return;
     } else {
-      await message("Unsupported remote URL format", { title: 'Error', kind: 'error' });
+      toast.error("Unsupported remote URL format", { title: "Error" });
       loading.value = false;
       return;
     }
     
     if (!ownerRepo) {
-      await message("Could not parse repository from remote URL", { title: 'Error', kind: 'error' });
+      toast.error("Could not parse repository from remote URL", { title: "Error" });
       loading.value = false;
       return;
     }
@@ -612,13 +888,18 @@ const handleSwitchToSSH = async () => {
     const confirmed = await ask(`Switch remote protocol to SSH?\nNew URL: ${sshUrl}`, { title: 'Switch Remote', kind: 'warning' });
     if (confirmed) {
       await gitService.setRemoteUrl("origin", sshUrl);
-      await message("Remote protocol switched to SSH successfully!", { title: 'Success' });
+      toast.success("Remote protocol switched to SSH successfully!", { title: "Success" });
       showSettingsModal.value = false;
     }
+    error.value = null;
   } catch (err) {
     error.value = err as string;
+    lastFailedOperation.value = async () => await handleSwitchToSSH();
+    
   } finally {
     loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
   }
 };
 
@@ -652,6 +933,8 @@ const handleClickOutside = (event: MouseEvent) => {
 </script>
 
 <template>
+  <Toast />
+  <ContextMenu />
   <div class="app flex flex-col h-screen bg-background text-foreground overflow-hidden font-sans">
     <!-- Header/Top Bar -->
     <header class="h-14 border-b border-border bg-card flex items-center px-6 justify-between flex-shrink-0 shadow-sm">
@@ -730,7 +1013,10 @@ const handleClickOutside = (event: MouseEvent) => {
 
     <div v-if="error" class="bg-error/10 border-b border-error/20 px-6 py-3 text-sm flex justify-between items-center text-error">
       <span class="font-medium">{{ error }}</span>
-      <button @click="error = null" class="hover:bg-error hover:text-white px-3 py-1 rounded transition-safe">✕</button>
+      <div class="flex gap-2">
+        <button v-if="lastFailedOperation" @click="retryLastOperation" class="hover:bg-error hover:text-white px-3 py-1 rounded transition-safe">Retry</button>
+        <button @click="clearError" class="hover:bg-error hover:text-white px-3 py-1 rounded transition-safe">✕</button>
+      </div>
     </div>
 
     <!-- Modals -->
@@ -829,6 +1115,7 @@ const handleClickOutside = (event: MouseEvent) => {
           <div v-if="view === 'changes'" class="space-y-1.5">
             <!-- Changes Header with Bulk Select -->
             <div v-if="fileStatuses.length > 0" 
+                 @contextmenu.prevent="onFileHeaderContextMenu"
                  class="flex items-center gap-3 p-2.5 mb-2 rounded-lg bg-muted/50 border border-border transition-safe justify-between">
               <div class="flex items-center gap-3 cursor-pointer" @click="toggleAllStaged">
                 <input type="checkbox" :checked="allStaged" class="w-4 h-4 rounded border-border accent-accent cursor-pointer pointer-events-none" />
@@ -840,6 +1127,7 @@ const handleClickOutside = (event: MouseEvent) => {
             </div>
 
             <div v-for="file in fileStatuses" :key="file.path" 
+                 @contextmenu.prevent="onFileContextMenu($event, file)"
                  class="group flex items-center gap-3 p-2.5 rounded-lg border border-transparent hover:border-border cursor-pointer transition-safe"
                  :class="{ 'border-accent bg-accent/5': selectedFile === file.path }"
                  @click.self="selectedFile = file.path">
@@ -865,6 +1153,7 @@ const handleClickOutside = (event: MouseEvent) => {
               v-slot="{ item }"
             >
               <div @click="selectedCommit = item"
+                   @contextmenu.prevent="onCommitContextMenu($event, item)"
                    class="mb-1.5 p-3 rounded-lg border border-transparent hover:border-border cursor-pointer transition-safe bg-card/30"
                    :class="{ 'border-accent bg-accent/5 shadow-sm': selectedCommit?.sha === item.sha }">
                 <div class="text-sm font-semibold truncate mb-1.5 flex items-center gap-2" :class="{ 'text-accent': selectedCommit?.sha === item.sha }">
@@ -1017,10 +1306,19 @@ const handleClickOutside = (event: MouseEvent) => {
       </div>
     </div>
 
-    <!-- Loading Indicator (右上角小圈圈) -->
-    <div v-if="loading" class="fixed top-4 right-4 z-[100] flex items-center gap-2 bg-card/95 backdrop-blur-sm px-3 py-2 rounded-lg shadow-lg border border-border">
+    <!-- Loading Indicator -->
+    <!-- Full-screen overlay for major operations -->
+    <div v-if="loading && isMajorOperation" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div class="bg-card border border-border rounded-2xl p-8 shadow-xl flex flex-col items-center gap-4">
+        <div class="w-12 h-12 border-4 border-accent border-t-transparent rounded-full animate-spin"></div>
+        <span class="text-lg font-semibold text-foreground">{{ loadingMessage || 'Processing...' }}</span>
+      </div>
+    </div>
+
+    <!-- Small indicator for quick operations -->
+    <div v-else-if="loading" class="fixed top-4 right-4 z-[100] flex items-center gap-2 bg-card/95 backdrop-blur-sm px-3 py-2 rounded-lg shadow-lg border border-border">
       <div class="w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin"></div>
-      <span class="text-xs font-medium text-muted-foreground">Loading...</span>
+      <span class="text-xs font-medium text-muted-foreground">{{ loadingMessage || 'Loading...' }}</span>
     </div>
   </div>
 </template>
