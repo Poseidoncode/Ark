@@ -756,9 +756,8 @@ const handleStashPop = async (index: number) => {
     loading.value = true;
     loadingMessage.value = "Popping stash...";
     isMajorOperation.value = false;
-    loadingMessage.value = "Popping stash...";
-    isMajorOperation.value = false;
-    error.value = null;await gitService.stashPop(index);
+    error.value = null;
+    await gitService.stashPop(index);
     await refreshRepo();
     error.value = null;
   } catch (err) {
@@ -777,9 +776,8 @@ const handleResolve = async (path: string, ours: boolean) => {
     loading.value = true;
     loadingMessage.value = "Resolving conflict...";
     isMajorOperation.value = false;
-    loadingMessage.value = "Resolving conflict...";
-    isMajorOperation.value = false;
-    error.value = null;await gitService.resolveConflict(path, ours);
+    error.value = null;
+    await gitService.resolveConflict(path, ours);
     await refreshRepo();
     error.value = null;
   } catch (err) {
@@ -798,9 +796,8 @@ const checkoutBranch = async (branchName: string) => {
     loading.value = true;
     loadingMessage.value = "Checking out branch...";
     isMajorOperation.value = false;
-    loadingMessage.value = "Checking out branch...";
-    isMajorOperation.value = false;
-    error.value = null;await gitService.checkoutBranch(branchName);
+    error.value = null;
+    await gitService.checkoutBranch(branchName);
     showBranchModal.value = false;
     selectedFile.value = null;
     selectedCommit.value = null;
