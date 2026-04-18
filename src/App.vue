@@ -356,6 +356,8 @@ const refreshRepo = async () => {
   }
 };
 
+let unlisten: (() => void) | null = null;
+
 onMounted(async () => {
   window.addEventListener('click', handleClickOutside);
   await fetchSettings();
@@ -368,15 +370,17 @@ onMounted(async () => {
     console.error("Failed to fetch initial repo info", err);
   }
 
-  const unlisten = await listen('git-state-changed', () => {
+  unlisten = await listen('git-state-changed', () => {
     refreshRepo();
   });
-  
-  onUnmounted(() => {
+});
+
+onUnmounted(() => {
+  if (unlisten) {
     unlisten();
-    window.removeEventListener('click', handleClickOutside);
-    clearTimeouts();
-  });
+  }
+  window.removeEventListener('click', handleClickOutside);
+  clearTimeouts();
 });
 
 watch([repoInfo, view], () => {

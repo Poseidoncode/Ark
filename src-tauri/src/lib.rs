@@ -10,7 +10,7 @@ use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, Listener, Manager, State};
 
 use crate::credential_store::CredentialStore;
 
@@ -67,6 +67,14 @@ type AppResult<T> = Result<T, AppError>;
 
 fn require_open_repository(repo: Option<&git2::Repository>) -> AppResult<&git2::Repository> {
     repo.ok_or(AppError::Git("No repository open".to_string()))
+}
+
+fn stop_watcher(watcher: Option<notify::RecommendedWatcher>) {
+    if let Some(mut w) = watcher {
+        let _ = w.unwatch(&std::path::PathBuf::from(".git/index"));
+        let _ = w.unwatch(&std::path::PathBuf::from(".git/HEAD"));
+        let _ = w.unwatch(&std::path::PathBuf::from(".git/refs"));
+    }
 }
 
 fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> Option<notify::RecommendedWatcher> {
@@ -336,8 +344,9 @@ fn open_repository(
         Ok(repo) => {
             let info = git_operations::get_repository_info(&repo)?;
             state.repo = Some(repo);
+            stop_watcher(state.watcher.take());
             state.watcher = start_watcher(app_handle.clone(), &path);
-            
+
             // Add to recent repositories if not already there
             if !state.settings.recent_repositories.contains(&path) {
                 state.settings.recent_repositories.insert(0, path.clone());
@@ -398,6 +407,7 @@ async fn clone_repository(
     match git_operations::open_repository(&path) {
         Ok(repo) => {
             state_lock.repo = Some(repo);
+            stop_watcher(state_lock.watcher.take());
             state_lock.watcher = start_watcher(app_handle.clone(), &path);
 
             if !state_lock.settings.recent_repositories.contains(&path) {
@@ -766,6 +776,17 @@ pub fn run() {
                 settings,
                 watcher,
             })));
+
+            // Cleanup on app exit
+            let app_handle_clone = app_handle.clone();
+            app.listen("tauri://close-requested", move |_| {
+                if let Some(state) = app_handle_clone.try_state::<App>() {
+                    if let Ok(mut app_state) = state.0.lock() {
+                        stop_watcher(app_state.watcher.take());
+                    }
+                }
+            });
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())

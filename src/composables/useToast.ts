@@ -1,4 +1,4 @@
-import { ref, onUnmounted } from 'vue';
+import { ref } from 'vue';
 
 export type ToastType = 'success' | 'error' | 'warning' | 'info';
 
@@ -57,20 +57,10 @@ export function useToast() {
     }
   };
 
-  const clearTimeouts = () => {
-    timeoutIds.value.forEach(id => clearTimeout(id));
-    timeoutIds.value = [];
-  };
-
   const success = (message: string, options?: ToastOptions) => addToast('success', message, options);
   const error = (message: string, options?: ToastOptions) => addToast('error', message, options);
   const warning = (message: string, options?: ToastOptions) => addToast('warning', message, options);
   const info = (message: string, options?: ToastOptions) => addToast('info', message, options);
-
-  // Auto-cleanup on component unmount
-  onUnmounted(() => {
-    clearTimeouts();
-  });
 
   return {
     toasts,

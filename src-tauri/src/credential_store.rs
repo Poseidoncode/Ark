@@ -9,7 +9,6 @@ use keyring::Entry;
 use keyring::Error;
 
 #[cfg(not(test))]
-#[cfg(not(test))]
 const SERVICE_NAME: &str = "Ark Git GUI";
 
 pub struct CredentialStore;
