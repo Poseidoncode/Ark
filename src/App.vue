@@ -30,6 +30,7 @@ const loading = ref(false);
 const loadingMessage = ref("");
 const isMajorOperation = ref(false);
 const lastFailedOperation = ref<(() => Promise<void>) | null>(null);
+const timeoutIds = ref<ReturnType<typeof setTimeout>[]>([]);
 
 const retryLastOperation = async () => {
   if (lastFailedOperation.value) {
@@ -44,6 +45,22 @@ const clearError = () => {
   error.value = null;
   lastFailedOperation.value = null;
 };
+
+const trackedSetTimeout = (callback: () => void, delay: number) => {
+  const id = setTimeout(() => {
+    // Remove the id from the array after it fires
+    timeoutIds.value = timeoutIds.value.filter(t => t !== id);
+    callback();
+  }, delay);
+  timeoutIds.value.push(id);
+  return id;
+};
+
+const clearTimeouts = () => {
+  timeoutIds.value.forEach(id => clearTimeout(id));
+  timeoutIds.value = [];
+};
+
 const error = ref<string | null>(null);
 const toast = useToast();
 const { showContextMenu } = useContextMenu();
@@ -60,7 +77,7 @@ const showRecentRepos = ref(false);
 watch(showRecentRepos, async (isOpen) => {
   if (isOpen && settings.value?.recent_repositories.length) {
     try {
-      const infos = await gitService.getRepositoriesInfo(settings.value.recent_repositories);
+      const infos = await gitService.getRepositoriesInfo(settings.value?.recent_repositories || []);
       recentRepoInfos.value = infos;
     } catch (err) {
       console.error("Failed to fetch recent repo infos", err);
@@ -137,6 +154,14 @@ const filteredCommits = computed(() => {
     c.author.toLowerCase().includes(q)
   );
 });
+
+const getRecentRepoInfo = (path: string) => {
+  return recentRepoInfos.value.find(r => r.path === path);
+};
+
+const getCurrentBranch = () => {
+  return branches.value.find((b: BranchInfo) => b.is_current)?.name || 'Unknown';
+};
 
 const toggleAllStaged = async () => {
   if (fileStatuses.value.length === 0) return;
@@ -350,6 +375,7 @@ onMounted(async () => {
   onUnmounted(() => {
     unlisten();
     window.removeEventListener('click', handleClickOutside);
+    clearTimeouts();
   });
 });
 
@@ -422,7 +448,7 @@ watch(cloneUrl, async (newUrl) => {
       if (!basePath || !basePath.includes('github')) {
         try {
           const home = await homeDir();
-          basePath = `${home}Documents/github`;
+          basePath = `${home}/Documents/github`;
         } catch {
           // Fallback to empty - user will need to browse manually
           basePath = "";
@@ -513,7 +539,7 @@ const handleCloneRepo = async () => {
   } catch (err) {
     error.value = err as string;
     lastFailedOperation.value = async () => await handleCloneRepo();
-    setTimeout(() => refreshRepo(), 500);
+    trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
     loadingMessage.value = "";
@@ -681,7 +707,7 @@ const handlePush = async () => {
   } catch (err) {
     error.value = err as string;
     lastFailedOperation.value = async () => await handlePush();
-    setTimeout(() => refreshRepo(), 500);
+    trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
     loadingMessage.value = "";
@@ -702,7 +728,7 @@ const handlePull = async () => {
   } catch (err) {
     error.value = err as string;
     lastFailedOperation.value = async () => await handlePull();
-    setTimeout(() => refreshRepo(), 500);
+    trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
     loadingMessage.value = "";
@@ -722,7 +748,7 @@ const handleFetch = async () => {
   } catch (err) {
     error.value = err as string;
     lastFailedOperation.value = async () => await handleFetch();
-    setTimeout(() => refreshRepo(), 500);
+    trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
     loading.value = false;
     loadingMessage.value = "";
@@ -970,14 +996,14 @@ const handleClickOutside = (event: MouseEvent) => {
                     {{ getRepoName(path) }}
                   </div>
                   <!-- Status Indicators -->
-                  <div v-if="recentRepoInfos.find(r => r.path === path)" class="flex items-center gap-1.5 flex-shrink-0">
-                    <span v-if="recentRepoInfos.find(r => r.path === path)?.ahead" class="text-[10px] font-bold text-success flex items-center gap-0.5" title="Unpushed commits">
-                      ↑{{ recentRepoInfos.find(r => r.path === path)?.ahead }}
+                  <div v-if="getRecentRepoInfo(path)" class="flex items-center gap-1.5 flex-shrink-0">
+                    <span v-if="getRecentRepoInfo(path)?.ahead" class="text-[10px] font-bold text-success flex items-center gap-0.5" title="Unpushed commits">
+                      ↑{{ getRecentRepoInfo(path)?.ahead }}
                     </span>
-                    <span v-if="recentRepoInfos.find(r => r.path === path)?.behind" class="text-[10px] font-bold text-error flex items-center gap-0.5" title="Unpulled commits">
-                      ↓{{ recentRepoInfos.find(r => r.path === path)?.behind }}
+                    <span v-if="getRecentRepoInfo(path)?.behind" class="text-[10px] font-bold text-error flex items-center gap-0.5" title="Unpulled commits">
+                      ↓{{ getRecentRepoInfo(path)?.behind }}
                     </span>
-                    <span v-if="recentRepoInfos.find(r => r.path === path)?.is_dirty" class="w-1.5 h-1.5 rounded-full bg-accent/40" title="Uncommitted changes"></span>
+                    <span v-if="getRecentRepoInfo(path)?.is_dirty" class="w-1.5 h-1.5 rounded-full bg-accent/40" title="Uncommitted changes"></span>
                   </div>
                 </div>
                 <div class="text-[10px] text-muted-foreground truncate font-mono">{{ path }}</div>
@@ -990,7 +1016,7 @@ const handleClickOutside = (event: MouseEvent) => {
         </div>
         <div v-if="repoInfo" class="flex items-center gap-2 cursor-pointer hover:bg-muted px-3 py-1.5 rounded-lg transition-safe" @click="showBranchModal = true">
           <span class="text-muted-foreground mr-1">Branch:</span>
-          <span class="font-semibold text-accent">{{ branches.find((b: BranchInfo) => b.is_current)?.name || 'Unknown' }}</span>
+          <span class="font-semibold text-accent">{{ getCurrentBranch() }}</span>
         </div>
       </div>
       <div class="flex items-center gap-3 text-sm">
@@ -1195,7 +1221,7 @@ const handleClickOutside = (event: MouseEvent) => {
           <textarea v-model="commitMessage" placeholder="Describe your changes..." class="w-full bg-card border border-border rounded-lg p-3 text-foreground text-sm mb-3 focus:ring-2 focus:ring-accent focus:border-transparent outline-none resize-none" rows="3" />
           <button @click="handleCommit" :disabled="loading || !commitMessage.trim() || (!amendCommit && stagedFiles.length === 0)" 
                   class="w-full gradient-bg text-accent-foreground disabled:opacity-50 disabled:cursor-not-allowed py-2.5 rounded-lg font-semibold text-sm hover:shadow-accent transition-safe">
-            {{ amendCommit ? 'Amend Commit' : `Commit to ${branches.find((b: BranchInfo) => b.is_current)?.name || 'HEAD'}` }}
+            {{ amendCommit ? 'Amend Commit' : `Commit to ${getCurrentBranch()}` }}
           </button>
         </div>
 

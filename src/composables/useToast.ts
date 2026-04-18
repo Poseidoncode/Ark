@@ -1,4 +1,4 @@
-import { ref } from 'vue';
+import { ref, onUnmounted } from 'vue';
 
 export type ToastType = 'success' | 'error' | 'warning' | 'info';
 
@@ -17,6 +17,7 @@ export interface Toast {
 
 const toasts = ref<Toast[]>([]);
 const MAX_TOASTS = 5;
+const timeoutIds = ref<ReturnType<typeof setTimeout>[]>([]);
 
 export function useToast() {
   const addToast = (type: ToastType, message: string, options?: ToastOptions) => {
@@ -38,9 +39,12 @@ export function useToast() {
     }
 
     if (timeout > 0) {
-      setTimeout(() => {
+      const timeoutId = setTimeout(() => {
+        // Remove the timeout id from the array after it fires
+        timeoutIds.value = timeoutIds.value.filter(t => t !== timeoutId);
         dismiss(id);
       }, timeout);
+      timeoutIds.value.push(timeoutId);
     }
 
     return id;
@@ -53,10 +57,20 @@ export function useToast() {
     }
   };
 
+  const clearTimeouts = () => {
+    timeoutIds.value.forEach(id => clearTimeout(id));
+    timeoutIds.value = [];
+  };
+
   const success = (message: string, options?: ToastOptions) => addToast('success', message, options);
   const error = (message: string, options?: ToastOptions) => addToast('error', message, options);
   const warning = (message: string, options?: ToastOptions) => addToast('warning', message, options);
   const info = (message: string, options?: ToastOptions) => addToast('info', message, options);
+
+  // Auto-cleanup on component unmount
+  onUnmounted(() => {
+    clearTimeouts();
+  });
 
   return {
     toasts,
