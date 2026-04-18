@@ -198,6 +198,13 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
         toast.success('Full SHA copied', { title: 'Copied' });
       }
     },
+    {
+      label: 'Copy Commit Message',
+      action: async () => {
+        await navigator.clipboard.writeText(commit.message);
+        toast.success('Message copied', { title: 'Copied' });
+      }
+    },
     { divider: true },
     {
       label: 'Create Branch from Commit',
@@ -218,6 +225,25 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
       }
     },
     {
+      label: 'Create Tag',
+      action: async () => {
+        const tagName = prompt(`Enter tag name for ${commit.sha.substring(0, 7)}:`);
+        if (tagName && tagName.trim()) {
+          const tagMessage = prompt(`Enter tag message (optional):`) || '';
+          try {
+            loading.value = true;
+            await gitService.createTag(tagName.trim(), tagMessage, commit.sha);
+            await refreshRepo();
+            toast.success(`Created tag ${tagName}`, { title: 'Success' });
+          } catch (e) {
+            error.value = String(e);
+          } finally {
+            loading.value = false;
+          }
+        }
+      }
+    },
+    {
       label: 'Cherry-pick Commit',
       action: () => handleCherryPick(commit.sha)
     },
@@ -225,6 +251,59 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
       label: 'Revert Commit',
       danger: true,
       action: () => handleRevertCommit(commit.sha)
+    },
+    {
+      label: 'Reset Branch to this Commit',
+      danger: true,
+      action: async () => {
+        const confirmed = await ask(`Reset current branch to ${commit.sha.substring(0, 7)}? This will discard all commits after this point.`, { 
+          title: 'Reset Branch', 
+          kind: 'warning' 
+        });
+        if (!confirmed) return;
+        try {
+          loading.value = true;
+          loadingMessage.value = "Resetting branch...";
+          isMajorOperation.value = false;
+          await gitService.resetBranch(commit.sha);
+          await refreshRepo();
+          toast.success("Branch reset successfully", { title: 'Success' });
+          error.value = null;
+        } catch (e) {
+          error.value = String(e);
+          lastFailedOperation.value = async () => await gitService.resetBranch(commit.sha);
+        } finally {
+          loading.value = false;
+          loadingMessage.value = "";
+          isMajorOperation.value = false;
+        }
+      }
+    },
+    {
+      label: 'Merge into Current Branch',
+      action: async () => {
+        const confirmed = await ask(`Merge commit ${commit.sha.substring(0, 7)} into current branch?`, { 
+          title: 'Merge Commit', 
+          kind: 'info' 
+        });
+        if (!confirmed) return;
+        try {
+          loading.value = true;
+          loadingMessage.value = "Merging commit...";
+          isMajorOperation.value = false;
+          await gitService.mergeCommit(commit.sha);
+          await refreshRepo();
+          toast.success("Merge successful", { title: 'Success' });
+          error.value = null;
+        } catch (e) {
+          error.value = String(e);
+          lastFailedOperation.value = async () => await gitService.mergeCommit(commit.sha);
+        } finally {
+          loading.value = false;
+          loadingMessage.value = "";
+          isMajorOperation.value = false;
+        }
+      }
     },
     { divider: true },
     {
@@ -278,6 +357,47 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
     },
     { divider: true },
     {
+      label: 'Copy Path',
+      action: async () => {
+        await navigator.clipboard.writeText(file.path);
+        toast.success('Path copied', { title: 'Copied' });
+      }
+    },
+    {
+      label: 'Ignore File',
+      action: async () => {
+        try {
+          await gitService.addToGitignore(file.path);
+          await refreshRepo();
+          toast.success(`Added ${file.path} to .gitignore`, { title: 'Success' });
+        } catch (e) {
+          error.value = String(e);
+        }
+      }
+    },
+    {
+      label: 'View File History',
+      action: async () => {
+        view.value = "history";
+        searchCommitQuery.value = file.path;
+      }
+    },
+    {
+      label: 'Copy File Contents',
+      action: async () => {
+        try {
+          if (repoInfo.value) {
+            const content = await gitService.readFile(`${repoInfo.value.path}/${file.path}`);
+            await navigator.clipboard.writeText(content);
+            toast.success('File contents copied', { title: 'Copied' });
+          }
+        } catch (e) {
+          error.value = String(e);
+        }
+      }
+    },
+    { divider: true },
+    {
       label: 'Reveal in Finder/Explorer',
       action: async () => {
         if (repoInfo.value) {
@@ -316,6 +436,124 @@ const onFileHeaderContextMenu = (event: MouseEvent) => {
       label: 'Discard All Changes',
       danger: true,
       action: () => handleDiscardAllChanges()
+    }
+  ]);
+};
+
+const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
+  showContextMenu(event, [
+    {
+      label: 'Copy Path',
+      action: async () => {
+        await navigator.clipboard.writeText(filePath);
+        toast.success('Path copied', { title: 'Copied' });
+      }
+    },
+    {
+      label: 'View File History',
+      action: async () => {
+        searchCommitQuery.value = filePath;
+      }
+    },
+    { divider: true },
+    {
+      label: 'Reveal in Finder/Explorer',
+      action: async () => {
+        if (repoInfo.value) {
+          try {
+            await gitService.revealInFinder(`${repoInfo.value.path}/${filePath}`);
+          } catch (e) {
+            error.value = String(e);
+          }
+        }
+      }
+    },
+    {
+      label: 'Open in Editor',
+      action: async () => {
+        if (repoInfo.value) {
+          try {
+            await openPath(`${repoInfo.value.path}/${filePath}`);
+          } catch (e) {
+            error.value = String(e);
+          }
+        }
+      }
+    }
+  ]);
+};
+
+const onStashContextMenu = (event: MouseEvent, stash: StashInfo) => {
+  showContextMenu(event, [
+    {
+      label: 'Apply Stash',
+      action: () => handleApplyStash(stash.index)
+    },
+    {
+      label: 'Pop Stash',
+      action: () => handleStashPop(stash.index)
+    },
+    {
+      label: 'Drop Stash',
+      danger: true,
+      action: () => handleDropStash(stash.index)
+    },
+    { divider: true },
+    {
+      label: 'Create Branch from Stash',
+      action: () => handleBranchFromStash(stash.index)
+    },
+    {
+      label: 'Copy SHA',
+      action: async () => {
+        await navigator.clipboard.writeText(stash.sha);
+        toast.success('SHA copied', { title: 'Copied' });
+      }
+    }
+  ]);
+};
+
+const onConflictContextMenu = (event: MouseEvent, conflict: ConflictInfo) => {
+  showContextMenu(event, [
+    {
+      label: 'Use Ours',
+      action: () => handleResolve(conflict.path, true)
+    },
+    {
+      label: 'Use Theirs',
+      action: () => handleResolve(conflict.path, false)
+    },
+    { divider: true },
+    {
+      label: 'Copy Path',
+      action: async () => {
+        await navigator.clipboard.writeText(conflict.path);
+        toast.success('Path copied', { title: 'Copied' });
+      }
+    },
+    {
+      label: 'Reveal in Finder/Explorer',
+      action: async () => {
+        if (repoInfo.value) {
+          try {
+            await gitService.revealInFinder(`${repoInfo.value.path}/${conflict.path}`);
+          } catch (e) {
+            error.value = String(e);
+          }
+        }
+      }
+    },
+    {
+      label: 'Open in Editor',
+      action: async () => {
+        if (repoInfo.value) {
+          try {
+            await openPath(`${repoInfo.value.path}/${conflict.path}`);
+          } catch (e) {
+            error.value = String(e);
+          }
+        }
+      }
     }
   ]);
 };
@@ -793,7 +1031,77 @@ const handleStashPop = async (index: number) => {
   } catch (err) {
     error.value = err as string;
     lastFailedOperation.value = async () => await handleStashPop(index);
-    
+
+  } finally {
+    loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
+  }
+};
+
+const handleApplyStash = async (index: number) => {
+  try {
+    loading.value = true;
+    loadingMessage.value = "Applying stash...";
+    isMajorOperation.value = false;
+    error.value = null;
+    await gitService.applyStash(index);
+    await refreshRepo();
+    toast.success("Stash applied successfully", { title: 'Success' });
+    error.value = null;
+  } catch (err) {
+    error.value = err as string;
+    lastFailedOperation.value = async () => await handleApplyStash(index);
+
+  } finally {
+    loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
+  }
+};
+
+const handleDropStash = async (index: number) => {
+  const confirmed = await ask("Are you sure you want to drop this stash? This cannot be undone.", {
+    title: 'Drop Stash',
+    kind: 'warning'
+  });
+  if (!confirmed) return;
+  try {
+    loading.value = true;
+    loadingMessage.value = "Dropping stash...";
+    isMajorOperation.value = false;
+    error.value = null;
+    await gitService.dropStash(index);
+    await refreshRepo();
+    toast.success("Stash dropped successfully", { title: 'Success' });
+    error.value = null;
+  } catch (err) {
+    error.value = err as string;
+    lastFailedOperation.value = async () => await handleDropStash(index);
+
+  } finally {
+    loading.value = false;
+    loadingMessage.value = "";
+    isMajorOperation.value = false;
+  }
+};
+
+const handleBranchFromStash = async (index: number) => {
+  const branchName = prompt("Enter new branch name:");
+  if (!branchName || !branchName.trim()) return;
+  try {
+    loading.value = true;
+    loadingMessage.value = "Creating branch from stash...";
+    isMajorOperation.value = false;
+    error.value = null;
+    await gitService.branchFromStash(index, branchName.trim());
+    await refreshRepo();
+    toast.success(`Branch ${branchName} created from stash`, { title: 'Success' });
+    error.value = null;
+  } catch (err) {
+    error.value = err as string;
+    lastFailedOperation.value = async () => await handleBranchFromStash(index);
+
   } finally {
     loading.value = false;
     loadingMessage.value = "";
@@ -1196,7 +1504,8 @@ const handleClickOutside = (event: MouseEvent) => {
             </RecycleScroller>
           </div>
           <div v-else-if="view === 'stashes'" class="space-y-1.5">
-            <div v-for="(stash, index) in stashes" :key="index" 
+            <div v-for="(stash, index) in stashes" :key="index"
+                 @contextmenu.prevent="onStashContextMenu($event, stash)"
                  class="p-3 bg-card rounded-lg border border-border flex justify-between items-center group hover:border-accent transition-safe">
               <div class="flex-1 min-w-0">
                 <div class="text-sm font-semibold truncate">{{ stash.message || 'No message' }}</div>
@@ -1206,7 +1515,9 @@ const handleClickOutside = (event: MouseEvent) => {
             </div>
           </div>
           <div v-else-if="view === 'conflicts'" class="space-y-2">
-            <div v-for="conflict in conflicts" :key="conflict.path" class="p-3 bg-error/5 rounded-lg border border-error/20">
+            <div v-for="conflict in conflicts" :key="conflict.path"
+                 @contextmenu.prevent="onConflictContextMenu($event, conflict)"
+                 class="p-3 bg-error/5 rounded-lg border border-error/20">
               <div class="text-sm font-semibold truncate mb-3 text-error" :title="conflict.path">{{ conflict.path.split('/').pop() }}</div>
               <div class="flex gap-2 text-xs">
                 <button @click="handleResolve(conflict.path, true)" class="flex-1 bg-card border border-border hover:bg-muted py-2 rounded-lg font-medium transition-safe">Use Ours</button>
@@ -1270,6 +1581,7 @@ const handleClickOutside = (event: MouseEvent) => {
             <div class="w-64 border-r border-border bg-card overflow-y-auto flex-shrink-0">
               <div v-for="diff in diffs" :key="diff.path"
                    @click="selectedCommitFile = diff.path"
+                   @contextmenu.prevent="onCommitFileContextMenu($event, diff.path)"
                    class="px-4 py-2 text-sm cursor-pointer border-l-2 hover:bg-muted transition-safe flex items-center justify-between group"
                    :class="{ 'border-accent bg-accent/5': selectedCommitFile === diff.path, 'border-transparent': selectedCommitFile !== diff.path }">
                 <span class="truncate" :title="diff.path">{{ diff.path.split('/').pop() }}</span>

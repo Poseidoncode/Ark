@@ -339,5 +339,61 @@ export const gitService = {
    */
   async revealInFinder(path: string): Promise<void> {
     return await invoke("reveal_in_finder", { path });
+  },
+
+  /**
+   * Add file to .gitignore
+   */
+  async addToGitignore(filePath: string): Promise<void> {
+    return await invoke("add_to_gitignore", { filePath });
+  },
+
+  /**
+   * Read file contents
+   */
+  async readFile(filePath: string): Promise<string> {
+    return await invoke("read_file", { filePath });
+  },
+
+  /**
+   * Create tag
+   */
+  async createTag(name: string, message: string, sha: string): Promise<void> {
+    return await invoke("create_tag", { options: { name, message, sha } });
+  },
+
+  /**
+   * Delete stash
+   */
+  async dropStash(index: number): Promise<void> {
+    return await invoke("drop_stash", { index });
+  },
+
+  /**
+   * Apply stash without removing from stack
+   */
+  async applyStash(index: number): Promise<void> {
+    return await invoke("apply_stash", { index });
+  },
+
+  /**
+   * Create branch from stash
+   */
+  async branchFromStash(index: number, branchName: string): Promise<void> {
+    return await invoke("branch_from_stash", { index, branchName });
+  },
+
+  /**
+   * Reset branch to specific commit
+   */
+  async resetBranch(sha: string): Promise<void> {
+    return await invoke("reset_branch", { sha });
+  },
+
+  /**
+   * Merge commit into current branch
+   */
+  async mergeCommit(sha: string): Promise<void> {
+    return await invoke("merge_commit", { sha });
   }
 };

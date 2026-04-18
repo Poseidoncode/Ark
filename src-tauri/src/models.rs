@@ -96,6 +96,13 @@ pub struct StashOptions {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TagOptions {
+    pub name: String,
+    pub message: String,
+    pub sha: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StageResult {
     pub staged: Vec<String>,

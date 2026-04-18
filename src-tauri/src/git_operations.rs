@@ -1002,6 +1002,65 @@ pub fn stash_list(repo: &mut Repository) -> Result<Vec<StashInfo>, String> {
     Ok(stashes)
 }
 
+pub fn stash_apply(repo: &mut Repository, index: usize) -> Result<(), String> {
+    repo.stash_apply(index, None)
+        .map_err(|e| format!("Failed to apply stash: {}", e))?;
+    Ok(())
+}
+
+pub fn stash_drop(repo: &mut Repository, index: usize) -> Result<(), String> {
+    repo.stash_drop(index)
+        .map_err(|e| format!("Failed to drop stash: {}", e))?;
+    Ok(())
+}
+
+pub fn stash_branch(repo: &mut Repository, index: usize, branch_name: &str) -> Result<(), String> {
+    if !is_safe_git_arg(branch_name) {
+        return Err("Invalid branch name".to_string());
+    }
+    repo.stash_apply(index, None)
+        .map_err(|e| format!("Failed to apply stash for branch: {}", e))?;
+    
+    let signature = repo
+        .signature()
+        .or_else(|_| Signature::now("User", "user@example.com"))
+        .map_err(|e| format!("Failed to create signature: {}", e))?;
+    
+    let mut index = repo
+        .index()
+        .map_err(|e| format!("Failed to get index: {}", e))?;
+    
+    let tree_id = index
+        .write_tree()
+        .map_err(|e| format!("Failed to write tree: {}", e))?;
+    
+    let tree = repo
+        .find_tree(tree_id)
+        .map_err(|e| format!("Failed to find tree: {}", e))?;
+    
+    let head = repo
+        .head()
+        .map_err(|e| format!("Failed to get HEAD: {}", e))?;
+    
+    repo.commit(
+        Some(&format!("refs/heads/{}", branch_name)),
+        &signature,
+        &signature,
+        &format!("Branch from stash {}", index),
+        &tree,
+        &[],
+    )
+    .map_err(|e| format!("Failed to create branch from stash: {}", e))?;
+    
+    repo.checkout_tree(&tree, None)
+        .map_err(|e| format!("Failed to checkout tree: {}", e))?;
+    
+    repo.set_head(&format!("refs/heads/{}", branch_name))
+        .map_err(|e| format!("Failed to set HEAD: {}", e))?;
+    
+    Ok(())
+}
+
 pub fn get_conflicts(repo: &Repository) -> Result<Vec<ConflictInfo>, String> {
     let index = repo
         .index()
@@ -1154,6 +1213,115 @@ pub fn get_remote_url(repo: &Repository, name: &str) -> Result<String, String> {
 pub fn set_remote_url(repo: &Repository, name: &str, url: &str) -> Result<(), String> {
     repo.remote_set_url(name, url)
         .map_err(|e| format!("Failed to set remote URL: {}", e))?;
+    Ok(())
+}
+
+pub fn add_to_gitignore(repo: &Repository, file_path: &str) -> Result<(), String> {
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let gitignore_path = workdir.join(".gitignore");
+    
+    let content = if gitignore_path.exists() {
+        let existing = fs::read_to_string(&gitignore_path)
+            .map_err(|e| format!("Failed to read .gitignore: {}", e))?;
+        format!("{}\n{}", existing, file_path)
+    } else {
+        file_path.to_string()
+    };
+    
+    fs::write(&gitignore_path, content)
+        .map_err(|e| format!("Failed to write .gitignore: {}", e))?;
+    
+    Ok(())
+}
+
+pub fn read_file(repo: &Repository, file_path: &str) -> Result<String, String> {
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let full_path = validate_repo_path(repo, file_path)?;
+    
+    fs::read_to_string(full_path)
+        .map_err(|e| format!("Failed to read file: {}", e))
+}
+
+pub fn create_tag(repo: &Repository, name: &str, message: &str, sha: &str) -> Result<(), String> {
+    if !is_safe_git_arg(name) {
+        return Err("Invalid tag name".to_string());
+    }
+    
+    let commit = repo
+        .find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Commit not found: {}", e))?;
+    
+    let signature = repo
+        .signature()
+        .or_else(|_| Signature::now("User", "user@example.com"))
+        .map_err(|e| format!("Failed to create signature: {}", e))?;
+    
+    repo.tag(
+        name,
+        &commit,
+        &signature,
+        message,
+        false,
+    )
+    .map_err(|e| format!("Failed to create tag: {}", e))?;
+    
+    Ok(())
+}
+
+pub fn reset_branch(repo: &Repository, sha: &str) -> Result<(), String> {
+    create_safety_ref(repo, "reset")?;
+    
+    let commit = repo
+        .find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Commit not found: {}", e))?;
+    
+    let mut checkout_opts = git2::build::CheckoutBuilder::new();
+    checkout_opts.force();
+    
+    repo.reset(&commit, git2::ResetType::Hard, Some(&mut checkout_opts))
+        .map_err(|e| format!("Failed to reset branch: {}", e))?;
+    
+    Ok(())
+}
+
+pub fn merge_commit(repo: &Repository, sha: &str) -> Result<(), String> {
+    create_safety_ref(repo, "merge")?;
+    
+    let commit = repo
+        .find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Commit not found: {}", e))?;
+    
+    let mut opts = git2::MergeOptions::new();
+    repo.merge(&commit, Some(&mut opts), None)
+        .map_err(|e| format!("Merge failed: {}", e))?;
+    
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+    if index.has_conflicts() {
+        return Err("Merge resulted in conflicts. Please resolve them.".to_string());
+    }
+    
+    let tree_id = index.write_tree().map_err(|e| e.to_string())?;
+    let tree = repo.find_tree(tree_id).map_err(|e| e.to_string())?;
+    let signature = repo.signature().map_err(|e| e.to_string())?;
+    
+    let head = repo
+        .head()
+        .map_err(|e| format!("Failed to get HEAD: {}", e))?;
+    let parent = head
+        .peel_to_commit()
+        .map_err(|e| format!("Failed to peel HEAD: {}", e))?;
+    
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        &format!("Merge commit {}", sha.substring(0, 7)),
+        &tree,
+        &[&parent, &commit],
+    )
+    .map_err(|e| e.to_string())?;
+    
+    repo.cleanup_state().map_err(|e| e.to_string())?;
     Ok(())
 }
 
