@@ -63,7 +63,7 @@ const clearTimeouts = () => {
 
 const error = ref<string | null>(null);
 const toast = useToast();
-const { showContextMenu } = useContextMenu();
+const { showContextMenu, hideContextMenu, isVisible, position, menuItems } = useContextMenu();
 
 // Modal State
 const showCloneModal = ref(false);
@@ -1269,7 +1269,7 @@ const handleClickOutside = (event: MouseEvent) => {
 
 <template>
   <Toast />
-  <ContextMenu />
+  <ContextMenu :visible="isVisible" :position="position" :items="menuItems" @close="hideContextMenu" />
   <div class="app flex flex-col h-screen bg-background text-foreground overflow-hidden font-sans">
     <!-- Header/Top Bar -->
     <header class="h-14 border-b border-border bg-card flex items-center px-6 justify-between flex-shrink-0 shadow-sm">

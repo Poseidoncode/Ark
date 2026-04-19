@@ -1038,7 +1038,7 @@ pub fn stash_branch(repo: &mut Repository, index: usize, branch_name: &str) -> R
         .find_tree(tree_id)
         .map_err(|e| format!("Failed to find tree: {}", e))?;
     
-    let head = repo
+    let _head = repo
         .head()
         .map_err(|e| format!("Failed to get HEAD: {}", e))?;
     
@@ -1046,13 +1046,13 @@ pub fn stash_branch(repo: &mut Repository, index: usize, branch_name: &str) -> R
         Some(&format!("refs/heads/{}", branch_name)),
         &signature,
         &signature,
-        &format!("Branch from stash {}", index),
+        &format!("Branch from stash"),
         &tree,
         &[],
     )
     .map_err(|e| format!("Failed to create branch from stash: {}", e))?;
     
-    repo.checkout_tree(&tree, None)
+    repo.checkout_tree(tree.as_object(), None)
         .map_err(|e| format!("Failed to checkout tree: {}", e))?;
     
     repo.set_head(&format!("refs/heads/{}", branch_name))
@@ -1235,7 +1235,7 @@ pub fn add_to_gitignore(repo: &Repository, file_path: &str) -> Result<(), String
 }
 
 pub fn read_file(repo: &Repository, file_path: &str) -> Result<String, String> {
-    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let _workdir = repo.workdir().ok_or("No working directory found")?;
     let full_path = validate_repo_path(repo, file_path)?;
     
     fs::read_to_string(full_path)
@@ -1258,7 +1258,7 @@ pub fn create_tag(repo: &Repository, name: &str, message: &str, sha: &str) -> Re
     
     repo.tag(
         name,
-        &commit,
+        commit.as_object(),
         &signature,
         message,
         false,
@@ -1278,7 +1278,7 @@ pub fn reset_branch(repo: &Repository, sha: &str) -> Result<(), String> {
     let mut checkout_opts = git2::build::CheckoutBuilder::new();
     checkout_opts.force();
     
-    repo.reset(&commit, git2::ResetType::Hard, Some(&mut checkout_opts))
+    repo.reset(commit.as_object(), git2::ResetType::Hard, Some(&mut checkout_opts))
         .map_err(|e| format!("Failed to reset branch: {}", e))?;
     
     Ok(())
@@ -1292,7 +1292,9 @@ pub fn merge_commit(repo: &Repository, sha: &str) -> Result<(), String> {
         .map_err(|e| format!("Commit not found: {}", e))?;
     
     let mut opts = git2::MergeOptions::new();
-    repo.merge(&commit, Some(&mut opts), None)
+    let annotated_commit = repo.find_annotated_commit(commit.id())
+        .map_err(|e| format!("Failed to create annotated commit: {}", e))?;
+    repo.merge(&[&annotated_commit], Some(&mut opts), None)
         .map_err(|e| format!("Merge failed: {}", e))?;
     
     let mut index = repo.index().map_err(|e| e.to_string())?;
@@ -1315,7 +1317,7 @@ pub fn merge_commit(repo: &Repository, sha: &str) -> Result<(), String> {
         Some("HEAD"),
         &signature,
         &signature,
-        &format!("Merge commit {}", sha.substring(0, 7)),
+        &format!("Merge commit {}", &sha[..7.min(sha.len())]),
         &tree,
         &[&parent, &commit],
     )
