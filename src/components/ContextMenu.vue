@@ -131,16 +131,16 @@ onUnmounted(() => {
     <div
       v-if="visible"
       ref="menuRef"
-      class="fixed z-50 min-w-[200px] py-1 bg-card dark:bg-[#1e1e1e] border border-border dark:border-[#333] rounded-lg shadow-xl outline-none"
+      class="fixed z-50 min-w-[200px] py-1 bg-card border border-border rounded-lg shadow-xl outline-none"
       :style="menuStyles"
       role="menu"
       tabindex="-1"
     >
       <template v-for="(item, index) in items" :key="index">
         <!-- Divider -->
-        <div 
-          v-if="item.divider" 
-          class="h-px bg-border dark:bg-[#333] my-1 mx-2"
+        <div
+          v-if="item.divider"
+          class="h-px bg-border my-1 mx-2"
           role="separator"
         ></div>
         
