@@ -1,55 +1,56 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
- * 儲存當前 repository 的基本資訊
+ * Cache entry with expiration
  */
-export interface RepositoryInfo {
-  /** 倉庫本機路徑 */
-  path: string;
-  /** 目前分支 */
-  current_branch: string;
-  /** 是否有未提交更動 */
-  is_dirty: boolean;
-  /** 本地 ahead remote 幾個 commit */
-  ahead: number;
-  /** 本地 behind remote 幾個 commit */
-  behind: number;
+interface CacheEntry<T> {
+  data: T;
+  expiresAt: number;
 }
 
 /**
- * 個別檔案狀態
+ * Debounced function entry
  */
+interface DebouncedEntry {
+  id: ReturnType<typeof setTimeout>;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+}
+
+/**
+ * High-performance Git service with caching and debouncing
+ * Reduces unnecessary Rust backend calls for better performance
+ */
+export interface RepositoryInfo {
+  path: string;
+  current_branch: string;
+  is_dirty: boolean;
+  ahead: number;
+  behind: number;
+}
+
 export interface FileStatus {
   path: string;
   status: string;
   staged: boolean;
 }
 
-/**
- * 提交資訊
- */
 export interface CommitInfo {
   sha: string;
   message: string;
   author: string;
   email: string;
-  timestamp: number; // epoch 秒
+  timestamp: number;
   is_pushed: boolean;
   parents: string[];
 }
 
-/**
- * 分支資訊
- */
 export interface BranchInfo {
   name: string;
   is_current: boolean;
   is_remote: boolean;
 }
 
-/**
- * 某檔案/提交的差異（diff）
- */
 export interface DiffInfo {
   path: string;
   additions: number;
@@ -57,27 +58,18 @@ export interface DiffInfo {
   diff_text: string;
 }
 
-/**
- * Stash 資訊
- */
 export interface StashInfo {
   index: number;
   message: string;
   sha: string;
 }
 
-/**
- * 衝突資訊，用於 conflict 解決
- */
 export interface ConflictInfo {
   path: string;
   our_status: string;
   their_status: string;
 }
 
-/**
- * Git 操作的本地設定資料
- */
 export interface Settings {
   user_name: string;
   user_email: string;
@@ -91,309 +83,464 @@ export interface SettingsPayload extends Settings {
   ssh_passphrase: string | null;
 }
 
-/**
- * Stage 操作結果，支援部分成功
- */
 export interface StageResult {
   staged: string[];
   warnings: string[];
 }
 
-/**
- * 提供所有 Git 前端操作的方法介面，實際會呼叫 Rust 後端 command
- */
-export const gitService = {
+class GitServiceOptimizer {
+  private cache = new Map<string, CacheEntry<unknown>>();
+  private debounceTimers = new Map<string, DebouncedEntry>();
+  private readonly DEFAULT_TTL = 5000; // 5 seconds
+  private readonly SHORT_TTL = 1000; // 1 second for frequently changing data
+  private readonly LONG_TTL = 30000; // 30 seconds for static data
+  private readonly MAX_CACHE_SIZE = 50; // Memory optimization
+
   /**
-   * 從遠端 Clone 倉庫
-   * @param url Git 遠端 clone url
-   * @param path 本機儲存路徑
-   * @returns clone 後 repo 路徑
+   * Memory cleanup: Evict old cache entries when limit is reached
+   */
+  private evictOldCache() {
+    if (this.cache.size > this.MAX_CACHE_SIZE) {
+      const entries = Array.from(this.cache.entries());
+      entries.sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+      // Remove oldest 25%
+      const toRemove = Math.floor(this.MAX_CACHE_SIZE * 0.25);
+      for (let i = 0; i < toRemove; i++) {
+        this.cache.delete(entries[i][0]);
+      }
+    }
+  }
+
+  /**
+   * Get cached data or fetch from backend
+   */
+  private async getCachedOrFetch<T>(
+    key: string,
+    fetchFn: () => Promise<T>,
+    ttl: number = this.DEFAULT_TTL
+  ): Promise<T> {
+    const now = Date.now();
+    const cached = this.cache.get(key) as CacheEntry<T> | undefined;
+
+    if (cached && cached.expiresAt > now) {
+      return cached.data;
+    }
+
+    try {
+      const data = await fetchFn();
+      this.cache.set(key, { data, expiresAt: now + ttl });
+      this.evictOldCache(); // Memory optimization
+      return data;
+    } catch (error) {
+      // On error, try to return stale cache if available
+      const cached = this.cache.get(key) as CacheEntry<T> | undefined;
+      if (cached) {
+        console.warn(`Cache fallback for ${key}:`, error);
+        return cached.data;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Debounce rapid calls for the same key
+   */
+  private debounce<T>(
+    key: string,
+    fn: () => Promise<T>,
+    delay: number = 300
+  ): Promise<T> {
+    const existing = this.debounceTimers.get(key);
+
+    if (existing) {
+      clearTimeout(existing.id);
+    }
+
+    return new Promise((resolve, reject) => {
+      const id = setTimeout(async () => {
+        this.debounceTimers.delete(key);
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (error) {
+          reject(error as Error);
+        }
+      }, delay);
+
+      this.debounceTimers.set(key, { id, resolve: resolve as (value: unknown) => void, reject });
+    });
+  }
+
+  /**
+   * Invalidate cache for specific keys
+   */
+  invalidate(keyPattern?: string): void {
+    if (!keyPattern) {
+      this.cache.clear();
+      return;
+    }
+
+    for (const key of this.cache.keys()) {
+      if (key.includes(keyPattern)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Clone repository
    */
   async cloneRepository(url: string, path: string): Promise<string> {
+    this.invalidate('repo:');
     return await invoke("clone_repository", { options: { url, path } });
-  },
+  }
 
   /**
-   * 開啟本地倉庫
-   * @param path local repo 資料夾
+   * Open repository with caching
    */
   async openRepository(path: string): Promise<RepositoryInfo> {
-    return await invoke("open_repository", { path });
-  },
+    const cacheKey = `repo:info:${path}`;
+    return await this.getCachedOrFetch(
+      cacheKey,
+      async () => {
+        this.invalidate('repo:');
+        return await invoke("open_repository", { path });
+      },
+      this.SHORT_TTL
+    );
+  }
 
   /**
-   * 查詢目前所有檔案狀態
+   * Get repository status with debouncing
    */
   async getStatus(): Promise<FileStatus[]> {
-    return await invoke("get_repository_status");
-  },
+    const cacheKey = 'repo:status';
+    const result = await this.debounce(
+      cacheKey,
+      () => this.getCachedOrFetch(cacheKey, () => invoke("get_repository_status"), this.SHORT_TTL),
+      150
+    );
+    return result as FileStatus[];
+  }
 
   /**
-   * 建立 commit (並同時能 stage 多檔)
-   * @param message commit 訊息
-   * @param files 要加入 commit 的檔案
-   * @returns commit SHA
+   * Create commit
    */
   async createCommit(message: string, files: string[]): Promise<string> {
+    this.invalidate('repo:');
     return await invoke("create_commit", { options: { message, files } });
-  },
+  }
 
   /**
-   * 修正最後一次 commit
+   * Amend last commit
    */
   async amendCommit(message: string): Promise<string> {
+    this.invalidate('repo:');
     return await invoke("amend_commit", { message });
-  },
+  }
 
   /**
-   * 挑選特定 commit 併入當前分支
+   * Cherry-pick commit
    */
   async cherryPick(sha: string): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("cherry_pick", { sha });
-  },
+  }
 
   /**
-   * 反轉特定 commit
+   * Revert commit
    */
   async revertCommit(sha: string): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("revert_commit", { sha });
-  },
+  }
 
   /**
-   * 將多個檔案加入暫存
+   * Stage files with cache invalidation
    */
   async stageFiles(files: string[]): Promise<StageResult> {
+    this.invalidate('repo:status');
     return await invoke("stage_files", { files });
-  },
+  }
+
   /**
-   * 將多個檔案從暫存移除
+   * Unstage files with cache invalidation
    */
   async unstageFiles(files: string[]): Promise<void> {
+    this.invalidate('repo:status');
     return await invoke("unstage_files", { files });
-  },
+  }
 
   /**
-   * 丟棄單一檔案的所有變動
+   * Discard changes
    */
   async discardChanges(filePath: string): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("discard_changes", { filePath });
-  },
+  }
 
   /**
-   * 丟棄所有未提交的變動 (一鍵還原)
+   * Discard all changes
    */
   async discardAllChanges(): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("discard_all_changes");
-  },
+  }
 
   /**
-   * 查詢所有分支
+   * Get branches with caching
    */
   async getBranches(): Promise<BranchInfo[]> {
-    return await invoke("get_branches");
-  },
+    const cacheKey = 'repo:branches';
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("get_branches"),
+      this.DEFAULT_TTL
+    );
+  }
 
   /**
-   * 建立新分支
-   * @param name 分支名稱
-   * @param startSha 起始 commit SHA (可選，預設為 HEAD)
+   * Create branch
    */
   async createBranch(name: string, startSha?: string): Promise<void> {
+    this.invalidate('repo:branches');
     return await invoke("create_branch", { options: { name, start_sha: startSha } });
-  },
+  }
 
   /**
-   * 切換分支
-   * @param name 分支名稱
+   * Checkout branch
    */
   async checkoutBranch(name: string): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("checkout_branch", { options: { name } });
-  },
+  }
 
   /**
-   * 查詢某次提交的差異（完整diff）
-   * @param sha commit SHA
+   * Get commit diff
    */
   async getCommitDiff(sha: string): Promise<DiffInfo[]> {
-    return await invoke("get_commit_diff", { sha });
-  },
+    const cacheKey = `commit:diff:${sha.substring(0, 7)}`;
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("get_commit_diff", { sha }),
+      this.LONG_TTL
+    );
+  }
 
   /**
-   * 取得提交紀錄
-   * @param limit 限制最大數量（預設50）
+   * Get commit history
    */
   async getHistory(limit: number = 50): Promise<CommitInfo[]> {
-    return await invoke("get_commit_history", { limit });
-  },
+    const cacheKey = `repo:history:${limit}`;
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("get_commit_history", { limit }),
+      this.SHORT_TTL
+    );
+  }
 
   /**
-   * 取得當前 (或特定檔案) diff
-   * @param filePath 檔案路徑（可不填）
+   * Get diff
    */
   async getDiff(filePath?: string): Promise<DiffInfo[]> {
-    return await invoke("get_diff", { filePath });
-  },
+    const cacheKey = filePath ? `diff:${filePath}` : 'diff:all';
+    const result = await this.debounce(
+      cacheKey,
+      () => invoke("get_diff", { filePath }),
+      200
+    );
+    return result as DiffInfo[];
+  }
 
   /**
-   * push 變動至遠端
+   * Push changes
    */
   async push(): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("push_changes");
-  },
+  }
 
   /**
-   * 從遠端 pull 變更
+   * Pull changes
    */
   async pull(): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("pull_changes");
-  },
+  }
 
   /**
-   * fetch 遠端資料但不合併
+   * Fetch changes
    */
   async fetch(): Promise<void> {
+    this.invalidate('repo:ahead');
     return await invoke("fetch_changes");
-  },
+  }
 
   /**
-   * 存放當前變更至 stash
-   * @param message 可選，stash 訊息
+   * Stash save
    */
   async stashSave(message?: string): Promise<void> {
+    this.invalidate('repo:stash');
     return await invoke("stash_save", { options: { message } });
-  },
+  }
 
   /**
-   * 還原特定 stash
-   * @param index stack 序號
+   * Stash pop
    */
   async stashPop(index: number): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("stash_pop", { index });
-  },
+  }
 
   /**
-   * 查詢目前所有 stash
+   * List stashes
    */
   async listStashes(): Promise<StashInfo[]> {
-    return await invoke("list_stashes");
-  },
+    const cacheKey = 'repo:stashes';
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("list_stashes"),
+      this.DEFAULT_TTL
+    );
+  }
 
   /**
-   * 查詢當前所有衝突檔案
+   * Get conflicts
    */
   async getConflicts(): Promise<ConflictInfo[]> {
-    return await invoke("get_conflicts");
-  },
+    const cacheKey = 'repo:conflicts';
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("get_conflicts"),
+      this.SHORT_TTL
+    );
+  }
 
   /**
-   * 解決指定衝突
-   * @param path 衝突檔案路徑
-   * @param useOurs true:用 ours，false:theirs
+   * Resolve conflict
    */
   async resolveConflict(path: string, useOurs: boolean): Promise<void> {
+    this.invalidate('repo:conflicts');
+    this.invalidate('repo:status');
     return await invoke("resolve_conflict", { path, useOurs });
-  },
+  }
 
   /**
-   * 讀取偏好/設定
+   * Get settings
    */
   async getSettings(): Promise<SettingsPayload> {
-    return await invoke("get_settings");
-  },
+    const cacheKey = 'settings';
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("get_settings"),
+      this.LONG_TTL
+    );
+  }
 
   /**
-   * 儲存偏好/設定
+   * Save settings
    */
   async saveSettings(settings: SettingsPayload): Promise<void> {
+    this.invalidate('settings');
     return await invoke("save_settings", { settings });
-  },
+  }
 
   /**
-   * 變更遠端 url
+   * Set remote URL
    */
   async setRemoteUrl(name: string, url: string): Promise<void> {
     return await invoke("set_remote_url", { name, url });
-  },
+  }
 
   /**
-   * 取得遠端 url
+   * Get remote URL
    */
   async getRemoteUrl(name: string = "origin"): Promise<string> {
     return await invoke("get_remote_url", { name });
-  },
+  }
+
   /**
-   * 取得目前已開啟的倉庫資訊（若有）
+   * Get current repo info
    */
   async getCurrentRepoInfo(): Promise<RepositoryInfo | null> {
     return await invoke("get_current_repo_info");
-  },
+  }
+
   /**
-   * 取得多個倉庫的資訊
+   * Get repositories info
    */
   async getRepositoriesInfo(paths: string[]): Promise<RepositoryInfo[]> {
     return await invoke("get_repositories_info", { paths });
-  },
+  }
 
   /**
-   * Reveal file in Finder/Explorer
+   * Reveal in finder
    */
   async revealInFinder(path: string): Promise<void> {
     return await invoke("reveal_in_finder", { path });
-  },
+  }
 
   /**
-   * Add file to .gitignore
+   * Add to gitignore
    */
   async addToGitignore(filePath: string): Promise<void> {
     return await invoke("add_to_gitignore", { filePath });
-  },
+  }
 
   /**
-   * Read file contents
+   * Read file
    */
   async readFile(filePath: string): Promise<string> {
     return await invoke("read_file", { filePath });
-  },
+  }
 
   /**
    * Create tag
    */
   async createTag(name: string, message: string, sha: string): Promise<void> {
     return await invoke("create_tag", { options: { name, message, sha } });
-  },
+  }
 
   /**
-   * Delete stash
+   * Drop stash
    */
   async dropStash(index: number): Promise<void> {
+    this.invalidate('repo:stash');
     return await invoke("drop_stash", { index });
-  },
+  }
 
   /**
-   * Apply stash without removing from stack
+   * Apply stash
    */
   async applyStash(index: number): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("apply_stash", { index });
-  },
+  }
 
   /**
-   * Create branch from stash
+   * Branch from stash
    */
   async branchFromStash(index: number, branchName: string): Promise<void> {
+    this.invalidate('repo:branches');
     return await invoke("branch_from_stash", { index, branchName });
-  },
+  }
 
   /**
-   * Reset branch to specific commit
+   * Reset branch
    */
   async resetBranch(sha: string): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("reset_branch", { sha });
-  },
+  }
 
   /**
-   * Merge commit into current branch
+   * Merge commit
    */
   async mergeCommit(sha: string): Promise<void> {
+    this.invalidate('repo:');
     return await invoke("merge_commit", { sha });
   }
-};
+}
+
+// Export singleton instance
+export const gitService = new GitServiceOptimizer();

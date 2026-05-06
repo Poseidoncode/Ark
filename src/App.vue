@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, computed } from 'vue';
+import { ref, onMounted, onUnmounted, watch, computed, onErrorCaptured } from 'vue';
 import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type SettingsPayload, type DiffInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
@@ -10,6 +10,25 @@ import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import { listen } from '@tauri-apps/api/event';
 import { homeDir } from '@tauri-apps/api/path';
 import DiffViewer from './components/DiffViewer.vue';
+
+// Memory optimization: reuse refs and limit array growth
+const MAX_TIMEOUTS = 10;
+const MAX_STASHES = 100;
+const MAX_COMMITS = 200;
+const abortController = ref<AbortController | null>(null);
+
+onErrorCaptured((err, instance, info) => {
+  console.error('Error captured in component:', err, info);
+  toast.error(err instanceof Error ? err.message : String(err), { title: 'Component Error' });
+  return false;
+});
+
+// Abort all pending operations on unmount
+const abortPendingOperations = () => {
+  if (abortController.value) {
+    abortController.value.abort();
+  }
+};
 
 const repoInfo = ref<RepositoryInfo | null>(null);
 const fileStatuses = ref<FileStatus[]>([]);
@@ -60,6 +79,9 @@ const clearTimeouts = () => {
   timeoutIds.value.forEach(id => clearTimeout(id));
   timeoutIds.value = [];
 };
+
+// Global operation lock to prevent concurrent mutations
+const isOperationInProgress = ref(false);
 
 const error = ref<string | null>(null);
 const toast = useToast();
@@ -359,8 +381,12 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
     {
       label: 'Copy Path',
       action: async () => {
-        await navigator.clipboard.writeText(file.path);
-        toast.success('Path copied', { title: 'Copied' });
+        try {
+          await navigator.clipboard.writeText(file.path);
+          toast.success('Path copied', { title: 'Copied' });
+        } catch (err) {
+          console.error('Clipboard error:', err);
+        }
       }
     },
     {
@@ -568,29 +594,30 @@ const fetchSettings = async () => {
 };
 
 const refreshRepo = async () => {
-  if (!repoInfo.value) return;
+  if (!repoInfo.value || isOperationInProgress.value) return;
+  isOperationInProgress.value = true;
   try {
-    const status = await gitService.getStatus();
+    const [status, branchList, stashList, conflictList] = await Promise.all([
+      gitService.getStatus(),
+      gitService.getBranches(),
+      gitService.listStashes(),
+      gitService.getConflicts()
+    ]);
     fileStatuses.value = status;
-
-    const branchList = await gitService.getBranches();
     branches.value = branchList;
-
-    const stashList = await gitService.listStashes();
-    stashes.value = stashList;
-
-    const conflictList = await gitService.getConflicts();
+    stashes.value = stashList.slice(0, MAX_STASHES);
     conflicts.value = conflictList;
     if (conflictList.length > 0 && view.value !== "conflicts") {
       view.value = "conflicts";
     }
-
-    if (view.value === "history") {
+    if (view.value === "history" && commits.value.length === 0) {
       const history = await gitService.getHistory(50);
-      commits.value = history;
+      commits.value = history.slice(0, MAX_COMMITS);
     }
   } catch (err) {
     error.value = err as string;
+  } finally {
+    isOperationInProgress.value = false;
   }
 };
 
@@ -598,6 +625,7 @@ let unlisten: (() => void) | null = null;
 
 onMounted(async () => {
   window.addEventListener('click', handleClickOutside);
+  abortController.value = new AbortController();
   await fetchSettings();
   try {
     const info = await gitService.getCurrentRepoInfo();
@@ -619,6 +647,7 @@ onUnmounted(() => {
   }
   window.removeEventListener('click', handleClickOutside);
   clearTimeouts();
+  abortPendingOperations();
 });
 
 watch([repoInfo, view], () => {

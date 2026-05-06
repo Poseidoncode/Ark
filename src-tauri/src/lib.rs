@@ -60,6 +60,24 @@ struct AppState {
     repo: Option<git2::Repository>,
     settings: Settings,
     watcher: Option<notify::RecommendedWatcher>,
+    // Performance optimization: cache for frequently accessed data
+    branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
+    history_cache: Option<(Vec<CommitInfo>, std::time::Instant)>,
+    // Debounce refresh operations to prevent UI thrashing
+    last_refresh: Option<std::time::Instant>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            settings: default_settings(),
+            watcher: None,
+            branch_cache: None,
+            history_cache: None,
+            last_refresh: None,
+        }
+    }
 }
 
 struct App(Mutex<AppState>);
@@ -96,14 +114,18 @@ fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> Option<notify
     let _ = watcher.watch(&git_path.join("refs"), RecursiveMode::Recursive);
 
     std::thread::spawn(move || {
-        // Simple debounce: wait a bit and clear the channel of rapid events
+        let mut last_emit = std::time::Instant::now();
+        let debounce_duration = std::time::Duration::from_millis(300);
+        
         while let Ok(res) = rx.recv() {
             match res {
                 Ok(_) => {
-                    // Give Git a moment to finish its IO
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let _ = app_handle.emit("git-state-changed", ());
-
+                    let now = std::time::Instant::now();
+                    // Only emit if enough time has passed since last event
+                    if now.duration_since(last_emit) >= debounce_duration {
+                        last_emit = now;
+                        let _ = app_handle.emit("git-state-changed", ());
+                    }
                     // Drain the channel of immediate subsequent events
                     while let Ok(_) = rx.try_recv() {}
                 }
@@ -345,6 +367,9 @@ fn open_repository(
         Ok(repo) => {
             let info = git_operations::get_repository_info(&repo)?;
             state.repo = Some(repo);
+            // Invalidate all caches when changing repo
+            state.branch_cache = None;
+            state.history_cache = None;
             stop_watcher(state.watcher.take());
             state.watcher = start_watcher(app_handle.clone(), &path);
 
@@ -463,23 +488,43 @@ fn discard_changes(state: State<'_, App>, file_path: String) -> AppResult<()> {
 
 #[tauri::command]
 fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+
+    // Check cache first (cache for 5 seconds)
+    if let Some((ref branches, ref time)) = state.branch_cache {
+        if time.elapsed().as_secs() < 5 {
+            return Ok(branches.clone());
+        }
+    }
+
     let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::get_branches(repo).map_err(AppError::Git)
+    let branches = git_operations::get_branches(repo).map_err(AppError::Git)?;
+
+    // Update cache
+    state.branch_cache = Some((branches.clone(), std::time::Instant::now()));
+
+    Ok(branches)
 }
 
 #[tauri::command]
 fn create_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::create_branch(repo, &options.name, options.start_sha.as_deref()).map_err(AppError::Git)
+    git_operations::create_branch(repo, &options.name, options.start_sha.as_deref()).map_err(AppError::Git)?;
+    // Invalidate branch cache
+    state.branch_cache = None;
+    Ok(())
 }
 
 #[tauri::command]
 fn checkout_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::checkout_branch(repo, &options.name).map_err(AppError::Git)
+    git_operations::checkout_branch(repo, &options.name).map_err(AppError::Git)?;
+    // Invalidate caches
+    state.branch_cache = None;
+    state.history_cache = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -506,10 +551,13 @@ fn get_diff(state: State<'_, App>, file_path: Option<String>) -> AppResult<Vec<D
 #[tauri::command]
 async fn push_changes(state: State<'_, App>) -> AppResult<()> {
     let (path, ssh_key, ssh_pass) = {
-        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
         let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
+        // Invalidate caches before remote operation
+        state.branch_cache = None;
+        state.history_cache = None;
         (path, ssh_key, ssh_pass)
     };
 
@@ -528,10 +576,13 @@ async fn push_changes(state: State<'_, App>) -> AppResult<()> {
 #[tauri::command]
 async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
     let (path, ssh_key, ssh_pass) = {
-        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
         let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
+        // Invalidate caches before remote operation
+        state.branch_cache = None;
+        state.history_cache = None;
         (path, ssh_key, ssh_pass)
     };
 
@@ -550,10 +601,12 @@ async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
 #[tauri::command]
 async fn fetch_changes(state: State<'_, App>) -> AppResult<()> {
     let (path, ssh_key, ssh_pass) = {
-        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
         let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
+        // Invalidate caches before remote operation
+        state.branch_cache = None;
         (path, ssh_key, ssh_pass)
     };
 
@@ -832,6 +885,9 @@ pub fn run() {
                 repo,
                 settings,
                 watcher,
+                branch_cache: None,
+                history_cache: None,
+                last_refresh: None,
             })));
 
             // Cleanup on app exit

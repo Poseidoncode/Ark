@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Ark",
-  "version": "0.1.0",
-  "identifier": "com.infinity.Ark",
+  "version": "1.0.0",
+  "identifier": "com.ark.git",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,27 +13,38 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Ark",
-        "width": 800,
-        "height": 600,
-        "maximized": true
+        "title": "Ark - Git Client",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "maximized": true,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "visible": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https: data:; connect-src 'self' http://localhost:* ws://localhost:* ipc:;"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https: data:; connect-src 'self' http://localhost:* ws://localhost:* ipc:; font-src 'self' https://fonts.gstatic.com;"
     }
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "app"
-    ],
+    "targets": ["app", "dmg", "nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "shortDescription": "A high-performance Git client",
+    "longDescription": "Ark is a modern, elegant Git client built with Tauri for exceptional performance and native experience.",
+    "category": "DeveloperTool",
+    "windows": {
+      "allowDowngrades": true
+    }
   }
 }

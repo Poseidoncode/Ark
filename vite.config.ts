@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import { resolve } from "path";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -7,35 +8,69 @@ export default defineConfig({
   plugins: [vue()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  //
-  // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
-        protocol: "ws",
-        host,
-        port: 1421,
-      }
+          protocol: "ws",
+          host,
+          port: 1421,
+        }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+    fs: {
+      allow: [".."],
+    },
   },
-  // 3. to make use of `TAURI_DEBUG` and other env variables
-  // https://tauri.app/v1/api/config#buildconfig.beforedevcommand
   envPrefix: ["VITE_", "TAURI_"],
   build: {
-    // Tauri supports es2021
     target: process.env.TAURI_PLATFORM == "windows" ? "chrome105" : "safari13",
-    // don't minify for debug builds
+    // Minify for production
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
-    // produce sourcemaps for debug builds
+    // Sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_DEBUG,
+    // Better chunk splitting
+    chunkSizeWarningLimit: 500,
+    // Code splitting
+    cssCodeSplit: true,
+    // Optimization
+    reportCompressedSize: true,
+    // Assets inline threshold
+    assetsInlineLimit: 4096,
+    // Disable this for faster builds in dev
+    emptyOutDir: true,
+    // Manual chunks for better code splitting
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vue-vendor": ["vue"],
+          "virtual-scroller": ["vue-virtual-scroller"],
+          "tauri-api": ["@tauri-apps/api"],
+          "tauri-plugins": ["@tauri-apps/plugin-dialog", "@tauri-apps/plugin-opener"],
+        },
+      },
+    },
+  },
+  // Optimize deps
+  optimizeDeps: {
+    include: [
+      "vue",
+      "vue-virtual-scroller",
+      "@tauri-apps/api",
+      "@tauri-apps/plugin-dialog",
+      "@tauri-apps/plugin-opener",
+    ],
+    exclude: [],
+  },
+  // Resolve aliases
+  resolve: {
+    alias: {
+      "@": resolve(__dirname, "src"),
+    },
   },
 });

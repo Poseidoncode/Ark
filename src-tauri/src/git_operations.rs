@@ -358,12 +358,9 @@ pub fn stage_files(repo: &Repository, paths: Vec<String>) -> Result<StageResult,
                 Err(e) => warnings.push(format!("Failed to stage '{}': {}", path, e)),
             }
         } else {
-            // File was deleted externally — clean up index entry and record warning
+            // File was deleted externally — clean up index entry silently
             let _ = index.remove_path(relative_path);
-            warnings.push(format!(
-                "Skipped '{}': file not found (removed from index)",
-                path
-            ));
+            // Silently skip deleted files (matches GitHub Desktop behavior)
         }
     }
 
