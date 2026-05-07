@@ -16,11 +16,63 @@ use tauri::{Emitter, Listener, Manager, State};
 use crate::credential_store::CredentialStore;
 
 #[derive(Debug)]
+pub enum GitError {
+    NotFound(String),
+    Conflict(String),
+    PermissionDenied(String),
+    InvalidRef(String),
+    BranchExists(String),
+    CheckoutFailed(String),
+    MergeFailed(String),
+    RemoteNotFound(String),
+    AuthenticationFailed(String),
+    Other(String),
+}
+
+impl From<String> for GitError {
+    fn from(err: String) -> Self {
+        GitError::Other(err)
+    }
+}
+
+impl From<&str> for GitError {
+    fn from(err: &str) -> Self {
+        GitError::Other(err.to_string())
+    }
+}
+
+#[derive(Debug)]
 pub enum AppError {
-    Git(String),
+    Git(GitError),
     Io(String),
     Lock(String),
     Config(String),
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitError::NotFound(msg) => write!(f, "NotFound: {}", msg),
+            GitError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            GitError::PermissionDenied(msg) => write!(f, "PermissionDenied: {}", msg),
+            GitError::InvalidRef(msg) => write!(f, "InvalidRef: {}", msg),
+            GitError::BranchExists(msg) => write!(f, "BranchExists: {}", msg),
+            GitError::CheckoutFailed(msg) => write!(f, "CheckoutFailed: {}", msg),
+            GitError::MergeFailed(msg) => write!(f, "MergeFailed: {}", msg),
+            GitError::RemoteNotFound(msg) => write!(f, "RemoteNotFound: {}", msg),
+            GitError::AuthenticationFailed(msg) => write!(f, "AuthenticationFailed: {}", msg),
+            GitError::Other(msg) => write!(f, "Other: {}", msg),
+        }
+    }
+}
+
+impl serde::Serialize for GitError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 impl serde::Serialize for AppError {
@@ -40,21 +92,33 @@ impl serde::Serialize for AppError {
 
 impl From<git2::Error> for AppError {
     fn from(err: git2::Error) -> Self {
-        AppError::Git(err.to_string())
+        let code = err.code();
+        let message = err.message().to_string();
+        
+        let git_error = match code {
+            git2::ErrorCode::NotFound => GitError::NotFound(message),
+            git2::ErrorCode::MergeConflict => GitError::Conflict(message),
+            git2::ErrorCode::Auth => GitError::AuthenticationFailed(message),
+            git2::ErrorCode::Certificate => GitError::AuthenticationFailed(message),
+            _ => GitError::Other(message),
+        };
+        
+        AppError::Git(git_error)
     }
 }
 
 impl From<String> for AppError {
     fn from(err: String) -> Self {
-        AppError::Git(err)
+        AppError::Git(GitError::Other(err))
     }
 }
 
 impl From<&str> for AppError {
     fn from(err: &str) -> Self {
-        AppError::Git(err.to_string())
+        AppError::Git(GitError::Other(err.to_string()))
     }
 }
+
 
 struct AppState {
     repo: Option<git2::Repository>,
@@ -87,7 +151,7 @@ struct App(Mutex<AppState>);
 type AppResult<T> = Result<T, AppError>;
 
 fn require_open_repository(repo: Option<&git2::Repository>) -> AppResult<&git2::Repository> {
-    repo.ok_or(AppError::Git("No repository open".to_string()))
+    repo.ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))
 }
 
 fn stop_watcher(watcher: Option<notify::RecommendedWatcher>) {
@@ -393,9 +457,9 @@ fn open_repository(
                     state.settings.last_opened_repository = None;
                 }
                 let _ = save_settings_to_disk(&state, &app_handle);
-                return Err(AppError::Git("Repository path not found. Removed from list.".to_string()));
+                return Err(AppError::Git(GitError::NotFound("Repository path not found. Removed from list.".to_string())));
             }
-            Err(AppError::Git(e))
+            Err(AppError::Git(GitError::Other(e)))
         }
     }
 }
@@ -425,8 +489,8 @@ async fn clone_repository(
         )
     })
     .await
-    .map_err(|e| AppError::Git(format!("Spawn error: {}", e)))?
-    .map_err(AppError::Git)?;
+    .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
+    .map_err(|e| AppError::Git(e.into()))?;
 
     // Re-acquire lock to update state
     let mut state_lock = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
@@ -445,7 +509,7 @@ async fn clone_repository(
             save_settings_to_disk(&state_lock, &app_handle)?;
             Ok(path)
         }
-        Err(e) => Err(AppError::Git(e)),
+        Err(e) => Err(AppError::Git(GitError::Other(e))),
     }
 }
 
@@ -453,39 +517,39 @@ async fn clone_repository(
 fn get_repository_status(state: State<'_, App>) -> AppResult<Vec<FileStatus>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::get_status(repo).map_err(AppError::Git)
+    git_operations::get_status(repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn create_commit(state: State<'_, App>, options: CommitOptions) -> AppResult<String> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
     let stage_result = git_operations::stage_files(repo, options.files)?;
     if stage_result.staged.is_empty() && !stage_result.warnings.is_empty() {
-        return Err(AppError::Git(format!("No files could be staged: {}", stage_result.warnings.join("; "))));
+        return Err(AppError::Git(GitError::Other(format!("No files could be staged: {}", stage_result.warnings.join("; ")))));
     }
-    git_operations::create_commit(repo, &options.message).map_err(AppError::Git)
+    git_operations::create_commit(repo, &options.message).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn stage_files(state: State<'_, App>, files: Vec<String>) -> AppResult<StageResult> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::stage_files(repo, files).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::stage_files(repo, files).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn unstage_files(state: State<'_, App>, files: Vec<String>) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::unstage_files(repo, files).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::unstage_files(repo, files).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn discard_changes(state: State<'_, App>, file_path: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::discard_changes(repo, &file_path).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::discard_changes(repo, &file_path).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
@@ -499,8 +563,8 @@ fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
         }
     }
 
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    let branches = git_operations::get_branches(repo).map_err(AppError::Git)?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    let branches = git_operations::get_branches(repo).map_err(|e| AppError::Git(e.into()))?;
 
     // Update cache
     state.branch_cache = Some((branches.clone(), std::time::Instant::now()));
@@ -511,8 +575,8 @@ fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
 #[tauri::command]
 fn create_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::create_branch(repo, &options.name, options.start_sha.as_deref()).map_err(AppError::Git)?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::create_branch(repo, &options.name, options.start_sha.as_deref()).map_err(|e| AppError::Git(e.into()))?;
     // Invalidate branch cache
     state.branch_cache = None;
     Ok(())
@@ -521,8 +585,8 @@ fn create_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()>
 #[tauri::command]
 fn checkout_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::checkout_branch(repo, &options.name).map_err(AppError::Git)?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::checkout_branch(repo, &options.name).map_err(|e| AppError::Git(e.into()))?;
     // Invalidate caches
     state.branch_cache = None;
     state.history_cache = None;
@@ -532,30 +596,30 @@ fn checkout_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<(
 #[tauri::command]
 fn get_commit_diff(state: State<'_, App>, sha: String) -> AppResult<Vec<DiffInfo>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::get_commit_diff(repo, &sha).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::get_commit_diff(repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn get_commit_history(state: State<'_, App>, limit: usize) -> AppResult<Vec<CommitInfo>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::get_commit_history(repo, limit).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::get_commit_history(repo, limit).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn get_diff(state: State<'_, App>, file_path: Option<String>) -> AppResult<Vec<DiffInfo>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::get_diff(repo, file_path.as_deref()).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::get_diff(repo, file_path.as_deref()).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 async fn push_changes(state: State<'_, App>) -> AppResult<()> {
     let (path, ssh_key, ssh_pass) = {
         let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-        let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-        let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
+        let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+        let path = repo.workdir().ok_or(AppError::Git(GitError::InvalidRef("No workdir".to_string())))?.to_path_buf();
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
         // Invalidate caches before remote operation
         state.branch_cache = None;
@@ -569,18 +633,18 @@ async fn push_changes(state: State<'_, App>) -> AppResult<()> {
             &repo,
             ssh_key.as_deref(),
             ssh_pass.as_deref(),
-        ).map_err(AppError::Git)
+        ).map_err(|e| AppError::Git(e.into()))
     })
     .await
-    .map_err(|e| AppError::Git(format!("Spawn error: {}", e)))?
+    .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
 }
 
 #[tauri::command]
 async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
     let (path, ssh_key, ssh_pass) = {
         let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-        let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-        let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
+        let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+        let path = repo.workdir().ok_or(AppError::Git(GitError::InvalidRef("No workdir".to_string())))?.to_path_buf();
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
         // Invalidate caches before remote operation
         state.branch_cache = None;
@@ -594,18 +658,18 @@ async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
             &repo,
             ssh_key.as_deref(),
             ssh_pass.as_deref(),
-        ).map_err(AppError::Git)
+        ).map_err(|e| AppError::Git(e.into()))
     })
     .await
-    .map_err(|e| AppError::Git(format!("Spawn error: {}", e)))?
+    .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
 }
 
 #[tauri::command]
 async fn fetch_changes(state: State<'_, App>) -> AppResult<()> {
     let (path, ssh_key, ssh_pass) = {
         let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-        let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-        let path = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?.to_path_buf();
+        let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+        let path = repo.workdir().ok_or(AppError::Git(GitError::InvalidRef("No workdir".to_string())))?.to_path_buf();
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
         // Invalidate caches before remote operation
         state.branch_cache = None;
@@ -618,73 +682,73 @@ async fn fetch_changes(state: State<'_, App>) -> AppResult<()> {
             &repo,
             ssh_key.as_deref(),
             ssh_pass.as_deref(),
-        ).map_err(AppError::Git)
+        ).map_err(|e| AppError::Git(e.into()))
     })
     .await
-    .map_err(|e| AppError::Git(format!("Spawn error: {}", e)))?
+    .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
 }
 
 #[tauri::command]
 fn stash_save(state: State<'_, App>, options: StashOptions) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_mut().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::stash_save(repo, options.message.as_deref()).map_err(AppError::Git)
+    let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::stash_save(repo, options.message.as_deref()).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn stash_pop(state: State<'_, App>, index: usize) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_mut().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::stash_pop(repo, index).map_err(AppError::Git)
+    let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::stash_pop(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn list_stashes(state: State<'_, App>) -> AppResult<Vec<StashInfo>> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_mut().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::stash_list(repo).map_err(AppError::Git)
+    let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::stash_list(repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn get_conflicts(state: State<'_, App>) -> AppResult<Vec<ConflictInfo>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::get_conflicts(repo).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::get_conflicts(repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn resolve_conflict(state: State<'_, App>, path: String, use_ours: bool) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::resolve_conflict(repo, &path, use_ours).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::resolve_conflict(repo, &path, use_ours).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn amend_commit(state: State<'_, App>, message: String) -> AppResult<String> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::amend_last_commit(repo, &message).map_err(AppError::Git)
+    git_operations::amend_last_commit(repo, &message).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn cherry_pick(state: State<'_, App>, sha: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::cherry_pick(repo, &sha).map_err(AppError::Git)
+    git_operations::cherry_pick(repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn revert_commit(state: State<'_, App>, sha: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::revert_commit(repo, &sha).map_err(AppError::Git)
+    git_operations::revert_commit(repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn discard_all_changes(state: State<'_, App>) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::discard_all_changes(repo).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::discard_all_changes(repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
@@ -714,15 +778,15 @@ fn save_settings(
 #[tauri::command]
 fn set_remote_url(state: State<'_, App>, name: String, url: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::set_remote_url(repo, &name, &url).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::set_remote_url(repo, &name, &url).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn get_remote_url(state: State<'_, App>, name: String) -> AppResult<String> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::get_remote_url(repo, &name).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::get_remote_url(repo, &name).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
@@ -772,7 +836,7 @@ async fn get_repositories_info(
 fn get_current_repo_info(state: State<'_, App>) -> AppResult<Option<RepositoryInfo>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     if let Some(repo) = state.repo.as_ref() {
-        let info = git_operations::get_repository_info(repo).map_err(AppError::Git)?;
+        let info = git_operations::get_repository_info(repo).map_err(|e| AppError::Git(e.into()))?;
         Ok(Some(info))
     } else {
         Ok(None)
@@ -816,92 +880,92 @@ fn reveal_in_finder(path: String) -> AppResult<()> {
 #[tauri::command]
 fn add_to_gitignore(state: State<'_, App>, file_path: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::add_to_gitignore(repo, &file_path).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::add_to_gitignore(repo, &file_path).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn read_file(state: State<'_, App>, file_path: String) -> AppResult<String> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::read_file(repo, &file_path).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::read_file(repo, &file_path).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn create_tag(state: State<'_, App>, options: TagOptions) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::create_tag(repo, &options.name, &options.message, &options.sha).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::create_tag(repo, &options.name, &options.message, &options.sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn drop_stash(state: State<'_, App>, index: usize) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_mut().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::stash_drop(repo, index).map_err(AppError::Git)
+    let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::stash_drop(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn apply_stash(state: State<'_, App>, index: usize) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_mut().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::stash_apply(repo, index).map_err(AppError::Git)
+    let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::stash_apply(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn branch_from_stash(state: State<'_, App>, index: usize, branch_name: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_mut().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::stash_branch(repo, index, &branch_name).map_err(AppError::Git)
+    let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::stash_branch(repo, index, &branch_name).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn reset_branch(state: State<'_, App>, sha: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::reset_branch(repo, &sha).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::reset_branch(repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn merge_commit(state: State<'_, App>, sha: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::merge_commit(repo, &sha).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::merge_commit(repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn list_tags(state: State<'_, App>) -> AppResult<Vec<TagInfo>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::list_tags(repo).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::list_tags(repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn delete_tag(state: State<'_, App>, name: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::delete_tag(repo, &name).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::delete_tag(repo, &name).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn list_remotes(state: State<'_, App>) -> AppResult<Vec<RemoteInfo>> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::list_remotes(repo).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::list_remotes(repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn add_remote(state: State<'_, App>, name: String, url: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::add_remote(repo, &name, &url).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::add_remote(repo, &name, &url).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn remove_remote(state: State<'_, App>, name: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
-    git_operations::remove_remote(repo, &name).map_err(AppError::Git)
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    git_operations::remove_remote(repo, &name).map_err(|e| AppError::Git(e.into()))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1020,7 +1084,7 @@ mod tests {
         };
         let serialized = serde_json::to_string(&err).unwrap();
 
-        assert_eq!(serialized, "\"Git Error: No repository open\"");
+        assert_eq!(serialized, "\"Git Error: NotFound: No repository open\"");
     }
 
     #[test]
