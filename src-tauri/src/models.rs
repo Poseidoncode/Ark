@@ -9,10 +9,20 @@ pub struct RepositoryInfo {
     pub behind: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatusKind {
+    Added,
+    Modified,
+    Deleted,
+    Untracked,
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileStatus {
     pub path: String,
-    pub status: String, // "modified", "added", "deleted", "untracked"
+    pub status: FileStatusKind,
     pub staged: bool,
 }
 

@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::models::{
-    BranchInfo, CommitInfo, ConflictInfo, DiffInfo, FileStatus, RemoteInfo, RepositoryInfo, StageResult,
+    BranchInfo, CommitInfo, ConflictInfo, DiffInfo, FileStatus, FileStatusKind, RemoteInfo, RepositoryInfo, StageResult,
     StashInfo, TagInfo,
 };
 
@@ -58,19 +58,25 @@ fn run_git_command(
 }
 
 fn is_safe_git_arg(arg: &str) -> bool {
-    // Prevent common shell/command injection patterns and flag injection
-    !arg.is_empty()
-        && !arg.starts_with('-')
-        && !arg.contains(' ')
-        && !arg.contains(';')
-        && !arg.contains('&')
-        && !arg.contains('|')
-        && !arg.contains('`')
-        && !arg.contains('$')
-        && !arg.contains('\\')
+    if arg.is_empty() || arg.starts_with('-') {
+        return false;
+    }
+    for c in arg.chars() {
+        if c.is_whitespace() || c.is_control() {
+            return false;
+        }
+        // Block Unicode format characters (bidi overrides, zero-width joiners, etc.)
+        if matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}') {
+            return false;
+        }
+        if matches!(c, ';' | '&' | '|' | '`' | '$' | '\\' | '(' | ')' | '{' | '}' | '\'' | '"') {
+            return false;
+        }
+    }
+    true
 }
 
-fn shell_escape_single_quotes(value: &str) -> String {
+fn shell_escape_arg(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
@@ -95,7 +101,7 @@ fn build_git_ssh_command(ssh_key_path: Option<&str>) -> Result<Option<String>, S
         return Err(format!("SSH key file does not exist: {}", expanded_path));
     }
 
-    let escaped_path = shell_escape_single_quotes(&expanded_path);
+    let escaped_path = shell_escape_arg(&expanded_path);
     Ok(Some(format!(
         "ssh -i '{}' -o IdentitiesOnly=yes",
         escaped_path
@@ -108,7 +114,7 @@ pub fn clone_repository(
     ssh_key_path: Option<&str>,
     _ssh_passphrase: Option<&str>,
 ) -> Result<Repository, String> {
-    if url.contains(' ') || url.contains(';') || url.starts_with('-') {
+    if url.contains(|c: char| c.is_whitespace() || c.is_control()) || url.contains(';') || url.starts_with('-') {
         return Err("Invalid clone URL".to_string());
     }
 
@@ -202,23 +208,23 @@ pub fn get_status(repo: &Repository) -> Result<Vec<FileStatus>, String> {
         let status = entry.status();
         let path = entry.path().unwrap_or("unknown").to_string();
 
-        let status_str =
+        let status_kind =
             if status.is_index_new() || status.is_index_modified() || status.is_index_deleted() {
                 if status.is_index_new() {
-                    "added"
+                    FileStatusKind::Added
                 } else if status.is_index_modified() {
-                    "modified"
+                    FileStatusKind::Modified
                 } else {
-                    "deleted"
+                    FileStatusKind::Deleted
                 }
             } else if status.is_wt_new() {
-                "untracked"
+                FileStatusKind::Untracked
             } else if status.is_wt_modified() {
-                "modified"
+                FileStatusKind::Modified
             } else if status.is_wt_deleted() {
-                "deleted"
+                FileStatusKind::Deleted
             } else {
-                "unknown"
+                FileStatusKind::Unknown
             };
 
         let staged =
@@ -226,7 +232,7 @@ pub fn get_status(repo: &Repository) -> Result<Vec<FileStatus>, String> {
 
         file_statuses.push(FileStatus {
             path,
-            status: status_str.to_string(),
+            status: status_kind,
             staged,
         });
     }
@@ -436,6 +442,36 @@ pub fn create_safety_ref(repo: &Repository, action_name: &str) -> Result<(), Str
     )
     .map_err(|e| format!("Failed to create safety ref: {}", e))?;
     Ok(())
+}
+
+pub fn cleanup_safety_refs(repo: &Repository, older_than_secs: u64) -> Result<usize, String> {
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .saturating_sub(older_than_secs);
+
+    let mut removed = 0;
+    let refs = repo.references_glob("refs/safety/*").map_err(|e| e.to_string())?;
+    for ref_result in refs {
+        let mut r = ref_result.map_err(|e| e.to_string())?;
+        let name = match r.name() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if let Some(ts_str) = name.rsplit('/').next() {
+            if let Ok(ts) = ts_str.parse::<u64>() {
+                if ts < cutoff {
+                    if let Err(e) = r.delete() {
+                        eprintln!("Failed to delete safety ref {}: {}", name, e);
+                    } else {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(removed)
 }
 
 pub fn amend_last_commit(repo: &Repository, message: &str) -> Result<String, String> {
@@ -665,6 +701,7 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
         .map_err(|e| format!("Failed to generate diff: {}", e))?;
 
     let mut diff_infos = Vec::new();
+    let mut path_index = std::collections::HashMap::new();
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let path = delta
             .new_file()
@@ -681,10 +718,8 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
             _ => "",
         };
 
-        if let Some(info) = diff_infos
-            .iter_mut()
-            .find(|i: &&mut DiffInfo| i.path == path)
-        {
+        if let Some(&idx) = path_index.get(&path) {
+            let info: &mut DiffInfo = &mut diff_infos[idx];
             info.diff_text
                 .push_str(&format!("{}{}", prefix, line_content));
             match line.origin() {
@@ -693,6 +728,8 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
                 _ => {}
             }
         } else {
+            let idx = diff_infos.len();
+            path_index.insert(path.clone(), idx);
             diff_infos.push(DiffInfo {
                 path,
                 diff_text: format!("{}{}", prefix, line_content),
@@ -876,6 +913,7 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
     };
 
     let mut diff_infos = Vec::new();
+    let mut path_index = std::collections::HashMap::new();
 
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let file_path = delta
@@ -893,10 +931,8 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
             _ => "",
         };
 
-        if let Some(info) = diff_infos
-            .iter_mut()
-            .find(|i: &&mut DiffInfo| i.path == file_path)
-        {
+        if let Some(&idx) = path_index.get(&file_path) {
+            let info: &mut DiffInfo = &mut diff_infos[idx];
             info.diff_text
                 .push_str(&format!("{}{}", prefix, line_content));
             match line.origin() {
@@ -905,6 +941,8 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
                 _ => {}
             }
         } else {
+            let idx = diff_infos.len();
+            path_index.insert(file_path.clone(), idx);
             diff_infos.push(DiffInfo {
                 path: file_path,
                 diff_text: format!("{}{}", prefix, line_content),
@@ -1182,9 +1220,6 @@ pub fn resolve_conflict(repo: &Repository, path: &str, use_ours: bool) -> Result
 }
 
 #[allow(dead_code)]
-pub fn create_remote_callbacks() {
-    // Deprecated
-}
 pub fn fetch_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
@@ -1236,10 +1271,22 @@ pub fn add_to_gitignore(repo: &Repository, file_path: &str) -> Result<(), String
 }
 
 pub fn read_file(repo: &Repository, file_path: &str) -> Result<String, String> {
-    let _workdir = repo.workdir().ok_or("No working directory found")?;
+    let workdir = repo.workdir().ok_or("No working directory found")?;
     let full_path = validate_repo_path(repo, file_path)?;
-    
-    fs::read_to_string(full_path)
+
+    let canonical = full_path.canonicalize().map_err(|e| format!("Failed to resolve path: {}", e))?;
+    let canonical_workdir = workdir.canonicalize().map_err(|e| format!("Failed to resolve workdir: {}", e))?;
+    if !canonical.starts_with(&canonical_workdir) {
+        return Err(format!("Path '{}' resolves outside the repository", file_path));
+    }
+
+    let relative = canonical.strip_prefix(&canonical_workdir).map_err(|_| "Failed to normalize path".to_string())?;
+    let relative_str = relative.to_string_lossy();
+    if relative_str.starts_with(".git/") || relative_str == ".git" {
+        return Err("Reading .git internal files is not allowed".to_string());
+    }
+
+    fs::read_to_string(&full_path)
         .map_err(|e| format!("Failed to read file: {}", e))
 }
 
@@ -1413,7 +1460,7 @@ pub fn add_remote(repo: &Repository, name: &str, url: &str) -> Result<(), String
         return Err("Invalid remote name".to_string());
     }
 
-    if url.contains(' ') || url.contains(';') || url.starts_with('-') {
+    if url.contains(|c: char| c.is_whitespace() || c.is_control()) || url.contains(';') || url.starts_with('-') {
         return Err("Invalid remote URL".to_string());
     }
 
@@ -1754,14 +1801,22 @@ mod tests {
     }
 
     #[test]
-    fn test_is_safe_git_arg_allows_newlines_and_bidi_controls_currently() {
+    fn test_is_safe_git_arg_rejects_newlines_and_bidi_controls() {
         assert!(
-            is_safe_git_arg("feature\nname"),
-            "current validator unexpectedly started rejecting newlines"
+            !is_safe_git_arg("feature\nname"),
+            "newlines must be rejected"
         );
         assert!(
-            is_safe_git_arg("feature\u{202e}name"),
-            "current validator unexpectedly started rejecting bidi control characters"
+            !is_safe_git_arg("feature\rname"),
+            "carriage returns must be rejected"
+        );
+        assert!(
+            !is_safe_git_arg("feature\u{202e}name"),
+            "bidi control characters must be rejected"
+        );
+        assert!(
+            !is_safe_git_arg("feature\tname"),
+            "tabs must be rejected"
         );
     }
 

@@ -21,7 +21,7 @@ const abortController = ref<AbortController | null>(null);
 onErrorCaptured((err, instance, info) => {
   console.error('Error captured in component:', err, info);
   toast.error(err instanceof Error ? err.message : String(err), { title: 'Component Error' });
-  return false;
+  return true;
 });
 
 // Abort all pending operations on unmount
@@ -93,6 +93,13 @@ const showCloneModal = ref(false);
 const cloneUrl = ref("");
 const clonePath = ref("");
 const showSettingsModal = ref(false);
+
+const openSettingsModal = async () => {
+  if (!settings.value) {
+    await fetchSettings();
+  }
+  showSettingsModal.value = true;
+};
 const showBranchModal = ref(false);
 const newBranchName = ref("");
 const showRecentRepos = ref(false);
@@ -207,7 +214,7 @@ const toggleAllStaged = async () => {
     }
     await refreshRepo();
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
   }
 };
 
@@ -604,29 +611,39 @@ const refreshRepo = async () => {
   if (!repoInfo.value || isOperationInProgress.value) return;
   isOperationInProgress.value = true;
   try {
-    const [status, branchList, stashList, conflictList, info] = await Promise.all([
+    const results = await Promise.allSettled([
       gitService.getStatus(),
       gitService.getBranches(),
       gitService.listStashes(),
       gitService.getConflicts(),
       gitService.getCurrentRepoInfo()
     ]);
-    fileStatuses.value = status;
-    branches.value = branchList;
-    stashes.value = stashList.slice(0, MAX_STASHES);
-    conflicts.value = conflictList;
-    if (info) {
-      repoInfo.value = info;
-    }
-    if (conflictList.length > 0 && view.value !== "conflicts") {
+
+    const [statusRes, branchRes, stashRes, conflictRes, infoRes] = results;
+
+    if (statusRes.status === 'fulfilled') fileStatuses.value = statusRes.value;
+    if (branchRes.status === 'fulfilled') branches.value = branchRes.value;
+    if (stashRes.status === 'fulfilled') stashes.value = stashRes.value.slice(0, MAX_STASHES);
+    if (conflictRes.status === 'fulfilled') conflicts.value = conflictRes.value;
+    if (infoRes.status === 'fulfilled' && infoRes.value) repoInfo.value = infoRes.value;
+
+    const conflictResult = conflictRes.status === 'fulfilled' ? conflictRes.value : [];
+    if (conflictResult.length > 0 && view.value !== "conflicts") {
       view.value = "conflicts";
     }
     if (view.value === "history" && commits.value.length === 0) {
       const history = await gitService.getHistory(50);
       commits.value = history.slice(0, MAX_COMMITS);
     }
+
+    const errors = results
+      .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+      .map(r => String(r.reason));
+    if (errors.length > 0) {
+      console.warn('Partial refresh failures:', errors);
+    }
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
   } finally {
     isOperationInProgress.value = false;
   }
@@ -661,8 +678,8 @@ onUnmounted(() => {
   abortPendingOperations();
 });
 
-watch([repoInfo, view], () => {
-  if (repoInfo.value) {
+watch([() => repoInfo.value?.path, view], ([newPath]) => {
+  if (newPath) {
     refreshRepo();
   }
 });
@@ -676,28 +693,35 @@ watch(amendCommit, (newVal) => {
 });
 
 watch(selectedFile, (newFile: string | null) => {
+  abortController.value?.abort();
+  abortController.value = new AbortController();
+  const signal = abortController.value.signal;
   if (newFile && view.value === "changes") {
-    gitService.getDiff(newFile).then(d => diffs.value = d);
+    gitService.getDiff(newFile).then(d => {
+      if (!signal.aborted) diffs.value = d;
+    });
   } else if (!newFile && view.value === "changes") {
     diffs.value = [];
   }
 });
 
 watch(selectedCommit, async (newCommit) => {
+  abortController.value?.abort();
+  abortController.value = new AbortController();
+  const signal = abortController.value.signal;
   if (newCommit) {
-    // loading.value = true; // Removed to prevent flickering
     try {
-      // Assuming getCommitDiff exists in gitService, otherwise I need to add it
-      // Based on previous checks, backend has it.
-      // If TS error occurs, I might need to update git.ts, but let's assume it's there.
       const d = await gitService.getCommitDiff(newCommit.sha);
-      diffs.value = d;
-      if (d.length > 0) {
-        selectedCommitFile.value = d[0].path;
-      } else {
-        selectedCommitFile.value = null;
+      if (!signal.aborted) {
+        diffs.value = d;
+        if (d.length > 0) {
+          selectedCommitFile.value = d[0].path;
+        } else {
+          selectedCommitFile.value = null;
+        }
       }
     } catch (err) {
+      if (signal.aborted) return;
       const errMsg = String(err);
       if (errMsg.includes("Commit not found")) {
         console.warn("Selected commit not found, diff unavailable:", err);
@@ -706,8 +730,6 @@ watch(selectedCommit, async (newCommit) => {
       } else {
         error.value = errMsg;
       }
-    } finally {
-      // loading.value = false; // Removed to prevent flickering
     }
   } else {
     diffs.value = [];
@@ -777,7 +799,7 @@ const handleOpenRepo = async (path?: string) => {
     }
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleOpenRepo(path);
     
   } finally {
@@ -805,7 +827,7 @@ const handleBrowseClonePath = async () => {
       clonePath.value = selected;
     }
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
   }
 };
 
@@ -826,7 +848,7 @@ const handleCloneRepo = async () => {
     selectedFile.value = null;
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleCloneRepo();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
@@ -848,7 +870,7 @@ const toggleStaged = async (file: FileStatus) => {
     }
     await refreshRepo();
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
   }
 };
 
@@ -867,7 +889,7 @@ const handleDiscardChanges = async (path: string) => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleDiscardChanges(path);
     
   } finally {
@@ -892,7 +914,7 @@ const handleDiscardAllChanges = async () => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleDiscardAllChanges();
     
   } finally {
@@ -930,7 +952,7 @@ const handleCommit = async () => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleCommit();
     
   } finally {
@@ -952,7 +974,7 @@ const handleCherryPick = async (sha: string) => {
     toast.success("Cherry-pick successful", { title: "Success" });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleCherryPick(sha);
     
   } finally {
@@ -974,7 +996,7 @@ const handleRevertCommit = async (sha: string) => {
     toast.success("Revert successful", { title: "Success" });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleRevertCommit(sha);
     
   } finally {
@@ -995,7 +1017,7 @@ const handlePush = async () => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handlePush();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
@@ -1016,7 +1038,7 @@ const handlePull = async () => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handlePull();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
@@ -1037,7 +1059,7 @@ const handleFetch = async () => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleFetch();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
@@ -1058,7 +1080,7 @@ const handleStashSave = async () => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleStashSave();
     
   } finally {
@@ -1078,7 +1100,7 @@ const handleStashPop = async (index: number) => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleStashPop(index);
 
   } finally {
@@ -1099,7 +1121,7 @@ const handleApplyStash = async (index: number) => {
     toast.success("Stash applied successfully", { title: 'Success' });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleApplyStash(index);
 
   } finally {
@@ -1125,7 +1147,7 @@ const handleDropStash = async (index: number) => {
     toast.success("Stash dropped successfully", { title: 'Success' });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleDropStash(index);
 
   } finally {
@@ -1148,7 +1170,7 @@ const handleBranchFromStash = async (index: number) => {
     toast.success(`Branch ${branchName} created from stash`, { title: 'Success' });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleBranchFromStash(index);
 
   } finally {
@@ -1168,7 +1190,7 @@ const handleResolve = async (path: string, ours: boolean) => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleResolve(path, ours);
     
   } finally {
@@ -1191,7 +1213,7 @@ const checkoutBranch = async (branchName: string) => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await checkoutBranch(branchName);
     
   } finally {
@@ -1213,7 +1235,7 @@ const handleCreateBranch = async () => {
     await refreshRepo();
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleCreateBranch();
     
   } finally {
@@ -1277,7 +1299,7 @@ const handleSwitchToSSH = async () => {
     }
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleSwitchToSSH();
     
   } finally {
@@ -1341,7 +1363,7 @@ const handleDeleteTag = async (name: string) => {
     toast.success(`Tag "${name}" deleted`, { title: 'Success' });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleDeleteTag(name);
   } finally {
     loading.value = false;
@@ -1363,7 +1385,7 @@ const handleAddRemote = async () => {
     toast.success(`Remote \"${name}\" added`, { title: 'Success' });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
   } finally {
     loading.value = false;
     loadingMessage.value = "";
@@ -1381,7 +1403,7 @@ const handleRemoveRemote = async (name: string) => {
     toast.success(`Remote "${name}" removed`, { title: 'Success' });
     error.value = null;
   } catch (err) {
-    error.value = err as string;
+    error.value = err instanceof Error ? err.message : String(err);
     lastFailedOperation.value = async () => await handleRemoveRemote(name);
   } finally {
     loading.value = false;
@@ -1482,7 +1504,7 @@ useKeyboardShortcuts([
         <button v-if="repoInfo" @click="() => { loadTags(); showTagsModal = true; }" class="btn btn-ghost h-8 px-3 text-[13px]">Tags</button>
         <button v-if="repoInfo" @click="() => { loadRemotes(); showRemotesModal = true; }" class="btn btn-ghost h-8 px-3 text-[13px]">Remotes</button>
         <div class="w-px h-5 mx-1" style="background: var(--border);"></div>
-        <button @click="showSettingsModal = true" class="btn btn-ghost h-8 w-8 p-0" title="Settings" style="color: var(--foreground);">
+        <button @click="openSettingsModal" class="btn btn-ghost h-8 w-8 p-0" title="Settings" style="color: var(--foreground);">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
           </svg>
@@ -1532,9 +1554,9 @@ useKeyboardShortcuts([
       </div>
 
       <!-- Settings Modal -->
-      <div v-if="showSettingsModal && settings" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+      <div v-if="showSettingsModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
         <h2 class="text-2xl font-display mb-6 text-foreground">Settings</h2>
-        <div class="space-y-5 mb-8">
+        <div v-if="settings" class="space-y-5 mb-8">
           <div>
             <label class="block text-sm font-semibold text-foreground mb-1">Git User Name</label>
             <p class="text-[11px] text-muted-foreground mb-2 leading-tight">Identifies you as the author of commits</p>
@@ -1556,7 +1578,11 @@ useKeyboardShortcuts([
             <p class="text-[11px] text-muted-foreground mt-1 leading-tight">Use this if you get authentication errors with HTTPS</p>
           </div>
         </div>
-        <div class="flex justify-end gap-3">
+        <div v-else class="space-y-5 mb-8 flex items-center justify-center py-8">
+          <div class="spinner"></div>
+          <span class="text-sm text-muted-foreground">Loading settings...</span>
+        </div>
+        <div v-if="settings" class="flex justify-end gap-3">
           <button @click="showSettingsModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Cancel</button>
           <button @click="saveSettings" class="gradient-bg text-accent-foreground px-6 py-2.5 rounded-lg hover:shadow-accent transition-safe font-semibold">Save</button>
         </div>

@@ -11,9 +11,9 @@ interface CacheEntry<T> {
 /**
  * Debounced function entry
  */
-interface DebouncedEntry {
+interface DebouncedEntry<T> {
   id: ReturnType<typeof setTimeout>;
-  resolve: (value: unknown) => void;
+  resolve: (value: T) => void;
   reject: (error: Error) => void;
 }
 
@@ -29,9 +29,11 @@ export interface RepositoryInfo {
   behind: number;
 }
 
+export type FileStatusKind = 'added' | 'modified' | 'deleted' | 'untracked' | 'unknown';
+
 export interface FileStatus {
   path: string;
-  status: string;
+  status: FileStatusKind;
   staged: boolean;
 }
 
@@ -103,7 +105,7 @@ export interface RemoteInfo {
 
 class GitServiceOptimizer {
   private cache = new Map<string, CacheEntry<unknown>>();
-  private debounceTimers = new Map<string, DebouncedEntry>();
+  private debounceTimers = new Map<string, DebouncedEntry<unknown>>();
   private readonly DEFAULT_TTL = 5000; // 5 seconds
   private readonly SHORT_TTL = 1000; // 1 second for frequently changing data
   private readonly LONG_TTL = 30000; // 30 seconds for static data
@@ -442,12 +444,7 @@ class GitServiceOptimizer {
    * Get settings
    */
   async getSettings(): Promise<SettingsPayload> {
-    const cacheKey = 'settings';
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("get_settings"),
-      this.LONG_TTL
-    );
+    return await invoke("get_settings");
   }
 
   /**

@@ -46,3 +46,13 @@ doc
 .github
 .gemini
 .claude.worktrees/
+
+# Tauri build artifacts
+src-tauri/target/
+
+# Test artifacts
+src-tauri/test_git2/
+src-tauri/test_upstream.rs
+
+# Worktrees
+.worktrees/

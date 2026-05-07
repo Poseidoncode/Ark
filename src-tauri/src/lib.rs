@@ -46,7 +46,7 @@ impl From<git2::Error> for AppError {
 
 impl From<String> for AppError {
     fn from(err: String) -> Self {
-        AppError::Git(err)
+        AppError::Io(err)
     }
 }
 
@@ -61,9 +61,7 @@ struct AppState {
     settings: Settings,
     watcher: Option<notify::RecommendedWatcher>,
     // Performance optimization: cache for frequently accessed data
-    #[allow(dead_code)]
     branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
-    #[allow(dead_code)]
     history_cache: Option<(Vec<CommitInfo>, std::time::Instant)>,
     #[allow(dead_code)]
     last_refresh: Option<std::time::Instant>,
@@ -90,11 +88,12 @@ fn require_open_repository(repo: Option<&git2::Repository>) -> AppResult<&git2::
     repo.ok_or(AppError::Git("No repository open".to_string()))
 }
 
-fn stop_watcher(watcher: Option<notify::RecommendedWatcher>) {
+fn stop_watcher(watcher: Option<notify::RecommendedWatcher>, repo_path: &str) {
     if let Some(mut w) = watcher {
-        let _ = w.unwatch(&std::path::PathBuf::from(".git/index"));
-        let _ = w.unwatch(&std::path::PathBuf::from(".git/HEAD"));
-        let _ = w.unwatch(&std::path::PathBuf::from(".git/refs"));
+        let base = std::path::Path::new(repo_path);
+        let _ = w.unwatch(&base.join(".git/index"));
+        let _ = w.unwatch(&base.join(".git/HEAD"));
+        let _ = w.unwatch(&base.join(".git/refs"));
     }
 }
 
@@ -131,7 +130,7 @@ fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> Option<notify
                     // Drain the channel of immediate subsequent events
                     while rx.try_recv().is_ok() {}
                 }
-                Err(e) => eprintln!("watcher error: {:?}", e),
+                Err(e) => tracing::error!("watcher error: {:?}", e),
             }
         }
     });
@@ -302,23 +301,21 @@ fn load_settings_from_path(path: &Path) -> AppResult<Settings> {
 
     let content = std::fs::read_to_string(path).map_err(|e| AppError::Io(e.to_string()))?;
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-        if value.get("ssh_passphrase").is_some() {
-            let legacy = serde_json::from_value::<LegacyDiskSettings>(value)
-                .map_err(|e| AppError::Config(e.to_string()))?;
-            return migrate_legacy_passphrase(path, legacy);
-        }
-    }
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(default_settings()),
+    };
 
-    if let Ok(settings) = serde_json::from_str::<DiskSettings>(&content) {
-        return Ok(settings.into());
-    }
-
-    if let Ok(legacy) = serde_json::from_str::<LegacyDiskSettings>(&content) {
+    if value.get("ssh_passphrase").is_some() {
+        let legacy = serde_json::from_value::<LegacyDiskSettings>(value)
+            .map_err(|e| AppError::Config(e.to_string()))?;
         return migrate_legacy_passphrase(path, legacy);
     }
 
-    Ok(default_settings())
+    match serde_json::from_value::<DiskSettings>(value) {
+        Ok(settings) => Ok(settings.into()),
+        Err(_) => Ok(default_settings()),
+    }
 }
 
 fn get_ssh_credentials(settings: &Settings) -> AppResult<(Option<String>, Option<String>)> {
@@ -372,8 +369,13 @@ fn open_repository(
             // Invalidate all caches when changing repo
             state.branch_cache = None;
             state.history_cache = None;
-            stop_watcher(state.watcher.take());
+            stop_watcher(state.watcher.take(), &path);
             state.watcher = start_watcher(app_handle.clone(), &path);
+
+            // Clean up old safety refs (older than 7 days)
+            if let Ok(repo_ref) = git_operations::open_repository(&path) {
+                let _ = git_operations::cleanup_safety_refs(&repo_ref, 7 * 24 * 3600);
+            }
 
             // Add to recent repositories if not already there
             if !state.settings.recent_repositories.contains(&path) {
@@ -435,7 +437,7 @@ async fn clone_repository(
     match git_operations::open_repository(&path) {
         Ok(repo) => {
             state_lock.repo = Some(repo);
-            stop_watcher(state_lock.watcher.take());
+            stop_watcher(state_lock.watcher.take(), &path);
             state_lock.watcher = start_watcher(app_handle.clone(), &path);
 
             if !state_lock.settings.recent_repositories.contains(&path) {
@@ -780,7 +782,16 @@ fn get_current_repo_info(state: State<'_, App>) -> AppResult<Option<RepositoryIn
 }
 
 #[tauri::command]
-fn reveal_in_finder(path: String) -> AppResult<()> {
+fn reveal_in_finder(state: State<'_, App>, path: String) -> AppResult<()> {
+    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    let workdir = repo.workdir().ok_or(AppError::Git("No workdir".to_string()))?;
+    let full_path = std::path::Path::new(&path);
+    let canonical = full_path.canonicalize().map_err(|e| AppError::Io(e.to_string()))?;
+    if !canonical.starts_with(workdir.canonicalize().map_err(|e| AppError::Io(e.to_string()))?) {
+        return Err(AppError::Git("Path is outside the repository".to_string()));
+    }
+
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
@@ -932,7 +943,11 @@ pub fn run() {
             app.listen("tauri://close-requested", move |_| {
                 if let Some(state) = app_handle_clone.try_state::<App>() {
                     if let Ok(mut app_state) = state.0.lock() {
-                        stop_watcher(app_state.watcher.take());
+                        let repo_path = app_state.repo.as_ref()
+                            .and_then(|r| r.workdir())
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        stop_watcher(app_state.watcher.take(), &repo_path);
                     }
                 }
             });
