@@ -83,9 +83,10 @@ const logMemoryUsage = () => {
 };
 
 // Initialize performance monitoring
-if (import.meta.env.DEV) {
-  observePerformance();
-  setInterval(logMemoryUsage, 30000);
+observePerformance();
+setInterval(logMemoryUsage, 30000);
+if (import.meta.env.PROD) {
+  console.log("Performance monitoring active in production");
 }
 
 // Register virtual scroller
