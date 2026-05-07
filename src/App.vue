@@ -604,16 +604,20 @@ const refreshRepo = async () => {
   if (!repoInfo.value || isOperationInProgress.value) return;
   isOperationInProgress.value = true;
   try {
-    const [status, branchList, stashList, conflictList] = await Promise.all([
+    const [status, branchList, stashList, conflictList, info] = await Promise.all([
       gitService.getStatus(),
       gitService.getBranches(),
       gitService.listStashes(),
-      gitService.getConflicts()
+      gitService.getConflicts(),
+      gitService.getCurrentRepoInfo()
     ]);
     fileStatuses.value = status;
     branches.value = branchList;
     stashes.value = stashList.slice(0, MAX_STASHES);
     conflicts.value = conflictList;
+    if (info) {
+      repoInfo.value = info;
+    }
     if (conflictList.length > 0 && view.value !== "conflicts") {
       view.value = "conflicts";
     }
