@@ -1,3 +1,4 @@
+use lru::LruCache;
 mod credential_store;
 mod git_operations;
 mod models;
@@ -126,9 +127,9 @@ struct AppState {
     watcher: Option<notify::RecommendedWatcher>,
     // Performance optimization: cache for frequently accessed data
     #[allow(dead_code)]
-    branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
+    branch_cache: Option<LruCache<(), (Vec<BranchInfo>, std::time::Instant)>>,
     #[allow(dead_code)]
-    history_cache: Option<(Vec<CommitInfo>, std::time::Instant)>,
+    history_cache: Option<LruCache<(), (Vec<CommitInfo>, std::time::Instant)>>,
     #[allow(dead_code)]
     last_refresh: Option<std::time::Instant>,
 }
@@ -557,9 +558,11 @@ fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
 
     // Check cache first (cache for 5 seconds)
-    if let Some((ref branches, ref time)) = state.branch_cache {
-        if time.elapsed().as_secs() < 5 {
-            return Ok(branches.clone());
+    if let Some(ref mut cache) = state.branch_cache {
+        if let Some((ref branches, ref time)) = cache.get(&()) {
+            if time.elapsed().as_secs() < 5 {
+                return Ok(branches.clone());
+            }
         }
     }
 
@@ -567,7 +570,9 @@ fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
     let branches = git_operations::get_branches(repo).map_err(|e| AppError::Git(e.into()))?;
 
     // Update cache
-    state.branch_cache = Some((branches.clone(), std::time::Instant::now()));
+    let mut cache = LruCache::new(std::num::NonZeroUsize::new(2).unwrap());
+    cache.put((), (branches.clone(), std::time::Instant::now()));
+    state.branch_cache = Some(cache);
 
     Ok(branches)
 }
