@@ -1,9 +1,13 @@
 import { createApp, provide, h } from 'vue';
+import { createPinia } from 'pinia';
 import './index.css';
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css';
 import VueVirtualScroller from 'vue-virtual-scroller';
 import App from './App.vue';
 import { useToast } from './composables/useToast';
+
+// Create Pinia instance
+const pinia = createPinia();
 
 // Create toast instance for global error handling
 const { error: showErrorToast, success: showSuccessToast, warning: showWarningToast } = useToast();
@@ -18,6 +22,9 @@ const app = createApp({
     return h(App);
   }
 });
+
+// Register Pinia
+app.use(pinia);
 
 // Global error handler
 app.config.errorHandler = (err, _instance, info) => {

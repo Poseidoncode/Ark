@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, computed, onErrorCaptured } from 'vue';
-import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type SettingsPayload, type DiffInfo, type StageResult, type TagInfo, type RemoteInfo } from './services/git';
+import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
 import Toast from './components/Toast.vue';
@@ -12,10 +12,18 @@ import { listen } from '@tauri-apps/api/event';
 import { homeDir } from '@tauri-apps/api/path';
 import DiffViewer from './components/DiffViewer.vue';
 
+// Import stores
+import { useRepoStore } from './stores/repo';
+import { useUIStore } from './stores/ui';
+import { useSettingsStore } from './stores/settings';
+
+// Initialize stores
+const repoStore = useRepoStore();
+const uiStore = useUIStore();
+const settingsStore = useSettingsStore();
+
 // Memory optimization: reuse refs and limit array growth
 const MAX_TIMEOUTS = 10;
-const MAX_STASHES = 100;
-const MAX_COMMITS = 200;
 const abortController = ref<AbortController | null>(null);
 
 onErrorCaptured((err, instance, info) => {
@@ -31,44 +39,15 @@ const abortPendingOperations = () => {
   }
 };
 
-const repoInfo = ref<RepositoryInfo | null>(null);
-const fileStatuses = ref<FileStatus[]>([]);
-const branches = ref<BranchInfo[]>([]);
-const commits = ref<CommitInfo[]>([]);
-const stashes = ref<StashInfo[]>([]);
-const conflicts = ref<ConflictInfo[]>([]);
-const settings = ref<SettingsPayload | null>(null);
-const recentRepoInfos = ref<RepositoryInfo[]>([]);
-const diffs = ref<DiffInfo[]>([]);
-
-const commitMessage = ref("");
-const selectedFile = ref<string | null>(null);
-const selectedCommit = ref<CommitInfo | null>(null);
-const selectedCommitFile = ref<string | null>(null);
-const view = ref<"changes" | "history" | "stashes" | "conflicts">("changes");
-const loading = ref(false);
-const loadingMessage = ref("");
-const isMajorOperation = ref(false);
-const lastFailedOperation = ref<(() => Promise<void>) | null>(null);
-const timeoutIds = ref<ReturnType<typeof setTimeout>[]>([]);
-
 const retryLastOperation = async () => {
-  if (lastFailedOperation.value) {
-    const op = lastFailedOperation.value;
-    // Keep reference in case it fails again, the function itself will reset it if needed
-    // or we just call op()
+  if (uiStore.lastFailedOperation) {
+    const op = uiStore.lastFailedOperation;
     await op();
   }
 };
 
-const clearError = () => {
-  error.value = null;
-  lastFailedOperation.value = null;
-};
-
 const trackedSetTimeout = (callback: () => void, delay: number) => {
   const id = setTimeout(() => {
-    // Remove the id from the array after it fires
     timeoutIds.value = timeoutIds.value.filter(t => t !== id);
     callback();
   }, delay);
@@ -81,42 +60,46 @@ const clearTimeouts = () => {
   timeoutIds.value = [];
 };
 
-// Global operation lock to prevent concurrent mutations
-const isOperationInProgress = ref(false);
+const timeoutIds = ref<ReturnType<typeof setTimeout>[]>([]);
 
 const error = ref<string | null>(null);
 const toast = useToast();
 const { showContextMenu, hideContextMenu, isVisible, position, menuItems } = useContextMenu();
 
-// Modal State
-const showCloneModal = ref(false);
-const cloneUrl = ref("");
-const clonePath = ref("");
-const showSettingsModal = ref(false);
-const showBranchModal = ref(false);
-const newBranchName = ref("");
-const showRecentRepos = ref(false);
-const showTagsModal = ref(false);
-const showRemotesModal = ref(false);
-const tags = ref<TagInfo[]>([]);
-const remotes = ref<RemoteInfo[]>([]);
-const newRemoteName = ref("");
-const newRemoteUrl = ref("");
+const dropdownRef = ref<HTMLElement | null>(null);
 
-watch(showRecentRepos, async (isOpen) => {
-  if (isOpen && settings.value?.recent_repositories.length) {
-    try {
-      const infos = await gitService.getRepositoriesInfo(settings.value?.recent_repositories || []);
-      recentRepoInfos.value = infos;
-    } catch (err) {
-      console.error("Failed to fetch recent repo infos", err);
+// Computed properties that use store state
+const currentProjectName = computed(() => {
+  if (!repoStore.repoInfo) return "";
+  
+  const path = repoStore.repoInfo.path;
+  const name = getRepoName(path);
+  
+  // 額外驗證：如果得到的名字和分支名相同，可能路徑有問題
+  if (name === repoStore.repoInfo.current_branch) {
+    console.warn('[WARNING] Project name equals branch name, path might be incorrect:', path);
+    if (path && (path.includes('/') || path.includes('\\'))) {
+      return getRepoName(path);
     }
+    return path || "";
   }
+  
+  return name;
 });
 
-const dropdownRef = ref<HTMLElement | null>(null);
-const amendCommit = ref(false);
-const searchCommitQuery = ref("");
+watch(currentProjectName, (name) => {
+  document.title = name ? `Ark - ${name}` : "Ark";
+}, { immediate: true });
+
+const filteredCommits = computed(() => {
+  if (!uiStore.searchCommitQuery.trim()) return repoStore.commits;
+  const q = uiStore.searchCommitQuery.toLowerCase();
+  return repoStore.commits.filter(c => 
+    c.message.toLowerCase().includes(q) || 
+    c.sha.toLowerCase().includes(q) || 
+    c.author.toLowerCase().includes(q)
+  );
+});
 
 const getRepoName = (path: string) => {
   if (!path || path.trim() === "") return "";
@@ -143,71 +126,22 @@ const getRepoName = (path: string) => {
   return lastPart || path;
 };
 
-const currentProjectName = computed(() => {
-  if (!repoInfo.value) return "";
-  
-  const path = repoInfo.value.path;
-  const name = getRepoName(path);
-  
-  // 額外驗證：如果得到的名字和分支名相同，可能路徑有問題
-  // 嘗試使用完整路徑來獲取專案名
-  if (name === repoInfo.value.current_branch) {
-    // 路徑可能有問題，嘗試其他方法
-    console.warn('[WARNING] Project name equals branch name, path might be incorrect:', path);
-    
-    // 如果路徑包含斜線，嘗試從完整路徑中提取
-    if (path && (path.includes('/') || path.includes('\\\\'))) {
-      return getRepoName(path);
-    }
-    
-    // 如果實在無法獲取，使用路徑本身
-    return path || "";
-  }
-  
-  return name;
-});
-
-watch(currentProjectName, (name) => {
-  document.title = name ? `Ark - ${name}` : "Ark";
-}, { immediate: true });
-
-const stagedFiles = computed(() => fileStatuses.value.filter(f => f.staged).map(f => f.path));
-const allStaged = computed(() => fileStatuses.value.length > 0 && fileStatuses.value.every(f => f.staged));
-
-const filteredCommits = computed(() => {
-  if (!searchCommitQuery.value.trim()) return commits.value;
-  const q = searchCommitQuery.value.toLowerCase();
-  return commits.value.filter(c => 
-    c.message.toLowerCase().includes(q) || 
-    c.sha.toLowerCase().includes(q) || 
-    c.author.toLowerCase().includes(q)
-  );
-});
-
-const getRecentRepoInfo = (path: string) => {
-  return recentRepoInfos.value.find(r => r.path === path);
-};
-
-const getCurrentBranch = () => {
-  return branches.value.find((b: BranchInfo) => b.is_current)?.name || 'Unknown';
-};
-
 const toggleAllStaged = async () => {
-  if (fileStatuses.value.length === 0) return;
+  if (repoStore.fileStatuses.length === 0) return;
   
   try {
-    const paths = fileStatuses.value.map(f => f.path);
-    if (allStaged.value) {
+    const paths = repoStore.fileStatuses.map(f => f.path);
+    if (repoStore.allStaged) {
       await gitService.unstageFiles(paths);
     } else {
       const result: StageResult = await gitService.stageFiles(paths);
       if (result.warnings.length > 0) {
-        error.value = result.warnings.join('\n');
+        uiStore.setError(result.warnings.join('\n'));
       }
     }
-    await refreshRepo();
+    await repoStore.refreshRepo();
   } catch (err) {
-    error.value = err as string;
+    uiStore.setError(String(err));
   }
 };
 
@@ -241,14 +175,14 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
         const name = prompt(`Enter new branch name from ${commit.sha.substring(0, 7)}:`);
         if (name && name.trim()) {
           try {
-            loading.value = true;
+            uiStore.setLoading(true, '', false);
             await gitService.createBranch(name.trim(), commit.sha);
-            await refreshRepo();
+            await repoStore.refreshRepo();
             toast.success(`Created branch ${name}`, { title: 'Success' });
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           } finally {
-            loading.value = false;
+            uiStore.setLoading(false);
           }
         }
       }
@@ -260,14 +194,14 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
         if (tagName && tagName.trim()) {
           const tagMessage = prompt(`Enter tag message (optional):`) || '';
           try {
-            loading.value = true;
+            uiStore.setLoading(true, '', false);
             await gitService.createTag(tagName.trim(), tagMessage, commit.sha);
-            await refreshRepo();
+            await repoStore.refreshRepo();
             toast.success(`Created tag ${tagName}`, { title: 'Success' });
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           } finally {
-            loading.value = false;
+            uiStore.setLoading(false);
           }
         }
       }
@@ -291,20 +225,16 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
         });
         if (!confirmed) return;
         try {
-          loading.value = true;
-          loadingMessage.value = "Resetting branch...";
-          isMajorOperation.value = false;
+          uiStore.setLoading(true, "Resetting branch...", false);
           await gitService.resetBranch(commit.sha);
-          await refreshRepo();
+          await repoStore.refreshRepo();
           toast.success("Branch reset successfully", { title: 'Success' });
-          error.value = null;
+          uiStore.clearError();
         } catch (e) {
-          error.value = String(e);
-          lastFailedOperation.value = async () => await gitService.resetBranch(commit.sha);
+          uiStore.setError(String(e));
+          uiStore.lastFailedOperation = async () => await gitService.resetBranch(commit.sha);
         } finally {
-          loading.value = false;
-          loadingMessage.value = "";
-          isMajorOperation.value = false;
+          uiStore.setLoading(false);
         }
       }
     },
@@ -317,20 +247,16 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
         });
         if (!confirmed) return;
         try {
-          loading.value = true;
-          loadingMessage.value = "Merging commit...";
-          isMajorOperation.value = false;
+          uiStore.setLoading(true, "Merging commit...", false);
           await gitService.mergeCommit(commit.sha);
-          await refreshRepo();
+          await repoStore.refreshRepo();
           toast.success("Merge successful", { title: 'Success' });
-          error.value = null;
+          uiStore.clearError();
         } catch (e) {
-          error.value = String(e);
-          lastFailedOperation.value = async () => await gitService.mergeCommit(commit.sha);
+          uiStore.setError(String(e));
+          uiStore.lastFailedOperation = async () => await gitService.mergeCommit(commit.sha);
         } finally {
-          loading.value = false;
-          loadingMessage.value = "";
-          isMajorOperation.value = false;
+          uiStore.setLoading(false);
         }
       }
     },
@@ -341,7 +267,6 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
         try {
           let url = await gitService.getRemoteUrl("origin");
           if (url) {
-            // handle ssh vs https
             if (url.startsWith('git@github.com:')) {
                url = url.replace('git@github.com:', 'https://github.com/').replace(/\.git$/, '');
             } else if (url.startsWith('https://')) {
@@ -352,7 +277,7 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
             toast.error("No origin remote found", { title: "Error" });
           }
         } catch (e) {
-          error.value = String(e);
+          uiStore.setError(String(e));
         }
       }
     },
@@ -360,11 +285,11 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
     {
       label: 'Reveal in Finder/Explorer',
       action: async () => {
-        if (repoInfo.value) {
+        if (repoStore.repoInfo) {
           try {
-            await gitService.revealInFinder(repoInfo.value.path);
+            await gitService.revealInFinder(repoStore.repoInfo.path);
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           }
         }
       }
@@ -401,31 +326,31 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
       action: async () => {
         try {
           await gitService.addToGitignore(file.path);
-          await refreshRepo();
+          await repoStore.refreshRepo();
           toast.success(`Added ${file.path} to .gitignore`, { title: 'Success' });
         } catch (e) {
-          error.value = String(e);
+          uiStore.setError(String(e));
         }
       }
     },
     {
       label: 'View File History',
       action: async () => {
-        view.value = "history";
-        searchCommitQuery.value = file.path;
+        uiStore.setView("history");
+        uiStore.setSearchCommitQuery(file.path);
       }
     },
     {
       label: 'Copy File Contents',
       action: async () => {
         try {
-          if (repoInfo.value) {
-            const content = await gitService.readFile(`${repoInfo.value.path}/${file.path}`);
+          if (repoStore.repoInfo) {
+            const content = await gitService.readFile(`${repoStore.repoInfo.path}/${file.path}`);
             await navigator.clipboard.writeText(content);
             toast.success('File contents copied', { title: 'Copied' });
           }
         } catch (e) {
-          error.value = String(e);
+          uiStore.setError(String(e));
         }
       }
     },
@@ -433,11 +358,11 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
     {
       label: 'Reveal in Finder/Explorer',
       action: async () => {
-        if (repoInfo.value) {
+        if (repoStore.repoInfo) {
           try {
-            await gitService.revealInFinder(`${repoInfo.value.path}/${file.path}`);
+            await gitService.revealInFinder(`${repoStore.repoInfo.path}/${file.path}`);
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           }
         }
       }
@@ -445,11 +370,11 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
     {
       label: 'Open in Editor',
       action: async () => {
-        if (repoInfo.value) {
+        if (repoStore.repoInfo) {
           try {
-            await openPath(`${repoInfo.value.path}/${file.path}`);
+            await openPath(`${repoStore.repoInfo.path}/${file.path}`);
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           }
         }
       }
@@ -458,10 +383,10 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
 };
 
 const onFileHeaderContextMenu = (event: MouseEvent) => {
-  if (fileStatuses.value.length === 0) return;
+  if (repoStore.fileStatuses.length === 0) return;
   showContextMenu(event, [
     {
-      label: allStaged.value ? 'Unstage All' : 'Stage All',
+      label: repoStore.allStaged ? 'Unstage All' : 'Stage All',
       action: () => toggleAllStaged()
     },
     { divider: true },
@@ -485,18 +410,18 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
     {
       label: 'View File History',
       action: async () => {
-        searchCommitQuery.value = filePath;
+        uiStore.setSearchCommitQuery(filePath);
       }
     },
     { divider: true },
     {
       label: 'Reveal in Finder/Explorer',
       action: async () => {
-        if (repoInfo.value) {
+        if (repoStore.repoInfo) {
           try {
-            await gitService.revealInFinder(`${repoInfo.value.path}/${filePath}`);
+            await gitService.revealInFinder(`${repoStore.repoInfo.path}/${filePath}`);
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           }
         }
       }
@@ -504,11 +429,11 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
     {
       label: 'Open in Editor',
       action: async () => {
-        if (repoInfo.value) {
+        if (repoStore.repoInfo) {
           try {
-            await openPath(`${repoInfo.value.path}/${filePath}`);
+            await openPath(`${repoStore.repoInfo.path}/${filePath}`);
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           }
         }
       }
@@ -567,11 +492,11 @@ const onConflictContextMenu = (event: MouseEvent, conflict: ConflictInfo) => {
     {
       label: 'Reveal in Finder/Explorer',
       action: async () => {
-        if (repoInfo.value) {
+        if (repoStore.repoInfo) {
           try {
-            await gitService.revealInFinder(`${repoInfo.value.path}/${conflict.path}`);
+            await gitService.revealInFinder(`${repoStore.repoInfo.path}/${conflict.path}`);
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           }
         }
       }
@@ -579,11 +504,11 @@ const onConflictContextMenu = (event: MouseEvent, conflict: ConflictInfo) => {
     {
       label: 'Open in Editor',
       action: async () => {
-        if (repoInfo.value) {
+        if (repoStore.repoInfo) {
           try {
-            await openPath(`${repoInfo.value.path}/${conflict.path}`);
+            await openPath(`${repoStore.repoInfo.path}/${conflict.path}`);
           } catch (e) {
-            error.value = String(e);
+            uiStore.setError(String(e));
           }
         }
       }
@@ -591,44 +516,17 @@ const onConflictContextMenu = (event: MouseEvent, conflict: ConflictInfo) => {
   ]);
 };
 
-const fetchSettings = async () => {
-  try {
-    const s = await gitService.getSettings();
-    settings.value = s;
-  } catch (err) {
-    console.error("Failed to fetch settings", err);
-  }
-};
-
 const refreshRepo = async () => {
-  if (!repoInfo.value || isOperationInProgress.value) return;
-  isOperationInProgress.value = true;
-  try {
-    const [status, branchList, stashList, conflictList, info] = await Promise.all([
-      gitService.getStatus(),
-      gitService.getBranches(),
-      gitService.listStashes(),
-      gitService.getConflicts(),
-      gitService.getCurrentRepoInfo()
-    ]);
-    fileStatuses.value = status;
-    branches.value = branchList;
-    stashes.value = stashList.slice(0, MAX_STASHES);
-    conflicts.value = conflictList;
-    if (info) {
-      repoInfo.value = info;
-    }
-    if (conflictList.length > 0 && view.value !== "conflicts") {
-      view.value = "conflicts";
-    }
-    if (view.value === "history" && commits.value.length === 0) {
-      const history = await gitService.getHistory(50);
-      commits.value = history.slice(0, MAX_COMMITS);
-    }
-  } catch (err) {
-    error.value = err as string;
-  } finally {
-    isOperationInProgress.value = false;
+  await repoStore.refreshRepo();
+  
+  // Check for conflicts and switch view if needed
+  if (repoStore.conflicts.length > 0 && uiStore.view !== "conflicts") {
+    uiStore.setView("conflicts");
+  }
+  
+  // Load commits if in history view
+  if (uiStore.view === "history" && repoStore.commits.length === 0) {
+    await repoStore.refreshCommits();
   }
 };
 
@@ -637,11 +535,13 @@ let unlisten: (() => void) | null = null;
 onMounted(async () => {
   window.addEventListener('click', handleClickOutside);
   abortController.value = new AbortController();
-  await fetchSettings();
+  
+  await settingsStore.fetchSettings();
+  
   try {
     const info = await gitService.getCurrentRepoInfo();
     if (info) {
-      repoInfo.value = info;
+      repoStore.setRepoInfo(info);
     }
   } catch (err) {
     console.error("Failed to fetch initial repo info", err);
@@ -661,100 +561,81 @@ onUnmounted(() => {
   abortPendingOperations();
 });
 
-watch([repoInfo, view], () => {
-  if (repoInfo.value) {
+// Watchers
+watch([repoStore.repoInfo, uiStore.view], () => {
+  if (repoStore.repoInfo) {
     refreshRepo();
   }
 });
 
-watch(amendCommit, (newVal) => {
-  if (newVal && commits.value.length > 0) {
-    commitMessage.value = commits.value[0].message;
+watch(() => uiStore.amendCommit, (newVal) => {
+  if (newVal && repoStore.commits.length > 0) {
+    uiStore.setCommitMessage(repoStore.commits[0].message);
   } else if (!newVal) {
-    commitMessage.value = "";
+    uiStore.setCommitMessage("");
   }
 });
 
-watch(selectedFile, (newFile: string | null) => {
-  if (newFile && view.value === "changes") {
-    gitService.getDiff(newFile).then(d => diffs.value = d);
-  } else if (!newFile && view.value === "changes") {
-    diffs.value = [];
+watch(() => repoStore.selectedFile, async (newFile: string | null) => {
+  if (newFile && uiStore.view === "changes") {
+    await repoStore.setSelectedFile(newFile);
+  } else if (!newFile && uiStore.view === "changes") {
+    repoStore.diffs = [];
   }
 });
 
-watch(selectedCommit, async (newCommit) => {
+watch(() => repoStore.selectedCommit, async (newCommit) => {
   if (newCommit) {
-    // loading.value = true; // Removed to prevent flickering
-    try {
-      // Assuming getCommitDiff exists in gitService, otherwise I need to add it
-      // Based on previous checks, backend has it.
-      // If TS error occurs, I might need to update git.ts, but let's assume it's there.
-      const d = await gitService.getCommitDiff(newCommit.sha);
-      diffs.value = d;
-      if (d.length > 0) {
-        selectedCommitFile.value = d[0].path;
-      } else {
-        selectedCommitFile.value = null;
-      }
-    } catch (err) {
-      const errMsg = String(err);
-      if (errMsg.includes("Commit not found")) {
-        console.warn("Selected commit not found, diff unavailable:", err);
-        diffs.value = [];
-        selectedCommitFile.value = null;
-      } else {
-        error.value = errMsg;
-      }
-    } finally {
-      // loading.value = false; // Removed to prevent flickering
-    }
+    await repoStore.setSelectedCommit(newCommit);
   } else {
-    diffs.value = [];
-    selectedCommitFile.value = null;
+    repoStore.diffs = [];
+    repoStore.selectedCommitFile = null;
   }
 });
 
-watch(cloneUrl, async (newUrl) => {
+watch(uiStore.showRecentRepos, async (isOpen) => {
+  if (isOpen && settingsStore.settings?.recent_repositories.length) {
+    try {
+      const infos = await gitService.getRepositoriesInfo(settingsStore.settings?.recent_repositories || []);
+      repoStore.setRecentRepoInfos(infos);
+    } catch (err) {
+      console.error("Failed to fetch recent repo infos", err);
+    }
+  }
+});
+
+watch(() => uiStore.cloneUrl, async (newUrl) => {
   if (newUrl) {
-    // Try to extract repo name from URL
-    // e.g. https://github.com/user/repo.git -> repo
     const match = newUrl.match(/\/([^\/]+?)(\.git)?$/);
     if (match && match[1]) {
       const repoName = match[1];
       
-      // Default base path: Documents/github in user's home
-      // Dynamically get user's home directory instead of hardcoding
       let basePath = "";
-      if (repoInfo.value) {
-        basePath = repoInfo.value.path.substring(0, repoInfo.value.path.lastIndexOf('/'));
-      } else if (settings.value && settings.value.recent_repositories.length > 0) {
-        const lastRepo = settings.value.recent_repositories[0];
+      if (repoStore.repoInfo) {
+        basePath = repoStore.repoInfo.path.substring(0, repoStore.repoInfo.path.lastIndexOf('/'));
+      } else if (settingsStore.settings && settingsStore.settings.recent_repositories.length > 0) {
+        const lastRepo = settingsStore.settings.recent_repositories[0];
         basePath = lastRepo.substring(0, lastRepo.lastIndexOf('/'));
       }
 
-      // If still no basePath or it doesn't look like a github dir, use dynamic home path
       if (!basePath || !basePath.includes('github')) {
         try {
           const home = await homeDir();
           basePath = `${home}/Documents/github`;
         } catch {
-          // Fallback to empty - user will need to browse manually
           basePath = "";
         }
       }
       
-      clonePath.value = `${basePath}/${repoName}`;
+      uiStore.setClonePath(`${basePath}/${repoName}`);
     }
   }
 });
 
 const handleOpenRepo = async (path?: string) => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Opening repository...";
-    isMajorOperation.value = true;
-    error.value = null;
+    uiStore.setLoading(true, "Opening repository...", true);
+    uiStore.clearError();
 
     let selectedPath = path;
     if (!selectedPath) {
@@ -770,28 +651,22 @@ const handleOpenRepo = async (path?: string) => {
 
     if (selectedPath) {
       const info = await gitService.openRepository(selectedPath);
-      repoInfo.value = info;
-      fetchSettings();
-      selectedFile.value = null;
-      selectedCommit.value = null;
+      repoStore.setRepoInfo(info);
+      repoStore.clearSelection();
+      await settingsStore.fetchSettings();
     }
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleOpenRepo(path);
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleOpenRepo(path);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
-    showRecentRepos.value = false;
+    uiStore.setLoading(false);
+    uiStore.closeModal('recentRepos');
   }
 };
 
 const triggerCloneModal = () => {
-  cloneUrl.value = "";
-  clonePath.value = "";
-  showCloneModal.value = true;
+  uiStore.openModal('clone');
 };
 
 const handleBrowseClonePath = async () => {
@@ -802,37 +677,35 @@ const handleBrowseClonePath = async () => {
       title: "Select Clone Destination",
     });
     if (selected && typeof selected === "string") {
-      clonePath.value = selected;
+      uiStore.setClonePath(selected);
     }
   } catch (err) {
-    error.value = err as string;
+    uiStore.setError(String(err));
   }
 };
 
 const handleCloneRepo = async () => {
-  if (!cloneUrl.value || !clonePath.value) return;
-  const url = cloneUrl.value;
-  const path = clonePath.value;
-  showCloneModal.value = false;
+  if (!uiStore.cloneUrl || !uiStore.clonePath) return;
+  const url = uiStore.cloneUrl;
+  const path = uiStore.clonePath;
+  uiStore.closeModal('clone');
 
   try {
-    loading.value = true;
-    error.value = null;
+    uiStore.setLoading(true, '', true);
+    uiStore.clearError();
 
     await gitService.cloneRepository(url, path);
     const info = await gitService.openRepository(path);
-    repoInfo.value = info;
-    fetchSettings();
-    selectedFile.value = null;
-    error.value = null;
+    repoStore.setRepoInfo(info);
+    repoStore.clearSelection();
+    await settingsStore.fetchSettings();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleCloneRepo();
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleCloneRepo();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
@@ -843,12 +716,12 @@ const toggleStaged = async (file: FileStatus) => {
     } else {
       const result: StageResult = await gitService.stageFiles([file.path]);
       if (result.warnings.length > 0) {
-        error.value = result.warnings.join('\n');
+        uiStore.setError(result.warnings.join('\n'));
       }
     }
-    await refreshRepo();
+    await repoStore.refreshRepo();
   } catch (err) {
-    error.value = err as string;
+    uiStore.setError(String(err));
   }
 };
 
@@ -859,21 +732,16 @@ const handleDiscardChanges = async (path: string) => {
   });
   if (!confirmed) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Discarding changes...";
-    isMajorOperation.value = false;
+    uiStore.setLoading(true, "Discarding changes...", false);
     await gitService.discardChanges(path);
-    if (selectedFile.value === path) selectedFile.value = null;
-    await refreshRepo();
-    error.value = null;
+    if (repoStore.selectedFile === path) repoStore.selectedFile = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleDiscardChanges(path);
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleDiscardChanges(path);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
@@ -884,59 +752,49 @@ const handleDiscardAllChanges = async () => {
   });
   if (!confirmed) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Discarding all changes...";
-    isMajorOperation.value = false;
+    uiStore.setLoading(true, "Discarding all changes...", false);
     await gitService.discardAllChanges();
-    selectedFile.value = null;
-    await refreshRepo();
-    error.value = null;
+    repoStore.selectedFile = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleDiscardAllChanges();
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleDiscardAllChanges();
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleCommit = async () => {
-  if (!commitMessage.value.trim()) {
+  if (!uiStore.commitMessage.trim()) {
     toast.error("Please enter a commit message", { title: "Commit Error" });
     return;
   }
-  if (!amendCommit.value && stagedFiles.value.length === 0) {
+  if (!uiStore.amendCommit && repoStore.stagedFiles.length === 0) {
     toast.error("Please select files to commit", { title: "Commit Error" });
     return;
   }
 
   try {
-    loading.value = true;
-    loadingMessage.value = "Creating commit...";
-    isMajorOperation.value = true;
-    error.value = null;
-    if (amendCommit.value) {
-      await gitService.amendCommit(commitMessage.value);
+    uiStore.setLoading(true, "Creating commit...", true);
+    uiStore.clearError();
+    if (uiStore.amendCommit) {
+      await gitService.amendCommit(uiStore.commitMessage);
       toast.success("Commit amended successfully!", { title: "Success" });
-      amendCommit.value = false;
+      uiStore.setAmendCommit(false);
     } else {
-      await gitService.createCommit(commitMessage.value, stagedFiles.value);
+      await gitService.createCommit(uiStore.commitMessage, repoStore.stagedFiles);
       toast.success("Commit created successfully!", { title: "Success" });
     }
-    commitMessage.value = "";
-    selectedFile.value = null;
-    await refreshRepo();
-    error.value = null;
+    uiStore.setCommitMessage("");
+    repoStore.selectedFile = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleCommit();
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleCommit();
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
@@ -944,21 +802,16 @@ const handleCherryPick = async (sha: string) => {
   const confirmed = await ask(`Cherry-pick commit ${sha.substring(0, 7)}?`, { title: 'Cherry-pick', kind: 'info' });
   if (!confirmed) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Cherry-picking commit...";
-    isMajorOperation.value = false;
+    uiStore.setLoading(true, "Cherry-picking commit...", false);
     await gitService.cherryPick(sha);
-    await refreshRepo();
+    await repoStore.refreshRepo();
     toast.success("Cherry-pick successful", { title: "Success" });
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleCherryPick(sha);
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleCherryPick(sha);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
@@ -966,146 +819,114 @@ const handleRevertCommit = async (sha: string) => {
   const confirmed = await ask(`Revert commit ${sha.substring(0, 7)}?`, { title: 'Revert Commit', kind: 'warning' });
   if (!confirmed) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Reverting commit...";
-    isMajorOperation.value = false;
+    uiStore.setLoading(true, "Reverting commit...", false);
     await gitService.revertCommit(sha);
-    await refreshRepo();
+    await repoStore.refreshRepo();
     toast.success("Revert successful", { title: "Success" });
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleRevertCommit(sha);
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleRevertCommit(sha);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handlePush = async () => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Pushing changes to remote...";
-    isMajorOperation.value = true;
-    error.value = null;
+    uiStore.setLoading(true, "Pushing changes to remote...", true);
+    uiStore.clearError();
     await gitService.push();
     toast.success("Pushed successfully!", { title: "Success" });
-    await refreshRepo();
-    error.value = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handlePush();
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handlePush();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handlePull = async () => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Pulling from remote...";
-    isMajorOperation.value = true;
-    error.value = null;
+    uiStore.setLoading(true, "Pulling from remote...", true);
+    uiStore.clearError();
     await gitService.pull();
     toast.success("Pulled successfully!", { title: "Success" });
-    await refreshRepo();
-    error.value = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handlePull();
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handlePull();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleFetch = async () => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Fetching from remote...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Fetching from remote...", false);
+    uiStore.clearError();
     await gitService.fetch();
     toast.success("Fetch completed!", { title: "Success" });
-    await refreshRepo();
-    error.value = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleFetch();
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleFetch();
     trackedSetTimeout(() => refreshRepo(), 500);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleStashSave = async () => {
   const message = prompt("Optional stash message:");
   try {
-    loading.value = true;
-    loadingMessage.value = "Saving stash...";
-    isMajorOperation.value = false;
+    uiStore.setLoading(true, "Saving stash...", false);
     await gitService.stashSave(message || undefined);
-    selectedFile.value = null;
-    await refreshRepo();
-    error.value = null;
+    repoStore.selectedFile = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleStashSave();
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleStashSave();
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleStashPop = async (index: number) => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Popping stash...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Popping stash...", false);
+    uiStore.clearError();
     await gitService.stashPop(index);
-    await refreshRepo();
-    error.value = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleStashPop(index);
-
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleStashPop(index);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleApplyStash = async (index: number) => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Applying stash...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Applying stash...", false);
+    uiStore.clearError();
     await gitService.applyStash(index);
-    await refreshRepo();
+    await repoStore.refreshRepo();
     toast.success("Stash applied successfully", { title: 'Success' });
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleApplyStash(index);
-
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleApplyStash(index);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
@@ -1116,22 +937,17 @@ const handleDropStash = async (index: number) => {
   });
   if (!confirmed) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Dropping stash...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Dropping stash...", false);
+    uiStore.clearError();
     await gitService.dropStash(index);
-    await refreshRepo();
+    await repoStore.refreshRepo();
     toast.success("Stash dropped successfully", { title: 'Success' });
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleDropStash(index);
-
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleDropStash(index);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
@@ -1139,100 +955,75 @@ const handleBranchFromStash = async (index: number) => {
   const branchName = prompt("Enter new branch name:");
   if (!branchName || !branchName.trim()) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Creating branch from stash...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Creating branch from stash...", false);
+    uiStore.clearError();
     await gitService.branchFromStash(index, branchName.trim());
-    await refreshRepo();
+    await repoStore.refreshRepo();
     toast.success(`Branch ${branchName} created from stash`, { title: 'Success' });
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleBranchFromStash(index);
-
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleBranchFromStash(index);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleResolve = async (path: string, ours: boolean) => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Resolving conflict...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Resolving conflict...", false);
+    uiStore.clearError();
     await gitService.resolveConflict(path, ours);
-    await refreshRepo();
-    error.value = null;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleResolve(path, ours);
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleResolve(path, ours);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const checkoutBranch = async (branchName: string) => {
   try {
-    loading.value = true;
-    loadingMessage.value = "Checking out branch...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Checking out branch...", false);
+    uiStore.clearError();
     await gitService.checkoutBranch(branchName);
-    showBranchModal.value = false;
-    selectedFile.value = null;
-    selectedCommit.value = null;
-    await refreshRepo();
-    error.value = null;
+    uiStore.closeModal('branch');
+    repoStore.clearSelection();
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await checkoutBranch(branchName);
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await checkoutBranch(branchName);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleCreateBranch = async () => {
-  if (!newBranchName.value.trim()) return;
+  if (!uiStore.newBranchName.trim()) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Creating branch...";
-    isMajorOperation.value = false;
-    await gitService.createBranch(newBranchName.value.trim());
-    newBranchName.value = "";
-    showBranchModal.value = false;
-    await refreshRepo();
-    error.value = null;
+    uiStore.setLoading(true, "Creating branch...", false);
+    await gitService.createBranch(uiStore.newBranchName.trim());
+    uiStore.setNewBranchName("");
+    uiStore.closeModal('branch');
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleCreateBranch();
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleCreateBranch();
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const handleSwitchToSSH = async () => {
-  if (!repoInfo.value) return;
-  // Actually, I should probably just use the remote name 'origin'
+  if (!repoStore.repoInfo) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Switching remote to SSH...";
-    isMajorOperation.value = false;
-    error.value = null;
+    uiStore.setLoading(true, "Switching remote to SSH...", false);
+    uiStore.clearError();
     
-    // Dynamically get the remote URL instead of hardcoding
     const currentUrl = await gitService.getRemoteUrl("origin");
     
     if (!currentUrl) {
@@ -1240,32 +1031,28 @@ const handleSwitchToSSH = async () => {
       return;
     }
     
-    // Parse the current URL to extract owner/repo
-    // Supports: https://github.com/owner/repo.git or git@github.com:owner/repo.git
     let ownerRepo = "";
     let sshUrl = "";
     
     if (currentUrl.startsWith("https://")) {
-      // HTTPS URL: extract owner/repo from path
       const match = currentUrl.match(/github\.com\/([^\/]+\/[^\/]+)/);
       if (match) {
         ownerRepo = match[1].replace(/\.git$/, '');
       }
       sshUrl = `git@github.com:${ownerRepo}.git`;
     } else if (currentUrl.startsWith("git@")) {
-      // Already SSH, nothing to do
       toast.info("Remote is already using SSH protocol", { title: "Info" });
-      loading.value = false;
+      uiStore.setLoading(false);
       return;
     } else {
       toast.error("Unsupported remote URL format", { title: "Error" });
-      loading.value = false;
+      uiStore.setLoading(false);
       return;
     }
     
     if (!ownerRepo) {
       toast.error("Could not parse repository from remote URL", { title: "Error" });
-      loading.value = false;
+      uiStore.setLoading(false);
       return;
     }
     
@@ -1273,50 +1060,38 @@ const handleSwitchToSSH = async () => {
     if (confirmed) {
       await gitService.setRemoteUrl("origin", sshUrl);
       toast.success("Remote protocol switched to SSH successfully!", { title: "Success" });
-      showSettingsModal.value = false;
+      uiStore.closeModal('settings');
     }
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleSwitchToSSH();
-    
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleSwitchToSSH();
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
-    isMajorOperation.value = false;
+    uiStore.setLoading(false);
   }
 };
 
 const saveSettings = async () => {
-  if (settings.value) {
-    await gitService.saveSettings(settings.value);
-    showSettingsModal.value = false;
-  }
-};
-const toggleTheme = () => {
-  if (settings.value) {
-    settings.value.theme = settings.value.theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', settings.value.theme);
-    saveSettings(); // This is async but we don't need to await for UI update
+  if (settingsStore.settings) {
+    await settingsStore.saveSettings();
+    uiStore.closeModal('settings');
   }
 };
 
-// Initialize theme on mount is handled in fetchSettings/watch, but let's make sure it applies
-watch(() => settings.value?.theme, (newTheme) => {
-  if (newTheme) {
-    document.documentElement.setAttribute('data-theme', newTheme);
-  }
-}, { immediate: true });
+const toggleTheme = () => {
+  settingsStore.toggleTheme();
+};
 
 const handleClickOutside = (event: MouseEvent) => {
-  if (showRecentRepos.value && dropdownRef.value && !dropdownRef.value.contains(event.target as Node)) {
-    showRecentRepos.value = false;
+  if (uiStore.showRecentRepos && dropdownRef.value && !dropdownRef.value.contains(event.target as Node)) {
+    uiStore.closeModal('recentRepos');
   }
 };
 
 const loadTags = async () => {
   try {
-    tags.value = await gitService.listTags();
+    const tagsList = await gitService.listTags();
+    uiStore.setTags(tagsList);
   } catch (err) {
     console.error("Failed to load tags", err);
   }
@@ -1324,7 +1099,8 @@ const loadTags = async () => {
 
 const loadRemotes = async () => {
   try {
-    remotes.value = await gitService.listRemotes();
+    const remotesList = await gitService.listRemotes();
+    uiStore.setRemotes(remotesList);
   } catch (err) {
     console.error("Failed to load remotes", err);
   }
@@ -1334,39 +1110,34 @@ const handleDeleteTag = async (name: string) => {
   const confirmed = await ask(`Delete tag "${name}"?`, { title: 'Delete Tag', kind: 'warning' });
   if (!confirmed) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Deleting tag...";
+    uiStore.setLoading(true, "Deleting tag...");
     await gitService.deleteTag(name);
     await loadTags();
     toast.success(`Tag "${name}" deleted`, { title: 'Success' });
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleDeleteTag(name);
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleDeleteTag(name);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
+    uiStore.setLoading(false);
   }
 };
 
 const handleAddRemote = async () => {
-  if (!newRemoteName.value.trim() || !newRemoteUrl.value.trim()) return;
-  const name = newRemoteName.value.trim();
-  const url = newRemoteUrl.value.trim();
+  if (!uiStore.newRemoteName.trim() || !uiStore.newRemoteUrl.trim()) return;
+  const name = uiStore.newRemoteName.trim();
+  const url = uiStore.newRemoteUrl.trim();
   try {
-    loading.value = true;
-    loadingMessage.value = "Adding remote...";
+    uiStore.setLoading(true, "Adding remote...");
     await gitService.addRemote(name, url);
-    newRemoteName.value = "";
-    newRemoteUrl.value = "";
+    uiStore.clearNewRemoteFields();
     await loadRemotes();
-    toast.success(`Remote \"${name}\" added`, { title: 'Success' });
-    error.value = null;
+    toast.success(`Remote "${name}" added`, { title: 'Success' });
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
+    uiStore.setError(String(err));
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
+    uiStore.setLoading(false);
   }
 };
 
@@ -1374,31 +1145,34 @@ const handleRemoveRemote = async (name: string) => {
   const confirmed = await ask(`Remove remote "${name}"?`, { title: 'Remove Remote', kind: 'warning' });
   if (!confirmed) return;
   try {
-    loading.value = true;
-    loadingMessage.value = "Removing remote...";
+    uiStore.setLoading(true, "Removing remote...");
     await gitService.removeRemote(name);
     await loadRemotes();
     toast.success(`Remote "${name}" removed`, { title: 'Success' });
-    error.value = null;
+    uiStore.clearError();
   } catch (err) {
-    error.value = err as string;
-    lastFailedOperation.value = async () => await handleRemoveRemote(name);
+    uiStore.setError(String(err));
+    uiStore.lastFailedOperation = async () => await handleRemoveRemote(name);
   } finally {
-    loading.value = false;
-    loadingMessage.value = "";
+    uiStore.setLoading(false);
   }
 };
 
 // Keyboard shortcuts
 useKeyboardShortcuts([
-  { key: 's', ctrl: true, action: () => view.value === 'changes' && handleCommit(), description: 'Commit staged changes' },
-  { key: 'p', ctrl: true, action: () => repoInfo.value && handlePush(), description: 'Push changes' },
-  { key: 'P', ctrl: true, action: () => repoInfo.value && handlePull(), description: 'Pull changes' },
-  { key: 'f', ctrl: true, action: () => repoInfo.value && handleFetch(), description: 'Fetch from remote' },
-  { key: 'b', ctrl: true, action: () => repoInfo.value && (showBranchModal.value = true), description: 'Open branch switcher' },
-  { key: 'k', ctrl: true, action: () => repoInfo.value && handleStashSave(), description: 'Stash changes' },
-  { key: 'Escape', action: () => { showCloneModal.value = false; showSettingsModal.value = false; showBranchModal.value = false; showTagsModal.value = false; showRemotesModal.value = false; }, description: 'Close modal' },
+  { key: 's', ctrl: true, action: () => uiStore.view === 'changes' && handleCommit(), description: 'Commit staged changes' },
+  { key: 'p', ctrl: true, action: () => repoStore.repoInfo && handlePush(), description: 'Push changes' },
+  { key: 'P', ctrl: true, action: () => repoStore.repoInfo && handlePull(), description: 'Pull changes' },
+  { key: 'f', ctrl: true, action: () => repoStore.repoInfo && handleFetch(), description: 'Fetch from remote' },
+  { key: 'b', ctrl: true, action: () => repoStore.repoInfo && (uiStore.openModal('branch')), description: 'Open branch switcher' },
+  { key: 'k', ctrl: true, action: () => repoStore.repoInfo && handleStashSave(), description: 'Stash changes' },
+  { key: 'Escape', action: () => uiStore.closeAllModals(), description: 'Close modal' },
 ]);
+
+// Sync error from UI store to local ref for template
+watch(() => uiStore.error, (newError) => {
+  error.value = newError;
+});
 
 </script>
 
@@ -1410,7 +1184,7 @@ useKeyboardShortcuts([
     <header class="h-12 border-b border-border flex items-center px-4 justify-between flex-shrink-0 relative top-accent-border" style="background: var(--header-bg);">
       <div class="flex items-center gap-6 text-sm">
         <div ref="dropdownRef" class="relative">
-          <div class="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg transition-safe hover:bg-muted" :class="{ 'bg-muted': showRecentRepos }" @click="showRecentRepos = !showRecentRepos" style="color: var(--foreground);">
+          <div class="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg transition-safe hover:bg-muted" :class="{ 'bg-muted': uiStore.showRecentRepos }" @click="uiStore.showRecentRepos = !uiStore.showRecentRepos" style="color: var(--foreground);">
             <!-- Ark Logo -->
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--mark); flex-shrink:0;">
               <path d="M12 2L2 7l10 5 10-5-10-5z"/>
@@ -1419,19 +1193,19 @@ useKeyboardShortcuts([
             </svg>
             <div class="flex items-center gap-1.5">
               <span class="text-[11px] font-medium" style="color: var(--muted-foreground);">repo</span>
-              <span class="font-semibold text-[13px]" style="color: var(--foreground);">{{ repoInfo ? currentProjectName : 'None' }}</span>
+              <span class="font-semibold text-[13px]" style="color: var(--foreground);">{{ repoStore.repoInfo ? currentProjectName : 'None' }}</span>
             </div>
-            <div v-if="repoInfo && (repoInfo.ahead > 0 || repoInfo.behind > 0)" class="flex items-center gap-1 ml-1">
-              <span v-if="repoInfo.ahead > 0" class="badge text-[10px] font-bold" style="background: var(--success-bg); color: var(--success);">↑{{ repoInfo.ahead }}</span>
-              <span v-if="repoInfo.behind > 0" class="badge text-[10px] font-bold" style="background: var(--error-bg); color: var(--error);">↓{{ repoInfo.behind }}</span>
+            <div v-if="repoStore.repoInfo && (repoStore.repoInfo.ahead > 0 || repoStore.repoInfo.behind > 0)" class="flex items-center gap-1 ml-1">
+              <span v-if="repoStore.repoInfo.ahead > 0" class="badge text-[10px] font-bold" style="background: var(--success-bg); color: var(--success);">↑{{ repoStore.repoInfo.ahead }}</span>
+              <span v-if="repoStore.repoInfo.behind > 0" class="badge text-[10px] font-bold" style="background: var(--error-bg); color: var(--error);">↓{{ repoStore.repoInfo.behind }}</span>
             </div>
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-muted-foreground transition-transform duration-200" :class="{ 'rotate-180': showRecentRepos }">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-muted-foreground transition-transform duration-200" :class="{ 'rotate-180': uiStore.showRecentRepos }">
               <polyline points="6 9 12 15 18 9"/>
             </svg>
           </div>
 
           <!-- Recent Repositories Dropdown -->
-          <div v-if="showRecentRepos"
+          <div v-if="uiStore.showRecentRepos"
                class="absolute top-full left-0 mt-2 w-80 rounded-xl z-50 overflow-hidden py-1.5 glass shadow-xl"
                :style="{ border: '1px solid var(--border)', animation: 'slide-down 0.2s cubic-bezier(0.16,1,0.3,1)' }">
             <div class="px-4 py-2 border-b flex justify-between items-center" style="border-color: var(--border);">
@@ -1439,56 +1213,56 @@ useKeyboardShortcuts([
               <button @click="handleOpenRepo()" class="text-[10px] font-bold transition-safe hover:underline" style="color: var(--accent);">OPEN NEW</button>
             </div>
             <div class="max-h-64 overflow-y-auto">
-              <div v-for="path in settings?.recent_repositories" :key="path"
+              <div v-for="path in settingsStore.settings?.recent_repositories" :key="path"
                    @click="handleOpenRepo(path)"
                    class="px-4 py-2.5 cursor-pointer transition-safe flex flex-col gap-0.5 hover:bg-muted"
-                   :class="{ 'bg-spotlight': repoInfo?.path === path }">
+                   :class="{ 'bg-spotlight': repoStore.repoInfo?.path === path }">
                 <div class="text-[13px] font-semibold truncate flex items-center justify-between gap-2">
                   <div class="flex items-center gap-2 truncate">
-                    <span v-if="repoInfo?.path === path" class="w-1.5 h-1.5 rounded-full flex-shrink-0" style="background: var(--accent);"></span>
+                    <span v-if="repoStore.repoInfo?.path === path" class="w-1.5 h-1.5 rounded-full flex-shrink-0" style="background: var(--accent);"></span>
                     {{ getRepoName(path) }}
                   </div>
-                  <div v-if="getRecentRepoInfo(path)" class="flex items-center gap-1 flex-shrink-0">
-                    <span v-if="getRecentRepoInfo(path)?.ahead" class="badge text-[9px] font-bold" style="background:var(--success-bg);color:var(--success);">↑{{ getRecentRepoInfo(path)?.ahead }}</span>
-                    <span v-if="getRecentRepoInfo(path)?.behind" class="badge text-[9px] font-bold" style="background:var(--error-bg);color:var(--error);">↓{{ getRecentRepoInfo(path)?.behind }}</span>
-                    <span v-if="getRecentRepoInfo(path)?.is_dirty" class="w-1.5 h-1.5 rounded-full" style="background:var(--warning);"></span>
+                  <div v-if="repoStore.getRecentRepoInfo(path)" class="flex items-center gap-1 flex-shrink-0">
+                    <span v-if="repoStore.getRecentRepoInfo(path)?.ahead" class="badge text-[9px] font-bold" style="background:var(--success-bg);color:var(--success);">↑{{ repoStore.getRecentRepoInfo(path)?.ahead }}</span>
+                    <span v-if="repoStore.getRecentRepoInfo(path)?.behind" class="badge text-[9px] font-bold" style="background:var(--error-bg);color:var(--error);">↓{{ repoStore.getRecentRepoInfo(path)?.behind }}</span>
+                    <span v-if="repoStore.getRecentRepoInfo(path)?.is_dirty" class="w-1.5 h-1.5 rounded-full" style="background:var(--warning);"></span>
                   </div>
                 </div>
                 <div class="text-[10px] font-mono truncate" style="color: var(--muted-foreground);">{{ path }}</div>
               </div>
             </div>
-            <div v-if="!settings?.recent_repositories.length" class="px-4 py-4 text-center text-xs italic" style="color: var(--muted-foreground);">No recent repositories</div>
+            <div v-if="!settingsStore.settings?.recent_repositories.length" class="px-4 py-4 text-center text-xs italic" style="color: var(--muted-foreground);">No recent repositories</div>
           </div>
         </div>
 
-        <div v-if="repoInfo" class="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg transition-safe hover:bg-muted" @click="showBranchModal = true" style="color: var(--foreground);">
+        <div v-if="repoStore.repoInfo" class="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg transition-safe hover:bg-muted" @click="uiStore.openModal('branch')" style="color: var(--foreground);">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--muted-foreground);">
             <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
             <path d="M18 9a9 9 0 0 1-9 9"/>
           </svg>
-          <span class="font-medium text-[13px]" style="color: var(--foreground);">{{ getCurrentBranch() }}</span>
+          <span class="font-medium text-[13px]" style="color: var(--foreground);">{{ repoStore.getCurrentBranch() }}</span>
         </div>
       </div>
 
       <!-- Center title -->
-      <div v-if="repoInfo" class="absolute left-1/2 -translate-x-1/2 hidden md:flex items-center gap-2 pointer-events-none">
+      <div v-if="repoStore.repoInfo" class="absolute left-1/2 -translate-x-1/2 hidden md:flex items-center gap-2 pointer-events-none">
         <span class="text-[11px] font-semibold uppercase tracking-widest" style="color: var(--muted-foreground);">{{ currentProjectName }}</span>
       </div>
 
       <!-- Right Actions -->
       <div class="flex items-center gap-1.5">
-        <button v-if="repoInfo" @click="triggerCloneModal" class="btn btn-ghost h-8 px-3 text-[13px]">Clone</button>
-        <button v-if="repoInfo" @click="handleFetch" class="btn btn-ghost h-8 px-3 text-[13px]">Fetch</button>
-        <button v-if="repoInfo" @click="() => { loadTags(); showTagsModal = true; }" class="btn btn-ghost h-8 px-3 text-[13px]">Tags</button>
-        <button v-if="repoInfo" @click="() => { loadRemotes(); showRemotesModal = true; }" class="btn btn-ghost h-8 px-3 text-[13px]">Remotes</button>
+        <button v-if="repoStore.repoInfo" @click="triggerCloneModal" class="btn btn-ghost h-8 px-3 text-[13px]">Clone</button>
+        <button v-if="repoStore.repoInfo" @click="handleFetch" class="btn btn-ghost h-8 px-3 text-[13px]">Fetch</button>
+        <button v-if="repoStore.repoInfo" @click="() => { loadTags(); uiStore.openModal('tags'); }" class="btn btn-ghost h-8 px-3 text-[13px]">Tags</button>
+        <button v-if="repoStore.repoInfo" @click="() => { loadRemotes(); uiStore.openModal('remotes'); }" class="btn btn-ghost h-8 px-3 text-[13px]">Remotes</button>
         <div class="w-px h-5 mx-1" style="background: var(--border);"></div>
-        <button @click="showSettingsModal = true" class="btn btn-ghost h-8 w-8 p-0" title="Settings" style="color: var(--foreground);">
+        <button @click="uiStore.openModal('settings')" class="btn btn-ghost h-8 w-8 p-0" title="Settings" style="color: var(--foreground);">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
           </svg>
         </button>
-        <button @click="toggleTheme" class="btn btn-ghost h-8 w-8 p-0" :title="settings?.theme === 'dark' ? 'Light Mode' : 'Dark Mode'" style="color: var(--foreground);">
-          <svg v-if="settings?.theme === 'dark'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <button @click="toggleTheme" class="btn btn-ghost h-8 w-8 p-0" :title="settingsStore.settings?.theme === 'dark' ? 'Light Mode' : 'Dark Mode'" style="color: var(--foreground);">
+          <svg v-if="settingsStore.settings?.theme === 'dark'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
           </svg>
           <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -1501,53 +1275,53 @@ useKeyboardShortcuts([
     <div v-if="error" class="border-b px-4 py-2.5 text-[13px] flex justify-between items-center" style="background: var(--error-bg); border-color: rgba(248,81,73,0.2); color: var(--error);">
       <span class="font-medium truncate mr-3">{{ error }}</span>
       <div class="flex gap-2">
-        <button v-if="lastFailedOperation" @click="retryLastOperation" class="btn btn-danger text-xs px-2.5 py-1">Retry</button>
-        <button @click="clearError" class="btn btn-ghost text-xs px-2 py-1 ml-1">✕</button>
+        <button v-if="uiStore.lastFailedOperation" @click="retryLastOperation" class="btn btn-danger text-xs px-2.5 py-1">Retry</button>
+        <button @click="uiStore.clearError" class="btn btn-ghost text-xs px-2 py-1 ml-1">✕</button>
       </div>
     </div>
 
     <!-- Modals -->
-    <div v-if="showCloneModal || showSettingsModal || showBranchModal || showTagsModal || showRemotesModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4" style="background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);">
+    <div v-if="uiStore.showCloneModal || uiStore.showSettingsModal || uiStore.showBranchModal || uiStore.showTagsModal || uiStore.showRemotesModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4" style="background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);">
       <!-- Clone Modal -->
-      <div v-if="showCloneModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+      <div v-if="uiStore.showCloneModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
         <h2 class="text-2xl font-display mb-6 text-foreground">Clone Repository</h2>
         
         <div class="mb-5">
           <label class="block mb-2 text-sm font-medium text-foreground">Remote URL</label>
-          <input v-model="cloneUrl" placeholder="https://github.com/user/repo.git" class="w-full border border-border rounded-lg p-3 text-foreground text-sm focus:ring-2 focus:ring-accent focus:border-transparent outline-none" />
+          <input v-model="uiStore.cloneUrl" placeholder="https://github.com/user/repo.git" class="w-full border border-border rounded-lg p-3 text-foreground text-sm focus:ring-2 focus:ring-accent focus:border-transparent outline-none" />
         </div>
 
         <div class="mb-8">
           <label class="block mb-2 text-sm font-medium text-foreground">Destination Path</label>
           <div class="flex gap-2">
-            <input v-model="clonePath" placeholder="/path/to/destination" class="flex-1 border border-border rounded-lg p-3 text-foreground text-sm focus:ring-2 focus:ring-accent focus:border-transparent outline-none" />
+            <input v-model="uiStore.clonePath" placeholder="/path/to/destination" class="flex-1 border border-border rounded-lg p-3 text-foreground text-sm focus:ring-2 focus:ring-accent focus:border-transparent outline-none" />
             <button @click="handleBrowseClonePath" class="px-4 py-3 border border-border rounded-lg hover:bg-muted transition-safe text-sm font-medium">Browse</button>
           </div>
         </div>
 
         <div class="flex justify-end gap-3">
-          <button @click="showCloneModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Cancel</button>
-          <button @click="handleCloneRepo" :disabled="!cloneUrl || !clonePath" class="gradient-bg text-accent-foreground px-6 py-2.5 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed hover:shadow-accent transition-safe font-semibold">Clone</button>
+          <button @click="uiStore.closeModal('clone')" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Cancel</button>
+          <button @click="handleCloneRepo" :disabled="!uiStore.cloneUrl || !uiStore.clonePath" class="gradient-bg text-accent-foreground px-6 py-2.5 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed hover:shadow-accent transition-safe font-semibold">Clone</button>
         </div>
       </div>
 
       <!-- Settings Modal -->
-      <div v-if="showSettingsModal && settings" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+      <div v-if="uiStore.showSettingsModal && settingsStore.settings" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
         <h2 class="text-2xl font-display mb-6 text-foreground">Settings</h2>
         <div class="space-y-5 mb-8">
           <div>
             <label class="block text-sm font-semibold text-foreground mb-1">Git User Name</label>
             <p class="text-[11px] text-muted-foreground mb-2 leading-tight">Identifies you as the author of commits</p>
-            <input v-model="settings.user_name" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent bg-white shadow-sm" />
+            <input v-model="settingsStore.settings.user_name" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent bg-white shadow-sm" />
           </div>
           <div>
             <label class="block text-sm font-semibold text-foreground mb-1">Git User Email</label>
             <p class="text-[11px] text-muted-foreground mb-2 leading-tight">Email address associated with your commits</p>
-            <input v-model="settings.user_email" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent bg-white shadow-sm" />
+            <input v-model="settingsStore.settings.user_email" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent bg-white shadow-sm" />
           </div>
           <div>
             <label class="block text-sm font-semibold text-foreground mb-1">SSH Key Path</label>
-            <input v-model="settings.ssh_key_path" placeholder="~/.ssh/id_rsa" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono bg-white shadow-sm" />
+            <input v-model="settingsStore.settings.ssh_key_path" placeholder="~/.ssh/id_rsa" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono bg-white shadow-sm" />
           </div>
           <div class="pt-4 border-t border-border">
             <button @click="handleSwitchToSSH" class="text-sm text-accent hover:underline font-semibold flex items-center gap-2">
@@ -1557,16 +1331,16 @@ useKeyboardShortcuts([
           </div>
         </div>
         <div class="flex justify-end gap-3">
-          <button @click="showSettingsModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Cancel</button>
+          <button @click="uiStore.closeModal('settings')" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Cancel</button>
           <button @click="saveSettings" class="gradient-bg text-accent-foreground px-6 py-2.5 rounded-lg hover:shadow-accent transition-safe font-semibold">Save</button>
         </div>
       </div>
 
       <!-- Branch Switcher Modal -->
-      <div v-if="showBranchModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+      <div v-if="uiStore.showBranchModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
         <h2 class="text-2xl font-display mb-6 text-foreground">Branches</h2>
         <div class="max-h-60 overflow-auto mb-6 space-y-2">
-          <div v-for="branch in branches" :key="branch.name"
+          <div v-for="branch in repoStore.branches" :key="branch.name"
                @click="!branch.is_current && checkoutBranch(branch.name)"
                class="p-3 rounded-lg border border-transparent hover:border-border cursor-pointer flex items-center justify-between text-sm transition-safe"
                :class="{ 'gradient-bg text-accent-foreground border-accent shadow-accent': branch.is_current, 'hover:bg-muted': !branch.is_current }">
@@ -1577,23 +1351,23 @@ useKeyboardShortcuts([
         <div class="border-t border-border pt-6">
           <label class="block text-sm font-medium text-foreground mb-2">Create New Branch</label>
           <div class="flex gap-2">
-            <input v-model="newBranchName" @keyup.enter="handleCreateBranch" placeholder="feature/new-branch" class="flex-1 border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono" />
+            <input v-model="uiStore.newBranchName" @keyup.enter="handleCreateBranch" placeholder="feature/new-branch" class="flex-1 border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono" />
             <button @click="handleCreateBranch" class="gradient-bg text-accent-foreground px-5 rounded-lg hover:shadow-accent transition-safe font-semibold">+</button>
           </div>
         </div>
         <div class="flex justify-end mt-6">
-          <button @click="showBranchModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
+          <button @click="uiStore.closeModal('branch')" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
         </div>
       </div>
 
       <!-- Tags Modal -->
-      <div v-if="showTagsModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+      <div v-if="uiStore.showTagsModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
         <h2 class="text-2xl font-display mb-6 text-foreground">Tags</h2>
         <div class="max-h-72 overflow-auto mb-6 space-y-2">
-          <div v-if="tags.length === 0" class="text-center text-muted-foreground text-sm py-8">
+          <div v-if="uiStore.tags.length === 0" class="text-center text-muted-foreground text-sm py-8">
             No tags found in this repository
           </div>
-          <div v-for="tag in tags" :key="tag.name"
+          <div v-for="tag in uiStore.tags" :key="tag.name"
                class="p-3 rounded-lg border border-border hover:border-accent cursor-pointer flex items-center justify-between group transition-safe">
             <div class="flex-1 min-w-0">
               <div class="text-sm font-semibold truncate flex items-center gap-2">
@@ -1612,18 +1386,18 @@ useKeyboardShortcuts([
           </div>
         </div>
         <div class="flex justify-end mt-6">
-          <button @click="showTagsModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
+          <button @click="uiStore.closeModal('tags')" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
         </div>
       </div>
 
       <!-- Remotes Modal -->
-      <div v-if="showRemotesModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+      <div v-if="uiStore.showRemotesModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
         <h2 class="text-2xl font-display mb-6 text-foreground">Remotes</h2>
         <div class="max-h-72 overflow-auto mb-6 space-y-2">
-          <div v-if="remotes.length === 0" class="text-center text-muted-foreground text-sm py-8">
+          <div v-if="uiStore.remotes.length === 0" class="text-center text-muted-foreground text-sm py-8">
             No remotes configured
           </div>
-          <div v-for="remote in remotes" :key="remote.name"
+          <div v-for="remote in uiStore.remotes" :key="remote.name"
                class="p-3 rounded-lg border border-border hover:border-accent flex items-center justify-between group transition-safe">
             <div class="flex-1 min-w-0 mr-3">
               <div class="text-sm font-semibold flex items-center gap-2">
@@ -1640,75 +1414,75 @@ useKeyboardShortcuts([
         <div class="border-t border-border pt-6">
           <label class="block text-sm font-medium text-foreground mb-2">Add Remote</label>
           <div class="space-y-3">
-            <input v-model="newRemoteName" placeholder="e.g. upstream" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent" />
-            <input v-model="newRemoteUrl" placeholder="https://github.com/user/repo.git" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono" />
-            <button @click="handleAddRemote" :disabled="!newRemoteName.trim() || !newRemoteUrl.trim()" class="w-full gradient-bg text-accent-foreground disabled:opacity-50 disabled:cursor-not-allowed px-5 py-2.5 rounded-lg hover:shadow-accent transition-safe font-semibold">
+            <input v-model="uiStore.newRemoteName" placeholder="e.g. upstream" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent" />
+            <input v-model="uiStore.newRemoteUrl" placeholder="https://github.com/user/repo.git" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono" />
+            <button @click="handleAddRemote" :disabled="!uiStore.newRemoteName.trim() || !uiStore.newRemoteUrl.trim()" class="w-full gradient-bg text-accent-foreground disabled:opacity-50 disabled:cursor-not-allowed px-5 py-2.5 rounded-lg hover:shadow-accent transition-safe font-semibold">
               Add Remote
             </button>
           </div>
         </div>
         <div class="flex justify-end mt-6">
-          <button @click="showRemotesModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
+          <button @click="uiStore.closeModal('remotes')" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
         </div>
       </div>
     </div>
 
     <!-- Main Content Area -->
-    <div v-if="repoInfo" class="flex flex-1 overflow-hidden">
+    <div v-if="repoStore.repoInfo" class="flex flex-1 overflow-hidden">
       <!-- Left Sidebar -->
       <aside class="w-80 min-w-[20rem] max-w-[20rem] flex-shrink-0 border-r border-border flex flex-col bg-card shadow-sm">
         <div class="flex border-b text-[12px] font-semibold" style="border-color: var(--border);">
-          <button @click="view = 'changes'"
+          <button @click="uiStore.setView('changes')"
             class="flex-1 py-2.5 transition-safe relative border-r"
             style="border-color: var(--border);"
-            :style="view === 'changes' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">
+            :style="uiStore.view === 'changes' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">
             Changes
-            <span v-if="fileStatuses.length > 0" class="ml-1 badge" style="background:var(--spotlight);color:var(--accent);">{{ fileStatuses.length }}</span>
-            <span v-if="view === 'changes'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
+            <span v-if="repoStore.fileStatuses.length > 0" class="ml-1 badge" style="background:var(--spotlight);color:var(--accent);">{{ repoStore.fileStatuses.length }}</span>
+            <span v-if="uiStore.view === 'changes'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
           </button>
-          <button @click="view = 'history'"
+          <button @click="uiStore.setView('history')"
             class="flex-1 py-2.5 transition-safe relative"
-            :class="{ 'border-r': stashes.length > 0 || conflicts.length > 0 }"
+            :class="{ 'border-r': repoStore.stashes.length > 0 || repoStore.conflicts.length > 0 }"
             style="border-color: var(--border);"
-            :style="view === 'history' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">History
-            <span v-if="view === 'history'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
+            :style="uiStore.view === 'history' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">History
+            <span v-if="uiStore.view === 'history'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
           </button>
-          <button v-if="stashes.length > 0" @click="view = 'stashes'"
+          <button v-if="repoStore.stashes.length > 0" @click="uiStore.setView('stashes')"
             class="flex-1 py-2.5 transition-safe relative border-r"
             style="border-color: var(--border);"
-            :style="view === 'stashes' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">Stash
-            <span v-if="view === 'stashes'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
+            :style="uiStore.view === 'stashes' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">Stash
+            <span v-if="uiStore.view === 'stashes'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
           </button>
-          <button v-if="conflicts.length > 0" @click="view = 'conflicts'"
+          <button v-if="repoStore.conflicts.length > 0" @click="uiStore.setView('conflicts')"
             class="flex-1 py-2.5 transition-safe relative"
             style="color: var(--error);">Conflicts
-            <span v-if="view === 'conflicts'" class="absolute bottom-0 left-0 right-0 h-0.5" style="background: var(--error);"></span>
+            <span v-if="uiStore.view === 'conflicts'" class="absolute bottom-0 left-0 right-0 h-0.5" style="background: var(--error);"></span>
           </button>
         </div>
 
         <div class="flex-1 overflow-auto p-3">
-          <div v-if="view === 'changes'" class="space-y-1.5">
+          <div v-if="uiStore.view === 'changes'" class="space-y-1.5">
             <!-- Changes Header with Bulk Select -->
-            <div v-if="fileStatuses.length > 0" 
+            <div v-if="repoStore.fileStatuses.length > 0" 
                  @contextmenu.prevent="onFileHeaderContextMenu"
                  class="flex items-center gap-3 p-2.5 mb-2 rounded-lg bg-muted/50 border border-border transition-safe justify-between">
               <div class="flex items-center gap-3 cursor-pointer" @click="toggleAllStaged">
-                <input type="checkbox" :checked="allStaged" class="w-4 h-4 rounded border-border accent-accent cursor-pointer pointer-events-none" />
+                <input type="checkbox" :checked="repoStore.allStaged" class="w-4 h-4 rounded border-border accent-accent cursor-pointer pointer-events-none" />
                 <div class="text-xs font-semibold text-muted-foreground select-none">
-                  {{ fileStatuses.length }} changed file{{ fileStatuses.length !== 1 ? 's' : '' }}
+                  {{ repoStore.fileStatuses.length }} changed file{{ repoStore.fileStatuses.length !== 1 ? 's' : '' }}
                 </div>
               </div>
               <button @click.stop="handleDiscardAllChanges" class="text-[10px] text-error hover:underline font-bold px-2 py-1 rounded hover:bg-error/10 transition-safe">DISCARD ALL</button>
             </div>
 
-            <div v-for="file in fileStatuses" :key="file.path"
+            <div v-for="file in repoStore.fileStatuses" :key="file.path"
                  @contextmenu.prevent="onFileContextMenu($event, file)"
                  class="group flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer transition-safe"
-                 :style="selectedFile === file.path ? 'background:var(--spotlight); border:1px solid var(--accent); border-opacity:0.3;' : 'border:1px solid transparent;'"
-                 :class="{ 'hover:bg-muted': selectedFile !== file.path }"
-                 @click.self="selectedFile = file.path">
+                 :style="repoStore.selectedFile === file.path ? 'background:var(--spotlight); border:1px solid var(--accent); border-opacity:0.3;' : 'border:1px solid transparent;'"
+                 :class="{ 'hover:bg-muted': repoStore.selectedFile !== file.path }"
+                 @click.self="repoStore.selectedFile = file.path">
               <input type="checkbox" :checked="file.staged" @change="toggleStaged(file)" class="w-3.5 h-3.5 rounded flex-shrink-0" style="accent-color: var(--accent);" />
-              <div class="flex-1 min-w-0 flex items-center gap-2" @click="selectedFile = file.path">
+              <div class="flex-1 min-w-0 flex items-center gap-2" @click="repoStore.selectedFile = file.path">
                 <span class="text-[10px] w-4 text-center font-bold flex-shrink-0"
                   :style="file.status === 'added' ? 'color:var(--success)' : file.status === 'deleted' ? 'color:var(--error)' : 'color:var(--accent)'">
                   {{ file.status[0].toUpperCase() }}
@@ -1719,9 +1493,9 @@ useKeyboardShortcuts([
               <button @click.stop="handleDiscardChanges(file.path)" class="opacity-0 group-hover:opacity-100 w-5 h-5 flex items-center justify-center rounded transition-safe flex-shrink-0 text-[10px]" style="color:var(--error);" onmouseover="this.style.background='var(--error-bg)'" onmouseout="this.style.background=''">✕</button>
             </div>
           </div>
-          <div v-else-if="view === 'history'" class="flex-1 flex flex-col overflow-hidden">
+          <div v-else-if="uiStore.view === 'history'" class="flex-1 flex flex-col overflow-hidden">
             <div class="px-3 py-2 border-b border-border bg-card/50">
-               <input v-model="searchCommitQuery" placeholder="Search commits..." class="w-full bg-muted/30 border border-border rounded-lg px-3 py-2 text-xs text-foreground outline-none focus:ring-1 focus:ring-accent" />
+               <input v-model="uiStore.searchCommitQuery" placeholder="Search commits..." class="w-full bg-muted/30 border border-border rounded-lg px-3 py-2 text-xs text-foreground outline-none focus:ring-1 focus:ring-accent" />
             </div>
             <RecycleScroller
               class="flex-1 overflow-auto p-3"
@@ -1730,11 +1504,11 @@ useKeyboardShortcuts([
               key-field="sha"
               v-slot="{ item }"
             >
-              <div @click="selectedCommit = item"
+              <div @click="repoStore.selectedCommit = item"
                    @contextmenu.prevent="onCommitContextMenu($event, item)"
                    class="mb-1.5 p-3 rounded-lg border border-transparent hover:border-border cursor-pointer transition-safe bg-card/30"
-                   :class="{ 'border-accent bg-accent/5 shadow-sm': selectedCommit?.sha === item.sha }">
-                <div class="text-sm font-semibold truncate mb-1.5 flex items-center gap-2" :class="{ 'text-accent': selectedCommit?.sha === item.sha }">
+                   :class="{ 'border-accent bg-accent/5 shadow-sm': repoStore.selectedCommit?.sha === item.sha }">
+                <div class="text-sm font-semibold truncate mb-1.5 flex items-center gap-2" :class="{ 'text-accent': repoStore.selectedCommit?.sha === item.sha }">
                   <span v-if="!item.is_pushed" 
                         class="text-success font-bold text-xs" title="Unpushed commit">↑</span>
                   {{ item.message }}
@@ -1746,8 +1520,8 @@ useKeyboardShortcuts([
               </div>
             </RecycleScroller>
           </div>
-          <div v-else-if="view === 'stashes'" class="space-y-1.5">
-            <div v-for="(stash, index) in stashes" :key="index"
+          <div v-else-if="uiStore.view === 'stashes'" class="space-y-1.5">
+            <div v-for="(stash, index) in repoStore.stashes" :key="index"
                  @contextmenu.prevent="onStashContextMenu($event, stash)"
                  class="p-3 bg-card rounded-lg border border-border flex justify-between items-center group hover:border-accent transition-safe">
               <div class="flex-1 min-w-0">
@@ -1757,8 +1531,8 @@ useKeyboardShortcuts([
               <button @click="handleStashPop(index)" class="opacity-0 group-hover:opacity-100 gradient-bg text-accent-foreground text-xs px-3 py-1.5 rounded-lg hover:shadow-accent transition-safe font-medium">Pop</button>
             </div>
           </div>
-          <div v-else-if="view === 'conflicts'" class="space-y-2">
-            <div v-for="conflict in conflicts" :key="conflict.path"
+          <div v-else-if="uiStore.view === 'conflicts'" class="space-y-2">
+            <div v-for="conflict in repoStore.conflicts" :key="conflict.path"
                  @contextmenu.prevent="onConflictContextMenu($event, conflict)"
                  class="p-3 bg-error/5 rounded-lg border border-error/20">
               <div class="text-sm font-semibold truncate mb-3 text-error" :title="conflict.path">{{ conflict.path.split('/').pop() }}</div>
@@ -1770,63 +1544,63 @@ useKeyboardShortcuts([
           </div>
         </div>
 
-        <div v-if="view === 'changes'" class="p-4 border-t border-border bg-muted/30">
+        <div v-if="uiStore.view === 'changes'" class="p-4 border-t border-border bg-muted/30">
           <div class="flex items-center gap-2 mb-2">
-             <input type="checkbox" id="amend" v-model="amendCommit" class="w-3.5 h-3.5 rounded border-border accent-accent" />
+             <input type="checkbox" id="amend" v-model="uiStore.amendCommit" class="w-3.5 h-3.5 rounded border-border accent-accent" />
              <label for="amend" class="text-xs font-medium text-muted-foreground cursor-pointer select-none">Amend Last Commit</label>
           </div>
           <label class="block mb-2 text-sm font-medium text-foreground">Commit Message</label>
-          <textarea v-model="commitMessage" placeholder="Describe your changes..." class="w-full bg-card border border-border rounded-lg p-3 text-foreground text-sm mb-3 focus:ring-2 focus:ring-accent focus:border-transparent outline-none resize-none" rows="3" />
-          <button @click="handleCommit" :disabled="loading || !commitMessage.trim() || (!amendCommit && stagedFiles.length === 0)" 
+          <textarea v-model="uiStore.commitMessage" placeholder="Describe your changes..." class="w-full bg-card border border-border rounded-lg p-3 text-foreground text-sm mb-3 focus:ring-2 focus:ring-accent focus:border-transparent outline-none resize-none" rows="3" />
+          <button @click="handleCommit" :disabled="uiStore.loading || !uiStore.commitMessage.trim() || (!uiStore.amendCommit && repoStore.stagedFiles.length === 0)" 
                   class="w-full gradient-bg text-accent-foreground disabled:opacity-50 disabled:cursor-not-allowed py-2.5 rounded-lg font-semibold text-sm hover:shadow-accent transition-safe">
-            {{ amendCommit ? 'Amend Commit' : `Commit to ${getCurrentBranch()}` }}
+            {{ uiStore.amendCommit ? 'Amend Commit' : `Commit to ${repoStore.getCurrentBranch()}` }}
           </button>
         </div>
 
         <div class="p-3 border-t border-border flex gap-2 overflow-x-auto bg-card text-sm">
           <button @click="handlePull" class="flex-1 bg-card border border-border py-2 px-3 rounded-lg hover:bg-muted transition-safe font-medium flex items-center justify-center gap-2">
             Pull
-            <span v-if="repoInfo?.behind" class="flex items-center justify-center bg-error/10 text-error text-[10px] w-4 h-4 rounded-full font-bold">{{ repoInfo.behind }}</span>
+            <span v-if="repoStore.repoInfo?.behind" class="flex items-center justify-center bg-error/10 text-error text-[10px] w-4 h-4 rounded-full font-bold">{{ repoStore.repoInfo.behind }}</span>
           </button>
           <button @click="handlePush" class="flex-1 bg-card border border-border py-2 px-3 rounded-lg hover:bg-muted transition-safe font-medium flex items-center justify-center gap-2">
             Push
-            <span v-if="repoInfo?.ahead" class="flex items-center justify-center bg-success/10 text-success text-[10px] w-4 h-4 rounded-full font-bold">{{ repoInfo.ahead }}</span>
+            <span v-if="repoStore.repoInfo?.ahead" class="flex items-center justify-center bg-success/10 text-success text-[10px] w-4 h-4 rounded-full font-bold">{{ repoStore.repoInfo.ahead }}</span>
           </button>
           <button @click="handleStashSave" class="flex-1 bg-card border border-border py-2 px-3 rounded-lg hover:bg-muted transition-safe font-medium">Stash</button>
-          <button v-if="view === 'history' && selectedCommit" @click="selectedCommit = null" class="flex-1 bg-card border border-border py-2 px-3 rounded-lg hover:bg-error/10 hover:text-error transition-safe font-medium">Clear</button>
+          <button v-if="uiStore.view === 'history' && repoStore.selectedCommit" @click="repoStore.selectedCommit = null" class="flex-1 bg-card border border-border py-2 px-3 rounded-lg hover:bg-error/10 hover:text-error transition-safe font-medium">Clear</button>
         </div>
       </aside>
 
       <!-- Diff/Main View -->
       <main class="flex-1 bg-background flex flex-col overflow-hidden">
-        <div v-if="view === 'changes' && selectedFile" class="flex-1 flex flex-col overflow-hidden">
+        <div v-if="uiStore.view === 'changes' && repoStore.selectedFile" class="flex-1 flex flex-col overflow-hidden">
           <div class="h-12 border-b border-border flex items-center px-6 bg-card text-sm font-mono text-muted-foreground">
-            {{ selectedFile }}
+            {{ repoStore.selectedFile }}
           </div>
           <div class="flex-1 overflow-auto">
-            <DiffViewer :diffs="diffs" />
+            <DiffViewer :diffs="repoStore.diffs" />
           </div>
         </div>
-        <div v-else-if="view === 'history' && selectedCommit" class="flex-1 flex flex-col overflow-hidden">
+        <div v-else-if="uiStore.view === 'history' && repoStore.selectedCommit" class="flex-1 flex flex-col overflow-hidden">
           <div class="h-14 border-b border-border flex items-center px-6 bg-card text-sm font-mono justify-between flex-shrink-0">
             <div class="flex items-center gap-3 overflow-hidden">
-              <span class="text-accent font-semibold flex-shrink-0">{{ selectedCommit.sha.substring(0, 7) }}</span>
-              <span class="text-muted-foreground truncate" :title="selectedCommit.message">{{ selectedCommit.message }}</span>
+              <span class="text-accent font-semibold flex-shrink-0">{{ repoStore.selectedCommit.sha.substring(0, 7) }}</span>
+              <span class="text-muted-foreground truncate" :title="repoStore.selectedCommit.message">{{ repoStore.selectedCommit.message }}</span>
             </div>
             <div class="flex items-center gap-3 flex-shrink-0 ml-4">
-               <button @click="handleCherryPick(selectedCommit.sha)" class="px-3 py-1.5 border border-border rounded text-xs hover:bg-muted transition-safe font-medium" title="Apply this commit to current branch">Cherry-pick</button>
-               <button @click="handleRevertCommit(selectedCommit.sha)" class="px-3 py-1.5 border border-border rounded text-xs hover:bg-muted hover:text-error transition-safe font-medium" title="Create a new commit that reverts this one">Revert</button>
+               <button @click="handleCherryPick(repoStore.selectedCommit.sha)" class="px-3 py-1.5 border border-border rounded text-xs hover:bg-muted transition-safe font-medium" title="Apply this commit to current branch">Cherry-pick</button>
+               <button @click="handleRevertCommit(repoStore.selectedCommit.sha)" class="px-3 py-1.5 border border-border rounded text-xs hover:bg-muted hover:text-error transition-safe font-medium" title="Create a new commit that reverts this one">Revert</button>
             </div>
           </div>
           
           <div class="flex-1 flex overflow-hidden">
             <!-- Left: File List -->
             <div class="w-64 border-r border-border bg-card overflow-y-auto flex-shrink-0">
-              <div v-for="diff in diffs" :key="diff.path"
-                   @click="selectedCommitFile = diff.path"
+              <div v-for="diff in repoStore.diffs" :key="diff.path"
+                   @click="repoStore.selectedCommitFile = diff.path"
                    @contextmenu.prevent="onCommitFileContextMenu($event, diff.path)"
                    class="px-4 py-2 text-sm cursor-pointer border-l-2 hover:bg-muted transition-safe flex items-center justify-between group"
-                   :class="{ 'border-accent bg-accent/5': selectedCommitFile === diff.path, 'border-transparent': selectedCommitFile !== diff.path }">
+                   :class="{ 'border-accent bg-accent/5': repoStore.selectedCommitFile === diff.path, 'border-transparent': repoStore.selectedCommitFile !== diff.path }">
                 <span class="truncate" :title="diff.path">{{ diff.path.split('/').pop() }}</span>
                 <span class="text-xs w-4 text-center font-bold" 
                       :class="{ 'text-success': diff.additions > 0 && diff.deletions === 0, 'text-error': diff.deletions > 0 && diff.additions === 0, 'text-accent': diff.additions > 0 && diff.deletions > 0 }">
@@ -1837,12 +1611,12 @@ useKeyboardShortcuts([
 
             <!-- Right: Diff -->
             <div class="flex-1 overflow-auto bg-background">
-              <DiffViewer :diffs="diffs.filter(d => d.path === selectedCommitFile)" />
+              <DiffViewer :diffs="repoStore.diffs.filter(d => d.path === repoStore.selectedCommitFile)" />
             </div>
           </div>
         </div>
         <div v-else class="flex-1 flex items-center justify-center text-muted-foreground text-sm">
-          {{ view === 'history' ? 'Select a commit to view diff' : 'Select a file to view changes' }}
+          {{ uiStore.view === 'history' ? 'Select a commit to view diff' : 'Select a file to view changes' }}
         </div>
       </main>
     </div>
@@ -1897,14 +1671,14 @@ useKeyboardShortcuts([
           </button>
         </div>
 
-        <div v-if="settings?.recent_repositories.length" class="text-left">
+        <div v-if="settingsStore.settings?.recent_repositories.length" class="text-left">
           <div class="flex items-center gap-3 mb-3">
             <div class="h-px flex-1" style="background: var(--border);"></div>
             <span class="text-[11px] font-semibold uppercase tracking-widest" style="color: var(--muted-foreground);">Recent</span>
             <div class="h-px flex-1" style="background: var(--border);"></div>
           </div>
           <div class="space-y-1.5">
-            <div v-for="path in settings.recent_repositories.slice(0, 5)" :key="path"
+            <div v-for="path in settingsStore.settings.recent_repositories.slice(0, 5)" :key="path"
                  @click="handleOpenRepo(path)"
                  class="group flex items-center gap-3 px-4 py-3 rounded-xl border cursor-pointer transition-safe"
                  style="background: var(--card); border-color: var(--border);"
@@ -1925,16 +1699,16 @@ useKeyboardShortcuts([
     </div>
 
     <!-- Loading Overlay (major operations) -->
-    <div v-if="loading && isMajorOperation" class="fixed inset-0 z-[100] flex items-center justify-center" style="background: rgba(0,0,0,0.6); backdrop-filter: blur(8px);">
+    <div v-if="uiStore.loading && uiStore.isMajorOperation" class="fixed inset-0 z-[100] flex items-center justify-center" style="background: rgba(0,0,0,0.6); backdrop-filter: blur(8px);">
       <div class="rounded-2xl p-8 flex flex-col items-center gap-5" style="background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-xl);">
         <div class="spinner spinner-lg"></div>
-        <span class="text-[15px] font-semibold">{{ loadingMessage || 'Processing...' }}</span>
+        <span class="text-[15px] font-semibold">{{ uiStore.loadingMessage || 'Processing...' }}</span>
       </div>
     </div>
     <!-- Small loading indicator -->
-    <div v-else-if="loading" class="fixed bottom-4 right-4 z-[100] flex items-center gap-2 px-3 py-2 rounded-xl" style="background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-lg); backdrop-filter:blur(12px);">
+    <div v-else-if="uiStore.loading" class="fixed bottom-4 right-4 z-[100] flex items-center gap-2 px-3 py-2 rounded-xl" style="background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-lg); backdrop-filter:blur(12px);">
       <div class="spinner"></div>
-      <span class="text-[12px] font-medium" style="color:var(--muted-foreground);">{{ loadingMessage || 'Loading...' }}</span>
+      <span class="text-[12px] font-medium" style="color:var(--muted-foreground);">{{ uiStore.loadingMessage || 'Loading...' }}</span>
     </div>
   </div>
 </template>
