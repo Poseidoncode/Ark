@@ -33,21 +33,8 @@ build:
 	npm run tauri build -- --ci
 
 # 打包 DMG 安裝映像
-APP_NAME := Ark
-APP_PATH := src-tauri/target/release/bundle/macos/$(APP_NAME).app
-DMG_PATH := src-tauri/target/release/bundle/dmg/$(APP_NAME).dmg
-
 dmg: build
-	@echo "📦 Creating DMG installer..."
-	@mkdir -p src-tauri/target/release/bundle/dmg
-	@rm -f "$(DMG_PATH)"
-	@STAGING=$$(mktemp -d) && \
-		cp -R "$(APP_PATH)" "$$STAGING/" && \
-		ln -s /Applications "$$STAGING/Applications" && \
-		hdiutil create -volname "$(APP_NAME)" -srcfolder "$$STAGING" \
-			-ov -format UDZO "$(DMG_PATH)" && \
-		rm -rf "$$STAGING"
-	@echo "✅ DMG created: $(DMG_PATH)"
+	@echo "✅ DMG package has been created by Tauri in src-tauri/target/release/bundle/dmg/"
 
 
 # 靜態分析與檢查

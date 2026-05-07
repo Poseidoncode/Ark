@@ -1,58 +1,65 @@
 <template>
-  <div class="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
-    <TransitionGroup 
-      name="toast" 
-      tag="div" 
-      class="flex flex-col gap-2"
-    >
-      <div 
-        v-for="toast in toasts" 
+  <div class="fixed top-4 right-4 z-[200] flex flex-col gap-2 pointer-events-none" style="max-width: 360px; width: 100%;">
+    <TransitionGroup name="toast" tag="div" class="flex flex-col gap-2">
+      <div
+        v-for="toast in toasts"
         :key="toast.id"
-        class="pointer-events-auto flex items-start p-4 w-80 max-w-full bg-card border border-border shadow-lg rounded-xl overflow-hidden transition-all relative"
+        class="pointer-events-auto relative overflow-hidden rounded-xl border shadow-lg"
+        :class="typeClasses[toast.type].wrapClass"
         role="alert"
+        aria-live="polite"
       >
-        <div class="absolute left-0 top-0 bottom-0 w-1" :class="typeClasses[toast.type].borderClass"></div>
+        <!-- Top accent line -->
+        <div class="absolute top-0 left-0 right-0 h-[2px]" :class="typeClasses[toast.type].accentClass"></div>
 
-        <div class="flex-shrink-0 mr-3 mt-0.5" :class="typeClasses[toast.type].iconClass">
-          <svg v-if="toast.type === 'success'" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
-            <polyline points="22 4 12 14.01 9 11.01"></polyline>
-          </svg>
-          
-          <svg v-else-if="toast.type === 'error'" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10"></circle>
-            <line x1="15" y1="9" x2="9" y2="15"></line>
-            <line x1="9" y1="9" x2="15" y2="15"></line>
-          </svg>
+        <div class="flex items-start gap-3 px-4 py-3.5">
+          <!-- Icon -->
+          <div class="flex-shrink-0 mt-0.5" :class="typeClasses[toast.type].iconClass">
+            <!-- Success -->
+            <svg v-if="toast.type === 'success'" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+              <polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+            <!-- Error -->
+            <svg v-else-if="toast.type === 'error'" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="15" y1="9" x2="9" y2="15"/>
+              <line x1="9" y1="9" x2="15" y2="15"/>
+            </svg>
+            <!-- Warning -->
+            <svg v-else-if="toast.type === 'warning'" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/>
+              <line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+            <!-- Info -->
+            <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="16" x2="12" y2="12"/>
+              <line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+          </div>
 
-          <svg v-else-if="toast.type === 'warning'" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path>
-            <line x1="12" y1="9" x2="12" y2="13"></line>
-            <line x1="12" y1="17" x2="12.01" y2="17"></line>
-          </svg>
+          <!-- Content -->
+          <div class="flex-1 min-w-0">
+            <p v-if="toast.title" class="text-sm font-semibold mb-0.5" style="color: var(--foreground);">{{ toast.title }}</p>
+            <p class="text-xs leading-relaxed break-words" style="color: var(--muted-foreground);">{{ toast.message }}</p>
+          </div>
 
-          <svg v-else xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10"></circle>
-            <line x1="12" y1="16" x2="12" y2="12"></line>
-            <line x1="12" y1="8" x2="12.01" y2="8"></line>
-          </svg>
+          <!-- Dismiss -->
+          <button
+            @click="dismiss(toast.id)"
+            class="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-md transition-safe -mt-0.5 -mr-1"
+            style="color: var(--muted-foreground);"
+            :style="{ ':hover': { background: 'var(--muted)', color: 'var(--foreground)' } }"
+            aria-label="Dismiss"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
         </div>
-
-        <div class="flex-1 min-w-0 mr-2">
-          <p v-if="toast.title" class="text-sm font-semibold text-foreground mb-1">{{ toast.title }}</p>
-          <p class="text-sm text-muted-foreground break-words">{{ toast.message }}</p>
-        </div>
-
-        <button 
-          @click="dismiss(toast.id)"
-          class="flex-shrink-0 text-muted-foreground hover:text-foreground transition-colors p-1 -mr-2 -mt-2 rounded-full hover:bg-muted"
-          aria-label="Close"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
-          </svg>
-        </button>
       </div>
     </TransitionGroup>
   </div>
@@ -65,41 +72,65 @@ const { toasts, dismiss } = useToast();
 
 const typeClasses = {
   success: {
-    borderClass: 'bg-success',
-    iconClass: 'text-success'
+    wrapClass: 'toast-success',
+    accentClass: 'bg-gradient-to-r from-green-500 to-emerald-400',
+    iconClass: 'text-green-500',
   },
   error: {
-    borderClass: 'bg-error',
-    iconClass: 'text-error'
+    wrapClass: 'toast-error',
+    accentClass: 'bg-gradient-to-r from-red-500 to-rose-400',
+    iconClass: 'text-red-500',
   },
   warning: {
-    borderClass: 'bg-warning',
-    iconClass: 'text-warning'
+    wrapClass: 'toast-warning',
+    accentClass: 'bg-gradient-to-r from-yellow-500 to-amber-400',
+    iconClass: 'text-yellow-500',
   },
   info: {
-    borderClass: 'bg-accent',
-    iconClass: 'text-accent'
-  }
+    wrapClass: 'toast-info',
+    accentClass: 'bg-gradient-to-r from-blue-500 to-indigo-400',
+    iconClass: 'text-blue-500',
+  },
 };
 </script>
 
 <style scoped>
-.toast-enter-active,
+/* Toast base */
+.toast-success,
+.toast-error,
+.toast-warning,
+.toast-info {
+  background: var(--card);
+  border-color: var(--border);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+/* Toast transitions */
+.toast-enter-active {
+  transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
 .toast-leave-active {
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: all 0.25s cubic-bezier(0.4, 0, 1, 1);
+  position: absolute;
+  right: 0;
+  left: 0;
 }
 .toast-enter-from {
   opacity: 0;
-  transform: translateX(100%) scale(0.9);
+  transform: translateX(24px) scale(0.95);
 }
 .toast-leave-to {
   opacity: 0;
-  transform: scale(0.9) translateY(-10px);
-}
-.toast-leave-active {
-  position: absolute;
+  transform: translateX(24px) scale(0.95);
 }
 .toast-move {
-  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Dismiss button hover */
+button:hover {
+  background: var(--muted);
+  color: var(--foreground);
 }
 </style>

@@ -981,6 +981,7 @@ const handlePush = async () => {
     error.value = null;
     await gitService.push();
     toast.success("Pushed successfully!", { title: "Success" });
+    await refreshRepo();
     error.value = null;
   } catch (err) {
     error.value = err as string;
@@ -1022,6 +1023,7 @@ const handleFetch = async () => {
     error.value = null;
     await gitService.fetch();
     toast.success("Fetch completed!", { title: "Success" });
+    await refreshRepo();
     error.value = null;
   } catch (err) {
     error.value = err as string;
@@ -1394,92 +1396,107 @@ useKeyboardShortcuts([
   <ContextMenu :visible="isVisible" :position="position" :items="menuItems" @close="hideContextMenu" />
   <div class="app flex flex-col h-screen bg-background text-foreground overflow-hidden font-sans">
     <!-- Header/Top Bar -->
-    <header class="h-14 border-b border-border bg-card flex items-center px-6 justify-between flex-shrink-0 shadow-sm">
-      <div class="flex items-center gap-10 text-sm">
-        <div ref="dropdownRef" class="relative items-center gap-2 px-3 py-1.5 rounded-lg transition-safe" :class="{ 'bg-muted': showRecentRepos }">
-          <div class="flex items-center gap-2 cursor-pointer" @click="showRecentRepos = !showRecentRepos">
-            <span class="text-muted-foreground mr-1">Repository:</span>
-            <span class="font-semibold gradient-text">{{ repoInfo ? currentProjectName : 'None' }}</span>
-            <div v-if="repoInfo && (repoInfo.ahead > 0 || repoInfo.behind > 0)" class="flex items-center gap-2 ml-1 px-2 py-0.5 bg-muted/50 rounded-full border border-border/50">
-              <span v-if="repoInfo.ahead > 0" class="text-[10px] font-bold text-success flex items-center gap-0.5" title="Unpushed commits">
-                ↑<span>{{ repoInfo.ahead }}</span>
-              </span>
-              <span v-if="repoInfo.ahead > 0 && repoInfo.behind > 0" class="w-[1px] h-2.5 bg-border"></span>
-              <span v-if="repoInfo.behind > 0" class="text-[10px] font-bold text-error flex items-center gap-0.5" title="Unpulled commits">
-                ↓<span>{{ repoInfo.behind }}</span>
-              </span>
+    <header class="h-12 border-b border-border flex items-center px-4 justify-between flex-shrink-0 relative top-accent-border" style="background: var(--header-bg);">
+      <div class="flex items-center gap-6 text-sm">
+        <div ref="dropdownRef" class="relative">
+          <div class="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg transition-safe hover:bg-muted" :class="{ 'bg-muted': showRecentRepos }" @click="showRecentRepos = !showRecentRepos" style="color: var(--foreground);">
+            <!-- Ark Logo -->
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--mark); flex-shrink:0;">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+              <path d="M2 17l10 5 10-5"/>
+              <path d="M2 12l10 5 10-5"/>
+            </svg>
+            <div class="flex items-center gap-1.5">
+              <span class="text-[11px] font-medium" style="color: var(--muted-foreground);">repo</span>
+              <span class="font-semibold text-[13px]" style="color: var(--foreground);">{{ repoInfo ? currentProjectName : 'None' }}</span>
             </div>
-            <span class="text-[10px] text-muted-foreground transition-transform duration-200" :class="{ 'rotate-180': showRecentRepos }">▼</span>
+            <div v-if="repoInfo && (repoInfo.ahead > 0 || repoInfo.behind > 0)" class="flex items-center gap-1 ml-1">
+              <span v-if="repoInfo.ahead > 0" class="badge text-[10px] font-bold" style="background: var(--success-bg); color: var(--success);">↑{{ repoInfo.ahead }}</span>
+              <span v-if="repoInfo.behind > 0" class="badge text-[10px] font-bold" style="background: var(--error-bg); color: var(--error);">↓{{ repoInfo.behind }}</span>
+            </div>
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-muted-foreground transition-transform duration-200" :class="{ 'rotate-180': showRecentRepos }">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
           </div>
-          
+
           <!-- Recent Repositories Dropdown -->
-          <div v-if="showRecentRepos" 
-               class="absolute top-full left-0 mt-2 w-72 bg-card border border-border rounded-xl shadow-2xl z-50 overflow-hidden py-2 animate-in fade-in slide-in-from-top-2 duration-200">
-            <div class="px-4 py-2 border-b border-border mb-1 flex justify-between items-center">
-              <span class="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Recent Repositories</span>
-              <button @click="handleOpenRepo()" class="text-[10px] text-accent hover:underline font-bold">OPEN NEW</button>
+          <div v-if="showRecentRepos"
+               class="absolute top-full left-0 mt-2 w-80 rounded-xl z-50 overflow-hidden py-1.5 glass shadow-xl"
+               :style="{ border: '1px solid var(--border)', animation: 'slide-down 0.2s cubic-bezier(0.16,1,0.3,1)' }">
+            <div class="px-4 py-2 border-b flex justify-between items-center" style="border-color: var(--border);">
+              <span class="text-[10px] font-bold uppercase tracking-widest" style="color: var(--muted-foreground);">Recent Repositories</span>
+              <button @click="handleOpenRepo()" class="text-[10px] font-bold transition-safe hover:underline" style="color: var(--accent);">OPEN NEW</button>
             </div>
             <div class="max-h-64 overflow-y-auto">
               <div v-for="path in settings?.recent_repositories" :key="path"
                    @click="handleOpenRepo(path)"
-                   class="px-4 py-2.5 hover:bg-muted cursor-pointer transition-safe group flex flex-col gap-0.5"
-                   :class="{ 'bg-accent/5': repoInfo?.path === path }">
-                <div class="text-sm font-semibold truncate flex items-center justify-between gap-2">
+                   class="px-4 py-2.5 cursor-pointer transition-safe flex flex-col gap-0.5 hover:bg-muted"
+                   :class="{ 'bg-spotlight': repoInfo?.path === path }">
+                <div class="text-[13px] font-semibold truncate flex items-center justify-between gap-2">
                   <div class="flex items-center gap-2 truncate">
-                    <span v-if="repoInfo?.path === path" class="w-1.5 h-1.5 rounded-full bg-accent"></span>
+                    <span v-if="repoInfo?.path === path" class="w-1.5 h-1.5 rounded-full flex-shrink-0" style="background: var(--accent);"></span>
                     {{ getRepoName(path) }}
                   </div>
-                  <!-- Status Indicators -->
-                  <div v-if="getRecentRepoInfo(path)" class="flex items-center gap-1.5 flex-shrink-0">
-                    <span v-if="getRecentRepoInfo(path)?.ahead" class="text-[10px] font-bold text-success flex items-center gap-0.5" title="Unpushed commits">
-                      ↑{{ getRecentRepoInfo(path)?.ahead }}
-                    </span>
-                    <span v-if="getRecentRepoInfo(path)?.behind" class="text-[10px] font-bold text-error flex items-center gap-0.5" title="Unpulled commits">
-                      ↓{{ getRecentRepoInfo(path)?.behind }}
-                    </span>
-                    <span v-if="getRecentRepoInfo(path)?.is_dirty" class="w-1.5 h-1.5 rounded-full bg-accent/40" title="Uncommitted changes"></span>
+                  <div v-if="getRecentRepoInfo(path)" class="flex items-center gap-1 flex-shrink-0">
+                    <span v-if="getRecentRepoInfo(path)?.ahead" class="badge text-[9px] font-bold" style="background:var(--success-bg);color:var(--success);">↑{{ getRecentRepoInfo(path)?.ahead }}</span>
+                    <span v-if="getRecentRepoInfo(path)?.behind" class="badge text-[9px] font-bold" style="background:var(--error-bg);color:var(--error);">↓{{ getRecentRepoInfo(path)?.behind }}</span>
+                    <span v-if="getRecentRepoInfo(path)?.is_dirty" class="w-1.5 h-1.5 rounded-full" style="background:var(--warning);"></span>
                   </div>
                 </div>
-                <div class="text-[10px] text-muted-foreground truncate font-mono">{{ path }}</div>
+                <div class="text-[10px] font-mono truncate" style="color: var(--muted-foreground);">{{ path }}</div>
               </div>
             </div>
-            <div v-if="!settings?.recent_repositories.length" class="px-4 py-4 text-center text-xs text-muted-foreground italic">
-              No recent repositories
-            </div>
+            <div v-if="!settings?.recent_repositories.length" class="px-4 py-4 text-center text-xs italic" style="color: var(--muted-foreground);">No recent repositories</div>
           </div>
         </div>
-        <div v-if="repoInfo" class="flex items-center gap-2 cursor-pointer hover:bg-muted px-3 py-1.5 rounded-lg transition-safe" @click="showBranchModal = true">
-          <span class="text-muted-foreground mr-1">Branch:</span>
-          <span class="font-semibold text-accent">{{ getCurrentBranch() }}</span>
+
+        <div v-if="repoInfo" class="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg transition-safe hover:bg-muted" @click="showBranchModal = true" style="color: var(--foreground);">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--muted-foreground);">
+            <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
+            <path d="M18 9a9 9 0 0 1-9 9"/>
+          </svg>
+          <span class="font-medium text-[13px]" style="color: var(--foreground);">{{ getCurrentBranch() }}</span>
         </div>
       </div>
-      <div class="flex items-center gap-3 text-sm">
-        <button v-if="repoInfo" @click="triggerCloneModal" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Clone</button>
-        <button v-if="repoInfo" @click="handleFetch" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Fetch</button>
-        <button v-if="repoInfo" @click="() => { loadTags(); showTagsModal = true; }" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Tags</button>
-        <button v-if="repoInfo" @click="() => { loadRemotes(); showRemotesModal = true; }" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Remotes</button>
-        <button @click="showSettingsModal = true" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Settings</button>
-        <button @click="toggleTheme" class="h-9 w-9 flex items-center justify-center rounded-lg border border-border hover:bg-muted transition-safe text-lg" :title="settings?.theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'">
-          {{ settings?.theme === 'dark' ? '🌙' : '☀️' }}
-        </button>
+
+      <!-- Center title -->
+      <div v-if="repoInfo" class="absolute left-1/2 -translate-x-1/2 hidden md:flex items-center gap-2 pointer-events-none">
+        <span class="text-[11px] font-semibold uppercase tracking-widest" style="color: var(--muted-foreground);">{{ currentProjectName }}</span>
       </div>
 
-      <!-- Center Title (Project Name) -->
-      <div v-if="repoInfo" class="absolute left-1/2 -translate-x-1/2 hidden md:flex items-center gap-2 pointer-events-none">
-        <span class="text-xs font-bold text-muted-foreground uppercase tracking-wider">{{ currentProjectName }}</span>
+      <!-- Right Actions -->
+      <div class="flex items-center gap-1.5">
+        <button v-if="repoInfo" @click="triggerCloneModal" class="btn btn-ghost h-8 px-3 text-[13px]">Clone</button>
+        <button v-if="repoInfo" @click="handleFetch" class="btn btn-ghost h-8 px-3 text-[13px]">Fetch</button>
+        <button v-if="repoInfo" @click="() => { loadTags(); showTagsModal = true; }" class="btn btn-ghost h-8 px-3 text-[13px]">Tags</button>
+        <button v-if="repoInfo" @click="() => { loadRemotes(); showRemotesModal = true; }" class="btn btn-ghost h-8 px-3 text-[13px]">Remotes</button>
+        <div class="w-px h-5 mx-1" style="background: var(--border);"></div>
+        <button @click="showSettingsModal = true" class="btn btn-ghost h-8 w-8 p-0" title="Settings" style="color: var(--foreground);">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+        <button @click="toggleTheme" class="btn btn-ghost h-8 w-8 p-0" :title="settings?.theme === 'dark' ? 'Light Mode' : 'Dark Mode'" style="color: var(--foreground);">
+          <svg v-if="settings?.theme === 'dark'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+          <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
       </div>
     </header>
 
-    <div v-if="error" class="bg-error/10 border-b border-error/20 px-6 py-3 text-sm flex justify-between items-center text-error">
-      <span class="font-medium">{{ error }}</span>
+    <div v-if="error" class="border-b px-4 py-2.5 text-[13px] flex justify-between items-center" style="background: var(--error-bg); border-color: rgba(248,81,73,0.2); color: var(--error);">
+      <span class="font-medium truncate mr-3">{{ error }}</span>
       <div class="flex gap-2">
-        <button v-if="lastFailedOperation" @click="retryLastOperation" class="hover:bg-error hover:text-white px-3 py-1 rounded transition-safe">Retry</button>
-        <button @click="clearError" class="hover:bg-error hover:text-white px-3 py-1 rounded transition-safe">✕</button>
+        <button v-if="lastFailedOperation" @click="retryLastOperation" class="btn btn-danger text-xs px-2.5 py-1">Retry</button>
+        <button @click="clearError" class="btn btn-ghost text-xs px-2 py-1 ml-1">✕</button>
       </div>
     </div>
 
     <!-- Modals -->
-    <div v-if="showCloneModal || showSettingsModal || showBranchModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4 bg-black/70 backdrop-blur-md">
+    <div v-if="showCloneModal || showSettingsModal || showBranchModal || showTagsModal || showRemotesModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4" style="background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);">
       <!-- Clone Modal -->
       <div v-if="showCloneModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
         <h2 class="text-2xl font-display mb-6 text-foreground">Clone Repository</h2>
@@ -1629,11 +1646,33 @@ useKeyboardShortcuts([
     <div v-if="repoInfo" class="flex flex-1 overflow-hidden">
       <!-- Left Sidebar -->
       <aside class="w-80 min-w-[20rem] max-w-[20rem] flex-shrink-0 border-r border-border flex flex-col bg-card shadow-sm">
-        <div class="flex border-b border-border text-sm">
-          <button @click="view = 'changes'" :class="{ 'gradient-bg text-accent-foreground': view === 'changes', 'hover:bg-muted': view !== 'changes' }" class="flex-1 py-3 font-semibold transition-safe border-r border-border">Changes ({{ fileStatuses.length }})</button>
-          <button @click="view = 'history'" :class="{ 'gradient-bg text-accent-foreground': view === 'history', 'hover:bg-muted': view !== 'history', 'border-r border-border': stashes.length > 0 || conflicts.length > 0 }" class="flex-1 py-3 font-semibold transition-safe">History</button>
-          <button v-if="stashes.length > 0" @click="view = 'stashes'" :class="{ 'gradient-bg text-accent-foreground': view === 'stashes', 'hover:bg-muted': view !== 'stashes' }" class="flex-1 py-3 font-semibold transition-safe border-r border-border">Stash</button>
-          <button v-if="conflicts.length > 0" @click="view = 'conflicts'" :class="{ 'gradient-bg text-accent-foreground': view === 'conflicts', 'hover:bg-muted': view !== 'conflicts' }" class="flex-1 py-3 font-semibold transition-safe">Conflict</button>
+        <div class="flex border-b text-[12px] font-semibold" style="border-color: var(--border);">
+          <button @click="view = 'changes'"
+            class="flex-1 py-2.5 transition-safe relative border-r"
+            style="border-color: var(--border);"
+            :style="view === 'changes' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">
+            Changes
+            <span v-if="fileStatuses.length > 0" class="ml-1 badge" style="background:var(--spotlight);color:var(--accent);">{{ fileStatuses.length }}</span>
+            <span v-if="view === 'changes'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
+          </button>
+          <button @click="view = 'history'"
+            class="flex-1 py-2.5 transition-safe relative"
+            :class="{ 'border-r': stashes.length > 0 || conflicts.length > 0 }"
+            style="border-color: var(--border);"
+            :style="view === 'history' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">History
+            <span v-if="view === 'history'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
+          </button>
+          <button v-if="stashes.length > 0" @click="view = 'stashes'"
+            class="flex-1 py-2.5 transition-safe relative border-r"
+            style="border-color: var(--border);"
+            :style="view === 'stashes' ? 'color: var(--accent);' : 'color: var(--muted-foreground);'">Stash
+            <span v-if="view === 'stashes'" class="absolute bottom-0 left-0 right-0 h-0.5 gradient-bg"></span>
+          </button>
+          <button v-if="conflicts.length > 0" @click="view = 'conflicts'"
+            class="flex-1 py-2.5 transition-safe relative"
+            style="color: var(--error);">Conflicts
+            <span v-if="view === 'conflicts'" class="absolute bottom-0 left-0 right-0 h-0.5" style="background: var(--error);"></span>
+          </button>
         </div>
 
         <div class="flex-1 overflow-auto p-3">
@@ -1651,19 +1690,22 @@ useKeyboardShortcuts([
               <button @click.stop="handleDiscardAllChanges" class="text-[10px] text-error hover:underline font-bold px-2 py-1 rounded hover:bg-error/10 transition-safe">DISCARD ALL</button>
             </div>
 
-            <div v-for="file in fileStatuses" :key="file.path" 
+            <div v-for="file in fileStatuses" :key="file.path"
                  @contextmenu.prevent="onFileContextMenu($event, file)"
-                 class="group flex items-center gap-3 p-2.5 rounded-lg border border-transparent hover:border-border cursor-pointer transition-safe"
-                 :class="{ 'border-accent bg-accent/5': selectedFile === file.path }"
+                 class="group flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer transition-safe"
+                 :style="selectedFile === file.path ? 'background:var(--spotlight); border:1px solid var(--accent); border-opacity:0.3;' : 'border:1px solid transparent;'"
+                 :class="{ 'hover:bg-muted': selectedFile !== file.path }"
                  @click.self="selectedFile = file.path">
-              <input type="checkbox" :checked="file.staged" @change="toggleStaged(file)" class="w-4 h-4 rounded border-border accent-accent" />
+              <input type="checkbox" :checked="file.staged" @change="toggleStaged(file)" class="w-3.5 h-3.5 rounded flex-shrink-0" style="accent-color: var(--accent);" />
               <div class="flex-1 min-w-0 flex items-center gap-2" @click="selectedFile = file.path">
-                <span class="text-xs w-5 text-center font-semibold" :class="{ 'text-success': file.status === 'added', 'text-accent': file.status === 'modified', 'text-error': file.status === 'deleted' }">
+                <span class="text-[10px] w-4 text-center font-bold flex-shrink-0"
+                  :style="file.status === 'added' ? 'color:var(--success)' : file.status === 'deleted' ? 'color:var(--error)' : 'color:var(--accent)'">
                   {{ file.status[0].toUpperCase() }}
                 </span>
-                <span class="truncate text-sm" :title="file.path">{{ file.path.split('/').pop() }}</span>
+                <span class="truncate text-[13px]" :title="file.path">{{ file.path.split('/').pop() }}</span>
+                <span class="text-[10px] font-mono truncate flex-shrink-0" style="color:var(--muted-foreground); max-width:60px;">{{ file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/')) : '' }}</span>
               </div>
-              <button @click.stop="handleDiscardChanges(file.path)" class="opacity-0 group-hover:opacity-100 p-1.5 hover:text-error text-xs transition-opacity rounded hover:bg-error/10">✕</button>
+              <button @click.stop="handleDiscardChanges(file.path)" class="opacity-0 group-hover:opacity-100 w-5 h-5 flex items-center justify-center rounded transition-safe flex-shrink-0 text-[10px]" style="color:var(--error);" onmouseover="this.style.background='var(--error-bg)'" onmouseout="this.style.background=''">✕</button>
             </div>
           </div>
           <div v-else-if="view === 'history'" class="flex-1 flex flex-col overflow-hidden">
@@ -1795,59 +1837,93 @@ useKeyboardShortcuts([
     </div>
 
     <!-- Welcome View -->
-    <div v-else class="flex-1 flex flex-col items-center justify-center p-8 bg-background dot-pattern">
-      <div class="max-w-3xl w-full text-center space-y-12 radial-glow">
-        <div class="space-y-6">
-          <h1 class="text-5xl md:text-6xl font-display text-foreground tracking-tight">
-            Git <span class="gradient-text">Terminal</span>
-          </h1>
-          <p class="text-muted-foreground text-lg max-w-xl mx-auto">A modern, elegant interface for version control</p>
+    <div v-else class="flex-1 flex flex-col items-center justify-center bg-background grid-pattern relative overflow-hidden">
+      <div class="relative max-w-lg w-full text-center px-8" style="animation: fade-in-up 0.4s ease;">
+        <!-- Logo mark -->
+        <div class="flex justify-center mb-7">
+          <div class="relative">
+            <div class="w-16 h-16 rounded-2xl flex items-center justify-center" style="background: var(--foreground);">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="stroke: var(--accent-foreground);">
+                <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                <path d="M2 17l10 5 10-5"/>
+                <path d="M2 12l10 5 10-5"/>
+              </svg>
+            </div>
+            <!-- Amber dot -->
+            <div class="absolute -top-1 -right-1 w-3.5 h-3.5 rounded-full border-2" style="background: var(--mark); border-color: var(--background);"></div>
+          </div>
         </div>
-        
-        <div class="grid grid-cols-2 gap-6 max-w-2xl mx-auto">
-          <button @click="handleOpenRepo()" class="group p-8 bg-card border border-border rounded-2xl hover:border-accent hover:shadow-lg transition-safe flex flex-col items-center">
-            <div class="text-4xl mb-4 gradient-text">📁</div>
-            <div class="text-lg font-semibold text-foreground mb-2">Open Local</div>
-            <div class="text-sm text-muted-foreground">Load repository from disk</div>
+
+        <h1 class="text-4xl font-semibold tracking-tight mb-2" style="color: var(--foreground); letter-spacing: -0.03em;">Ark</h1>
+        <p class="text-[14px] mb-10" style="color: var(--muted-foreground);">A precision Git client for professional workflows</p>
+
+        <div class="grid grid-cols-2 gap-3 mb-8">
+          <button @click="handleOpenRepo()" class="group p-5 rounded-xl border text-left transition-safe"
+            style="background: var(--card); border-color: var(--border);"
+            onmouseover="this.style.background='var(--muted)'"
+            onmouseout="this.style.background='var(--card)'">
+            <div class="w-8 h-8 rounded-lg flex items-center justify-center mb-3" style="background: var(--muted-foreground); opacity:0.15;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="stroke: var(--foreground); opacity:1;">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+            </div>
+            <div class="font-medium text-[14px] mb-0.5" style="color: var(--foreground);">Open</div>
+            <div class="text-[12px]" style="color: var(--muted-foreground);">Load from filesystem</div>
           </button>
-          <button @click="triggerCloneModal" class="group p-8 bg-card border border-border rounded-2xl hover:border-accent hover:shadow-lg transition-safe flex flex-col items-center">
-            <div class="text-4xl mb-4 gradient-text">⬇️</div>
-            <div class="text-lg font-semibold text-foreground mb-2">Clone Remote</div>
-            <div class="text-sm text-muted-foreground">Fetch from remote server</div>
+          <button @click="triggerCloneModal" class="group p-5 rounded-xl border text-left transition-safe"
+            style="background: var(--card); border-color: var(--border);"
+            onmouseover="this.style.background='var(--muted)'"
+            onmouseout="this.style.background='var(--card)'">
+            <div class="w-8 h-8 rounded-lg flex items-center justify-center mb-3" style="background: var(--muted);">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="stroke: var(--mark);">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+            </div>
+            <div class="font-medium text-[14px] mb-0.5" style="color: var(--foreground);">Clone</div>
+            <div class="text-[12px]" style="color: var(--muted-foreground);">From remote URL</div>
           </button>
         </div>
 
-        <div v-if="settings?.recent_repositories.length" class="space-y-4 text-left max-w-2xl mx-auto">
-          <h3 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider px-1 border-b border-border pb-3">Recent Repositories</h3>
-          <div class="space-y-2">
+        <div v-if="settings?.recent_repositories.length" class="text-left">
+          <div class="flex items-center gap-3 mb-3">
+            <div class="h-px flex-1" style="background: var(--border);"></div>
+            <span class="text-[11px] font-semibold uppercase tracking-widest" style="color: var(--muted-foreground);">Recent</span>
+            <div class="h-px flex-1" style="background: var(--border);"></div>
+          </div>
+          <div class="space-y-1.5">
             <div v-for="path in settings.recent_repositories.slice(0, 5)" :key="path"
                  @click="handleOpenRepo(path)"
-                 class="group flex items-center gap-4 p-4 bg-card border border-border rounded-xl hover:border-accent hover:shadow-md cursor-pointer transition-safe">
-              <span class="text-accent text-xl">›</span>
+                 class="group flex items-center gap-3 px-4 py-3 rounded-xl border cursor-pointer transition-safe"
+                 style="background: var(--card); border-color: var(--border);"
+                 onmouseover="this.style.borderColor='var(--accent)'"
+                 onmouseout="this.style.borderColor='var(--border)'">
+              <div class="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 text-[11px] font-bold" style="background:var(--muted); color:var(--accent);">{{ getRepoName(path)[0]?.toUpperCase() }}</div>
               <div class="flex-1 min-w-0">
-                <div class="text-foreground font-semibold truncate text-sm">{{ getRepoName(path) }}</div>
-                <div class="text-muted-foreground text-xs truncate font-mono mt-0.5">{{ path }}</div>
+                <div class="font-semibold truncate text-[13px]">{{ getRepoName(path) }}</div>
+                <div class="text-[11px] font-mono truncate" style="color:var(--muted-foreground);">{{ path }}</div>
               </div>
-              <span class="text-muted-foreground group-hover:text-accent transition-safe text-xl">→</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="flex-shrink-0 transition-safe" style="color:var(--muted-foreground);" onmouseover="this.style.color='var(--accent)'">
+                <polyline points="9 18 15 12 9 6"/>
+              </svg>
             </div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- Loading Indicator -->
-    <!-- Full-screen overlay for major operations -->
-    <div v-if="loading && isMajorOperation" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div class="bg-card border border-border rounded-2xl p-8 shadow-xl flex flex-col items-center gap-4">
-        <div class="w-12 h-12 border-4 border-accent border-t-transparent rounded-full animate-spin"></div>
-        <span class="text-lg font-semibold text-foreground">{{ loadingMessage || 'Processing...' }}</span>
+    <!-- Loading Overlay (major operations) -->
+    <div v-if="loading && isMajorOperation" class="fixed inset-0 z-[100] flex items-center justify-center" style="background: rgba(0,0,0,0.6); backdrop-filter: blur(8px);">
+      <div class="rounded-2xl p-8 flex flex-col items-center gap-5" style="background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-xl);">
+        <div class="spinner spinner-lg"></div>
+        <span class="text-[15px] font-semibold">{{ loadingMessage || 'Processing...' }}</span>
       </div>
     </div>
-
-    <!-- Small indicator for quick operations -->
-    <div v-else-if="loading" class="fixed top-4 right-4 z-[100] flex items-center gap-2 bg-card/95 backdrop-blur-sm px-3 py-2 rounded-lg shadow-lg border border-border">
-      <div class="w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin"></div>
-      <span class="text-xs font-medium text-muted-foreground">{{ loadingMessage || 'Loading...' }}</span>
+    <!-- Small loading indicator -->
+    <div v-else-if="loading" class="fixed bottom-4 right-4 z-[100] flex items-center gap-2 px-3 py-2 rounded-xl" style="background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-lg); backdrop-filter:blur(12px);">
+      <div class="spinner"></div>
+      <span class="text-[12px] font-medium" style="color:var(--muted-foreground);">{{ loadingMessage || 'Loading...' }}</span>
     </div>
   </div>
 </template>

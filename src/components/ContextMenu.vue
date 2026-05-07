@@ -131,7 +131,7 @@ onUnmounted(() => {
     <div
       v-if="visible"
       ref="menuRef"
-      class="fixed z-50 min-w-[200px] py-1 bg-card border border-border rounded-lg shadow-xl outline-none"
+      class="fixed z-50 min-w-[200px] py-1.5 rounded-xl outline-none glass shadow-xl"
       :style="menuStyles"
       role="menu"
       tabindex="-1"
@@ -140,24 +140,26 @@ onUnmounted(() => {
         <!-- Divider -->
         <div
           v-if="item.divider"
-          class="h-px bg-border my-1 mx-2"
+          class="h-px my-1.5 mx-3"
+          style="background: var(--border);"
           role="separator"
         ></div>
         
         <!-- Menu Item -->
         <button
           v-else
-          class="w-full text-left px-3 py-1.5 flex items-center space-x-2 text-sm transition-colors outline-none"
+          class="text-left flex items-center gap-2.5 text-[13px] outline-none rounded-lg transition-safe font-medium"
+          style="width: calc(100% - 12px); margin: 1px 6px; padding: 6px 10px;"
           :class="[
-            item.danger ? 'text-red-500 hover:bg-red-500/10 focus:bg-red-500/10' : 'text-foreground hover:bg-muted focus:bg-muted',
+            item.danger ? 'hover:bg-red-500/10 focus:bg-red-500/10' : 'hover:bg-muted focus:bg-muted',
             focusedIndex === index ? (item.danger ? 'bg-red-500/10' : 'bg-muted') : ''
           ]"
+          :style="{ color: item.danger ? 'var(--error)' : 'var(--foreground)' }"
           @click="executeAction(item)"
           @mouseenter="focusedIndex = index"
           role="menuitem"
         >
-          <span v-if="item.icon" class="w-4 h-4 flex items-center justify-center opacity-70">
-            <!-- Icon placeholder -->
+          <span v-if="item.icon" class="w-4 h-4 flex items-center justify-center opacity-50 flex-shrink-0">
             <i :class="item.icon"></i>
           </span>
           <span class="flex-1 truncate">{{ item.label }}</span>
@@ -170,12 +172,12 @@ onUnmounted(() => {
 <style scoped>
 .context-menu-enter-active,
 .context-menu-leave-active {
-  transition: opacity 0.15s ease, transform 0.15s ease;
+  transition: opacity 0.15s cubic-bezier(0.4, 0, 0.2, 1), transform 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .context-menu-enter-from,
 .context-menu-leave-to {
   opacity: 0;
-  transform: scale(0.95);
+  transform: scale(0.96) translateY(-4px);
 }
 </style>
