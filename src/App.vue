@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, computed, onErrorCaptured } from 'vue';
-import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type SettingsPayload, type DiffInfo, type StageResult } from './services/git';
+import { gitService, type RepositoryInfo, type FileStatus, type BranchInfo, type CommitInfo, type StashInfo, type ConflictInfo, type SettingsPayload, type DiffInfo, type StageResult, type TagInfo, type RemoteInfo } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
 import Toast from './components/Toast.vue';
 import { useContextMenu } from './composables/useContextMenu';
 import ContextMenu from './components/ContextMenu.vue';
+import { useKeyboardShortcuts } from './composables/useKeyboardShortcuts';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import { listen } from '@tauri-apps/api/event';
 import { homeDir } from '@tauri-apps/api/path';
@@ -95,6 +96,12 @@ const showSettingsModal = ref(false);
 const showBranchModal = ref(false);
 const newBranchName = ref("");
 const showRecentRepos = ref(false);
+const showTagsModal = ref(false);
+const showRemotesModal = ref(false);
+const tags = ref<TagInfo[]>([]);
+const remotes = ref<RemoteInfo[]>([]);
+const newRemoteName = ref("");
+const newRemoteUrl = ref("");
 
 watch(showRecentRepos, async (isOpen) => {
   if (isOpen && settings.value?.recent_repositories.length) {
@@ -1294,6 +1301,92 @@ const handleClickOutside = (event: MouseEvent) => {
   }
 };
 
+const loadTags = async () => {
+  try {
+    tags.value = await gitService.listTags();
+  } catch (err) {
+    console.error("Failed to load tags", err);
+  }
+};
+
+const loadRemotes = async () => {
+  try {
+    remotes.value = await gitService.listRemotes();
+  } catch (err) {
+    console.error("Failed to load remotes", err);
+  }
+};
+
+const handleDeleteTag = async (name: string) => {
+  const confirmed = await ask(`Delete tag "${name}"?`, { title: 'Delete Tag', kind: 'warning' });
+  if (!confirmed) return;
+  try {
+    loading.value = true;
+    loadingMessage.value = "Deleting tag...";
+    await gitService.deleteTag(name);
+    await loadTags();
+    toast.success(`Tag "${name}" deleted`, { title: 'Success' });
+    error.value = null;
+  } catch (err) {
+    error.value = err as string;
+    lastFailedOperation.value = async () => await handleDeleteTag(name);
+  } finally {
+    loading.value = false;
+    loadingMessage.value = "";
+  }
+};
+
+const handleAddRemote = async () => {
+  if (!newRemoteName.value.trim() || !newRemoteUrl.value.trim()) return;
+  const name = newRemoteName.value.trim();
+  const url = newRemoteUrl.value.trim();
+  try {
+    loading.value = true;
+    loadingMessage.value = "Adding remote...";
+    await gitService.addRemote(name, url);
+    newRemoteName.value = "";
+    newRemoteUrl.value = "";
+    await loadRemotes();
+    toast.success(`Remote \"${name}\" added`, { title: 'Success' });
+    error.value = null;
+  } catch (err) {
+    error.value = err as string;
+  } finally {
+    loading.value = false;
+    loadingMessage.value = "";
+  }
+};
+
+const handleRemoveRemote = async (name: string) => {
+  const confirmed = await ask(`Remove remote "${name}"?`, { title: 'Remove Remote', kind: 'warning' });
+  if (!confirmed) return;
+  try {
+    loading.value = true;
+    loadingMessage.value = "Removing remote...";
+    await gitService.removeRemote(name);
+    await loadRemotes();
+    toast.success(`Remote "${name}" removed`, { title: 'Success' });
+    error.value = null;
+  } catch (err) {
+    error.value = err as string;
+    lastFailedOperation.value = async () => await handleRemoveRemote(name);
+  } finally {
+    loading.value = false;
+    loadingMessage.value = "";
+  }
+};
+
+// Keyboard shortcuts
+useKeyboardShortcuts([
+  { key: 's', ctrl: true, action: () => view.value === 'changes' && handleCommit(), description: 'Commit staged changes' },
+  { key: 'p', ctrl: true, action: () => repoInfo.value && handlePush(), description: 'Push changes' },
+  { key: 'P', ctrl: true, action: () => repoInfo.value && handlePull(), description: 'Pull changes' },
+  { key: 'f', ctrl: true, action: () => repoInfo.value && handleFetch(), description: 'Fetch from remote' },
+  { key: 'b', ctrl: true, action: () => repoInfo.value && (showBranchModal.value = true), description: 'Open branch switcher' },
+  { key: 'k', ctrl: true, action: () => repoInfo.value && handleStashSave(), description: 'Stash changes' },
+  { key: 'Escape', action: () => { showCloneModal.value = false; showSettingsModal.value = false; showBranchModal.value = false; showTagsModal.value = false; showRemotesModal.value = false; }, description: 'Close modal' },
+]);
+
 </script>
 
 <template>
@@ -1363,6 +1456,8 @@ const handleClickOutside = (event: MouseEvent) => {
       <div class="flex items-center gap-3 text-sm">
         <button v-if="repoInfo" @click="triggerCloneModal" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Clone</button>
         <button v-if="repoInfo" @click="handleFetch" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Fetch</button>
+        <button v-if="repoInfo" @click="() => { loadTags(); showTagsModal = true; }" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Tags</button>
+        <button v-if="repoInfo" @click="() => { loadRemotes(); showRemotesModal = true; }" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Remotes</button>
         <button @click="showSettingsModal = true" class="h-9 px-4 rounded-lg border border-border hover:bg-muted transition-safe font-medium">Settings</button>
         <button @click="toggleTheme" class="h-9 w-9 flex items-center justify-center rounded-lg border border-border hover:bg-muted transition-safe text-lg" :title="settings?.theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'">
           {{ settings?.theme === 'dark' ? '🌙' : '☀️' }}
@@ -1460,6 +1555,72 @@ const handleClickOutside = (event: MouseEvent) => {
         </div>
         <div class="flex justify-end mt-6">
           <button @click="showBranchModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
+        </div>
+      </div>
+
+      <!-- Tags Modal -->
+      <div v-if="showTagsModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+        <h2 class="text-2xl font-display mb-6 text-foreground">Tags</h2>
+        <div class="max-h-72 overflow-auto mb-6 space-y-2">
+          <div v-if="tags.length === 0" class="text-center text-muted-foreground text-sm py-8">
+            No tags found in this repository
+          </div>
+          <div v-for="tag in tags" :key="tag.name"
+               class="p-3 rounded-lg border border-border hover:border-accent cursor-pointer flex items-center justify-between group transition-safe">
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-semibold truncate flex items-center gap-2">
+                <span class="text-accent">&#9878;</span>
+                {{ tag.name }}
+              </div>
+              <div class="text-xs text-muted-foreground font-mono mt-1">
+                {{ tag.sha.substring(0, 7) }}
+                <span v-if="tag.date" class="ml-2">{{ new Date(tag.date * 1000).toLocaleDateString() }}</span>
+              </div>
+              <div v-if="tag.message" class="text-[10px] text-muted-foreground mt-1 truncate">{{ tag.message }}</div>
+            </div>
+            <button @click="handleDeleteTag(tag.name)" class="opacity-0 group-hover:opacity-100 text-error hover:bg-error/10 px-3 py-1.5 rounded text-xs transition-opacity font-medium">
+              Delete
+            </button>
+          </div>
+        </div>
+        <div class="flex justify-end mt-6">
+          <button @click="showTagsModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
+        </div>
+      </div>
+
+      <!-- Remotes Modal -->
+      <div v-if="showRemotesModal" class="bg-card rounded-2xl shadow-xl p-8 w-full max-w-md border border-border">
+        <h2 class="text-2xl font-display mb-6 text-foreground">Remotes</h2>
+        <div class="max-h-72 overflow-auto mb-6 space-y-2">
+          <div v-if="remotes.length === 0" class="text-center text-muted-foreground text-sm py-8">
+            No remotes configured
+          </div>
+          <div v-for="remote in remotes" :key="remote.name"
+               class="p-3 rounded-lg border border-border hover:border-accent flex items-center justify-between group transition-safe">
+            <div class="flex-1 min-w-0 mr-3">
+              <div class="text-sm font-semibold flex items-center gap-2">
+                <span class="text-accent">&#9729;</span>
+                {{ remote.name }}
+              </div>
+              <div class="text-xs text-muted-foreground font-mono mt-1 truncate" :title="remote.url">{{ remote.url }}</div>
+            </div>
+            <button @click="handleRemoveRemote(remote.name)" class="opacity-0 group-hover:opacity-100 text-error hover:bg-error/10 px-3 py-1.5 rounded text-xs transition-opacity font-medium">
+              Remove
+            </button>
+          </div>
+        </div>
+        <div class="border-t border-border pt-6">
+          <label class="block text-sm font-medium text-foreground mb-2">Add Remote</label>
+          <div class="space-y-3">
+            <input v-model="newRemoteName" placeholder="e.g. upstream" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent" />
+            <input v-model="newRemoteUrl" placeholder="https://github.com/user/repo.git" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono" />
+            <button @click="handleAddRemote" :disabled="!newRemoteName.trim() || !newRemoteUrl.trim()" class="w-full gradient-bg text-accent-foreground disabled:opacity-50 disabled:cursor-not-allowed px-5 py-2.5 rounded-lg hover:shadow-accent transition-safe font-semibold">
+              Add Remote
+            </button>
+          </div>
+        </div>
+        <div class="flex justify-end mt-6">
+          <button @click="showRemotesModal = false" class="px-6 py-2.5 border border-border rounded-lg hover:bg-muted transition-safe font-medium">Close</button>
         </div>
       </div>
     </div>

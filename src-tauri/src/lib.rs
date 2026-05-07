@@ -4,8 +4,8 @@ mod models;
 
 use models::{
     BranchInfo, BranchOptions, CloneOptions, CommitInfo, CommitOptions, ConflictInfo, DiffInfo,
-    FileStatus, RepositoryInfo, Settings, SettingsPayload, StageResult, StashInfo, StashOptions,
-    TagOptions,
+    FileStatus, RemoteInfo, RepositoryInfo, Settings, SettingsPayload, StageResult, StashInfo, StashOptions,
+    TagInfo, TagOptions,
 };
 use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -61,9 +61,11 @@ struct AppState {
     settings: Settings,
     watcher: Option<notify::RecommendedWatcher>,
     // Performance optimization: cache for frequently accessed data
+    #[allow(dead_code)]
     branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
+    #[allow(dead_code)]
     history_cache: Option<(Vec<CommitInfo>, std::time::Instant)>,
-    // Debounce refresh operations to prevent UI thrashing
+    #[allow(dead_code)]
     last_refresh: Option<std::time::Instant>,
 }
 
@@ -127,7 +129,7 @@ fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> Option<notify
                         let _ = app_handle.emit("git-state-changed", ());
                     }
                     // Drain the channel of immediate subsequent events
-                    while let Ok(_) = rx.try_recv() {}
+                    while rx.try_recv().is_ok() {}
                 }
                 Err(e) => eprintln!("watcher error: {:?}", e),
             }
@@ -391,7 +393,7 @@ fn open_repository(
                     state.settings.last_opened_repository = None;
                 }
                 let _ = save_settings_to_disk(&state, &app_handle);
-                return Err(AppError::Git(format!("Repository path not found. Removed from list.")));
+                return Err(AppError::Git("Repository path not found. Removed from list.".to_string()));
             }
             Err(AppError::Git(e))
         }
@@ -867,6 +869,41 @@ fn merge_commit(state: State<'_, App>, sha: String) -> AppResult<()> {
     git_operations::merge_commit(repo, &sha).map_err(AppError::Git)
 }
 
+#[tauri::command]
+fn list_tags(state: State<'_, App>) -> AppResult<Vec<TagInfo>> {
+    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    git_operations::list_tags(repo).map_err(AppError::Git)
+}
+
+#[tauri::command]
+fn delete_tag(state: State<'_, App>, name: String) -> AppResult<()> {
+    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    git_operations::delete_tag(repo, &name).map_err(AppError::Git)
+}
+
+#[tauri::command]
+fn list_remotes(state: State<'_, App>) -> AppResult<Vec<RemoteInfo>> {
+    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    git_operations::list_remotes(repo).map_err(AppError::Git)
+}
+
+#[tauri::command]
+fn add_remote(state: State<'_, App>, name: String, url: String) -> AppResult<()> {
+    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    git_operations::add_remote(repo, &name, &url).map_err(AppError::Git)
+}
+
+#[tauri::command]
+fn remove_remote(state: State<'_, App>, name: String) -> AppResult<()> {
+    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git("No repository open".to_string()))?;
+    git_operations::remove_remote(repo, &name).map_err(AppError::Git)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -945,6 +982,11 @@ pub fn run() {
             branch_from_stash,
             reset_branch,
             merge_commit,
+            list_tags,
+            delete_tag,
+            list_remotes,
+            add_remote,
+            remove_remote,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

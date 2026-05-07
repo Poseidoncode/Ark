@@ -88,6 +88,19 @@ export interface StageResult {
   warnings: string[];
 }
 
+export interface TagInfo {
+  name: string;
+  message: string | null;
+  sha: string;
+  date: number;
+}
+
+export interface RemoteInfo {
+  name: string;
+  url: string;
+  fetch_url: string | null;
+}
+
 class GitServiceOptimizer {
   private cache = new Map<string, CacheEntry<unknown>>();
   private debounceTimers = new Map<string, DebouncedEntry>();
@@ -539,6 +552,54 @@ class GitServiceOptimizer {
   async mergeCommit(sha: string): Promise<void> {
     this.invalidate('repo:');
     return await invoke("merge_commit", { sha });
+  }
+
+  /**
+   * List all tags
+   */
+  async listTags(): Promise<TagInfo[]> {
+    const cacheKey = 'repo:tags';
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("list_tags"),
+      this.LONG_TTL
+    );
+  }
+
+  /**
+   * Delete a tag
+   */
+  async deleteTag(name: string): Promise<void> {
+    this.invalidate('repo:tags');
+    return await invoke("delete_tag", { name });
+  }
+
+  /**
+   * List all remotes
+   */
+  async listRemotes(): Promise<RemoteInfo[]> {
+    const cacheKey = 'repo:remotes';
+    return await this.getCachedOrFetch(
+      cacheKey,
+      () => invoke("list_remotes"),
+      this.LONG_TTL
+    );
+  }
+
+  /**
+   * Add a remote
+   */
+  async addRemote(name: string, url: string): Promise<void> {
+    this.invalidate('repo:remotes');
+    return await invoke("add_remote", { name, url });
+  }
+
+  /**
+   * Remove a remote
+   */
+  async removeRemote(name: string): Promise<void> {
+    this.invalidate('repo:remotes');
+    return await invoke("remove_remote", { name });
   }
 }
 

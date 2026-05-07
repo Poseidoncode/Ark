@@ -108,3 +108,18 @@ pub struct StageResult {
     pub staged: Vec<String>,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TagInfo {
+    pub name: String,
+    pub message: Option<String>,
+    pub sha: String,
+    pub date: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub url: String,
+    pub fetch_url: Option<String>,
+}

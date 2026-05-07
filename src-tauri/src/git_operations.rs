@@ -5,8 +5,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::models::{
-    BranchInfo, CommitInfo, ConflictInfo, DiffInfo, FileStatus, RepositoryInfo, StageResult,
-    StashInfo,
+    BranchInfo, CommitInfo, ConflictInfo, DiffInfo, FileStatus, RemoteInfo, RepositoryInfo, StageResult,
+    StashInfo, TagInfo,
 };
 
 pub fn open_repository(path: &str) -> Result<Repository, String> {
@@ -730,7 +730,7 @@ pub fn create_commit(repo: &Repository, message: &str) -> Result<String, String>
         vec![]
     };
 
-    let parent_refs: Vec<&git2::Commit> = parents.iter().map(|c| *c).collect();
+    let parent_refs: Vec<&git2::Commit> = parents.to_vec();
     let commit_id = repo
         .commit(
             Some("HEAD"),
@@ -1043,7 +1043,7 @@ pub fn stash_branch(repo: &mut Repository, index: usize, branch_name: &str) -> R
         Some(&format!("refs/heads/{}", branch_name)),
         &signature,
         &signature,
-        &format!("Branch from stash"),
+        "Branch from stash",
         &tree,
         &[],
     )
@@ -1178,7 +1178,7 @@ pub fn resolve_conflict(repo: &Repository, path: &str, use_ours: bool) -> Result
 }
 
 #[allow(dead_code)]
-pub fn create_remote_callbacks() -> () {
+pub fn create_remote_callbacks() {
     // Deprecated
 }
 pub fn fetch_changes(
@@ -1321,6 +1321,112 @@ pub fn merge_commit(repo: &Repository, sha: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     
     repo.cleanup_state().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn list_tags(repo: &Repository) -> Result<Vec<TagInfo>, String> {
+    let mut tags = Vec::new();
+
+    let tag_names = repo.tag_names(None).map_err(|e| format!("Failed to get tag names: {}", e))?;
+
+    for i in 0..tag_names.len() {
+        if let Some(tag_name) = tag_names.get(i) {
+            let name = tag_name.to_string();
+
+            // Get the target reference (could be tag or commit)
+            let (sha, message, date) = if let Ok(reference) = repo.find_reference(&format!("refs/tags/{}", name)) {
+                if let Some(oid) = reference.target() {
+                    // Peel to commit to get time and message
+                    if let Ok(commit) = repo.find_commit(oid) {
+                        let sha_str = oid.to_string();
+                        let message = commit.message().map(|m| m.to_string());
+                        let date = commit.time().seconds();
+                        (sha_str, message, date)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            tags.push(TagInfo {
+                name,
+                message,
+                sha,
+                date,
+            });
+        }
+    }
+
+    Ok(tags)
+}
+
+pub fn delete_tag(repo: &Repository, name: &str) -> Result<(), String> {
+    if !is_safe_git_arg(name) {
+        return Err("Invalid tag name".to_string());
+    }
+
+    // Try to delete the tag reference
+    let tag_ref = format!("refs/tags/{}", name);
+    if let Ok(reference) = repo.find_reference(&tag_ref) {
+        let mut ref_mut = reference;
+        ref_mut.delete().map_err(|e| format!("Failed to delete tag: {}", e))?;
+    }
+
+    Ok(())
+}
+
+pub fn list_remotes(repo: &Repository) -> Result<Vec<RemoteInfo>, String> {
+    let mut remotes = Vec::new();
+
+    let remote_names = repo.remotes()
+        .map_err(|e| format!("Failed to get remote names: {}", e))?;
+
+    for i in 0..remote_names.len() {
+        if let Some(name) = remote_names.get(i) {
+            let name_str = name.to_string();
+
+            if let Ok(remote) = repo.find_remote(&name_str) {
+                let url = remote.url().unwrap_or("").to_string();
+
+                remotes.push(RemoteInfo {
+                    name: name_str,
+                    url,
+                    fetch_url: None,
+                });
+            }
+        }
+    }
+
+    Ok(remotes)
+}
+
+pub fn add_remote(repo: &Repository, name: &str, url: &str) -> Result<(), String> {
+    if !is_safe_git_arg(name) {
+        return Err("Invalid remote name".to_string());
+    }
+
+    if url.contains(' ') || url.contains(';') || url.starts_with('-') {
+        return Err("Invalid remote URL".to_string());
+    }
+
+    repo.remote(name, url)
+        .map_err(|e| format!("Failed to add remote: {}", e))?;
+
+    Ok(())
+}
+
+pub fn remove_remote(repo: &Repository, name: &str) -> Result<(), String> {
+    if !is_safe_git_arg(name) {
+        return Err("Invalid remote name".to_string());
+    }
+
+    repo.remote_delete(name)
+        .map_err(|e| format!("Failed to remove remote: {}", e))?;
+
     Ok(())
 }
 
