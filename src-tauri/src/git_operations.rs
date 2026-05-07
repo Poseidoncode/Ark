@@ -1422,6 +1422,30 @@ mod tests {
         path
     }
 
+    /// RAII guard that automatically cleans up the temp directory when dropped.
+    /// This ensures cleanup happens even if the test panics.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            TempDir(get_temp_dir())
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Creates a new temp directory with automatic cleanup on drop.
+    /// Returns both the guard (for cleanup) and the path (for use in tests).
+    fn make_temp_dir() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new();
+        let path = temp_dir.0.clone();
+        (temp_dir, path)
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
