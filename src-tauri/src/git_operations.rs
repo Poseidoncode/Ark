@@ -922,48 +922,19 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
 pub fn push_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
-    _ssh_passphrase: Option<&str>,
+    ssh_passphrase: Option<&str>,
 ) -> Result<(), String> {
-    let path = repo
-        .workdir()
-        .ok_or("No working directory found")?
-        .to_str()
-        .ok_or("Invalid path")?;
-    let mut envs = Vec::new();
-    if let Some(command) = build_git_ssh_command(ssh_key_path)? {
-        envs.push(("GIT_SSH_COMMAND", command));
-    }
-
-    run_git_command(vec!["push", "origin", "HEAD"], Some(path), envs)?;
-    Ok(())
+    // Use git2-based remote operations instead of subprocess
+    crate::remote_ops::push_changes(repo, ssh_key_path, ssh_passphrase)
 }
 
 pub fn pull_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
-    _ssh_passphrase: Option<&str>,
+    ssh_passphrase: Option<&str>,
 ) -> Result<(), String> {
-    let path = repo
-        .workdir()
-        .ok_or("No working directory found")?
-        .to_str()
-        .ok_or("Invalid path")?;
-    let mut envs = Vec::new();
-    if let Some(command) = build_git_ssh_command(ssh_key_path)? {
-        envs.push(("GIT_SSH_COMMAND", command));
-    }
-
-    let head = repo
-        .head()
-        .map_err(|e| format!("Failed to get HEAD: {}", e))?;
-    let branch_name = if head.is_branch() {
-        head.shorthand().unwrap_or("HEAD")
-    } else {
-        "HEAD"
-    };
-
-    run_git_command(vec!["pull", "origin", branch_name], Some(path), envs)?;
-    Ok(())
+    // Use git2-based remote operations instead of subprocess
+    crate::remote_ops::pull_changes(repo, ssh_key_path, ssh_passphrase)
 }
 
 pub fn stash_save(repo: &mut Repository, message: Option<&str>) -> Result<(), String> {
@@ -1188,20 +1159,10 @@ pub fn create_remote_callbacks() {
 pub fn fetch_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
-    _ssh_passphrase: Option<&str>,
+    ssh_passphrase: Option<&str>,
 ) -> Result<(), String> {
-    let path = repo
-        .workdir()
-        .ok_or("No working directory found")?
-        .to_str()
-        .ok_or("Invalid path")?;
-    let mut envs = Vec::new();
-    if let Some(command) = build_git_ssh_command(ssh_key_path)? {
-        envs.push(("GIT_SSH_COMMAND", command));
-    }
-
-    run_git_command(vec!["fetch", "origin"], Some(path), envs)?;
-    Ok(())
+    // Use git2-based remote operations instead of subprocess
+    crate::remote_ops::fetch_changes(repo, ssh_key_path, ssh_passphrase)
 }
 
 pub fn get_remote_url(repo: &Repository, name: &str) -> Result<String, String> {

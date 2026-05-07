@@ -1,6 +1,7 @@
 use lru::LruCache;
 mod credential_store;
 mod git_operations;
+mod remote_ops;
 mod models;
 
 use models::{
