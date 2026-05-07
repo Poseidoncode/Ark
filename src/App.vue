@@ -694,7 +694,14 @@ watch(selectedCommit, async (newCommit) => {
         selectedCommitFile.value = null;
       }
     } catch (err) {
-      error.value = err as string;
+      const errMsg = String(err);
+      if (errMsg.includes("Commit not found")) {
+        console.warn("Selected commit not found, diff unavailable:", err);
+        diffs.value = [];
+        selectedCommitFile.value = null;
+      } else {
+        error.value = errMsg;
+      }
     } finally {
       // loading.value = false; // Removed to prevent flickering
     }

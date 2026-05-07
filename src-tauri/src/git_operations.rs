@@ -636,9 +636,13 @@ pub fn create_branch(repo: &Repository, name: &str, start_sha: Option<&str>) -> 
 }
 
 pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, String> {
-    let commit = repo
-        .find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("Commit not found: {}", e))?;
+    let commit = match repo.find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?) {
+        Ok(commit) => commit,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(format!("Commit not found: {}", e)),
+    };
 
     let tree = commit
         .tree()
@@ -1852,8 +1856,8 @@ mod tests {
         );
 
         let missing_sha = "0123456789012345678901234567890123456789";
-        let missing_sha_err = get_commit_diff(&repo, missing_sha).unwrap_err();
-        assert!(missing_sha_err.contains("Commit not found"));
+        let missing_sha_diff = get_commit_diff(&repo, missing_sha).unwrap();
+        assert!(missing_sha_diff.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2667,8 +2671,8 @@ mod tests {
         let history_error = get_commit_history(&repo, 10).unwrap_err();
         assert!(history_error.contains("Failed to push HEAD"));
 
-        let diff_error = get_commit_diff(&repo, "deadbeef").unwrap_err();
-        assert!(diff_error.contains("Commit not found") || diff_error.contains("too short"));
+        let diff_result = get_commit_diff(&repo, "deadbeef").unwrap();
+        assert!(diff_result.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
