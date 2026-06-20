@@ -12,27 +12,25 @@ export const useRepoStore = defineStore('repo', () => {
   const fileStatuses = ref<FileStatus[]>([]);
   const branches = ref<BranchInfo[]>([]);
   const commits = ref<CommitInfo[]>([]);
+  const commitsLoading = ref(false);
   const stashes = ref<StashInfo[]>([]);
   const conflicts = ref<ConflictInfo[]>([]);
   const recentRepoInfos = ref<RepositoryInfo[]>([]);
   const diffs = ref<DiffInfo[]>([]);
-  
+
   // Selection state
   const selectedFile = ref<string | null>(null);
   const selectedCommit = ref<CommitInfo | null>(null);
   const selectedCommitFile = ref<string | null>(null);
-  
-  // Operation lock
-  const isOperationInProgress = ref(false);
 
   // Computed
   const stagedFiles = computed(() => fileStatuses.value.filter(f => f.staged).map(f => f.path));
   const allStaged = computed(() => fileStatuses.value.length > 0 && fileStatuses.value.every(f => f.staged));
-  
-  const getCurrentBranch = () => {
+
+  const currentBranch = computed(() => {
     return branches.value.find((b: BranchInfo) => b.is_current)?.name || 'Unknown';
-  };
-  
+  });
+
   const getRecentRepoInfo = (path: string) => {
     return recentRepoInfos.value.find(r => r.path === path);
   };
@@ -47,8 +45,7 @@ export const useRepoStore = defineStore('repo', () => {
   };
 
   const refreshRepo = async () => {
-    if (!repoInfo.value || isOperationInProgress.value) return;
-    isOperationInProgress.value = true;
+    if (!repoInfo.value) return;
     try {
       const [status, branchList, stashList, conflictList, info] = await Promise.all([
         gitService.getStatus(),
@@ -67,17 +64,15 @@ export const useRepoStore = defineStore('repo', () => {
     } catch (err) {
       console.error('Failed to refresh repo:', err);
       throw err;
-    } finally {
-      isOperationInProgress.value = false;
     }
   };
 
   const refreshCommits = async () => {
+    commitsLoading.value = true;
     try {
-      const history = await gitService.getHistory(50);
-      commits.value = history.slice(0, MAX_COMMITS);
-    } catch (err) {
-      console.error('Failed to refresh commits:', err);
+      commits.value = await gitService.getHistory(MAX_COMMITS);
+    } finally {
+      commitsLoading.value = false;
     }
   };
 
@@ -136,6 +131,7 @@ export const useRepoStore = defineStore('repo', () => {
     fileStatuses,
     branches,
     commits,
+    commitsLoading,
     stashes,
     conflicts,
     recentRepoInfos,
@@ -143,14 +139,14 @@ export const useRepoStore = defineStore('repo', () => {
     selectedFile,
     selectedCommit,
     selectedCommitFile,
-    isOperationInProgress,
-    
+
+
     // Computed
     stagedFiles,
     allStaged,
-    getCurrentBranch,
+    currentBranch,
     getRecentRepoInfo,
-    
+
     // Actions
     setRepoInfo,
     setRecentRepoInfos,

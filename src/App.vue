@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
+import { onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
 import { gitService, type RepositoryInfo, type FileStatus, type CommitInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
@@ -35,74 +35,17 @@ const repoStore = useRepoStore();
 const uiStore = useUIStore();
 const settingsStore = useSettingsStore();
 
-// Memory optimization: reuse refs and limit array growth
-const MAX_TIMEOUTS = 10;
-const abortController = ref<AbortController | null>(null);
-
 onErrorCaptured((err, instance, info) => {
   console.error('Error captured in component:', err, info);
   toast.error(err instanceof Error ? err.message : String(err), { title: 'Component Error' });
   return false;
 });
 
-// Abort all pending operations on unmount
-const abortPendingOperations = () => {
-  if (abortController.value) {
-    abortController.value.abort();
-  }
-};
-
-const retryLastOperation = async () => {
-  if (uiStore.lastFailedOperation) {
-    const op = uiStore.lastFailedOperation;
-    await op();
-  }
-};
-
-const trackedSetTimeout = (callback: () => void, delay: number) => {
-  const id = setTimeout(() => {
-    timeoutIds.value = timeoutIds.value.filter(t => t !== id);
-    callback();
-  }, delay);
-  timeoutIds.value.push(id);
-  return id;
-};
-
-const clearTimeouts = () => {
-  timeoutIds.value.forEach(id => clearTimeout(id));
-  timeoutIds.value = [];
-};
-
-const timeoutIds = ref<ReturnType<typeof setTimeout>[]>([]);
-
 const toast = useToast();
 const { showContextMenu, hideContextMenu, isVisible, position, menuItems } = useContextMenu();
 
 // Helper functions
-const getRepoName = (path: string) => {
-  if (!path || path.trim() === "") return "";
-  
-  // 移除尾部的斜線
-  const cleanPath = path.replace(/[/\\]+$/, '');
-  
-  // 如果路徑以 .git 結尾，取父目錄名
-  if (cleanPath.endsWith('.git')) {
-    const withoutGit = cleanPath.slice(0, -4).replace(/[/\\]+$/, '');
-    const parts = withoutGit.split(/[/\\]/);
-    return parts[parts.length - 1] || "";
-  }
-  
-  // 取最後一個路徑段
-  const parts = cleanPath.split(/[/\\]/);
-  const lastPart = parts[parts.length - 1];
-  
-  // 如果最後一部分看起來不像是目錄名（太短或只是一個點），返回倒數第二個
-  if (!lastPart || lastPart === '.' || lastPart === '..') {
-    return parts[parts.length - 2] || path;
-  }
-  
-  return lastPart || path;
-};
+import { getRepoName } from './utils/path';
 
 const toggleAllStaged = async () => {
   if (repoStore.fileStatuses.length === 0) return;
@@ -151,30 +94,34 @@ const refreshRepo = async () => {
     uiStore.setView("conflicts");
   }
   
-  // Load commits if in history view
-  if (uiStore.view === "history" && repoStore.commits.length === 0) {
-    await repoStore.refreshCommits();
+  // Load commits when switching to history view
+  if (uiStore.view === "history") {
+    try {
+      await repoStore.refreshCommits();
+    } catch (err) {
+      console.error('Failed to refresh commits:', err);
+      toast.error('Failed to load commit history: ' + String(err), { title: 'Error' });
+    }
   }
 };
 
 let unlisten: (() => void) | null = null;
 
 onMounted(async () => {
-  abortController.value = new AbortController();
-  
   await settingsStore.fetchSettings();
   
   try {
     const info = await gitService.getCurrentRepoInfo();
     if (info) {
       repoStore.setRepoInfo(info);
+      await refreshRepo();
     }
   } catch (err) {
     console.error("Failed to fetch initial repo info", err);
   }
 
   unlisten = await listen('git-state-changed', () => {
-    refreshRepo();
+    refreshRepo().catch(err => console.error('git-state-changed refresh failed:', err));
   });
 });
 
@@ -182,14 +129,12 @@ onUnmounted(() => {
   if (unlisten) {
     unlisten();
   }
-  clearTimeouts();
-  abortPendingOperations();
 });
 
 // Watchers
-watch([repoStore.repoInfo, uiStore.view], () => {
+watch(() => uiStore.view, () => {
   if (repoStore.repoInfo) {
-    refreshRepo();
+    refreshRepo().catch(err => console.error('View switch refresh failed:', err));
   }
 });
 
@@ -252,6 +197,7 @@ const handleOpenRepo = async (path?: string) => {
       repoStore.setRepoInfo(info);
       repoStore.clearSelection();
       await settingsStore.fetchSettings();
+      await refreshRepo();
     }
     uiStore.clearError();
   } catch (err) {
@@ -297,11 +243,12 @@ const handleCloneRepo = async () => {
     repoStore.setRepoInfo(info);
     repoStore.clearSelection();
     await settingsStore.fetchSettings();
+    await refreshRepo();
     uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handleCloneRepo();
-    trackedSetTimeout(() => refreshRepo(), 500);
+    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
   } finally {
     uiStore.setLoading(false);
   }
@@ -318,7 +265,7 @@ const handlePush = async () => {
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handlePush();
-    trackedSetTimeout(() => refreshRepo(), 500);
+    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
   } finally {
     uiStore.setLoading(false);
   }
@@ -335,7 +282,7 @@ const handlePull = async () => {
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handlePull();
-    trackedSetTimeout(() => refreshRepo(), 500);
+    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
   } finally {
     uiStore.setLoading(false);
   }
@@ -352,7 +299,7 @@ const handleFetch = async () => {
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handleFetch();
-    trackedSetTimeout(() => refreshRepo(), 500);
+    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
   } finally {
     uiStore.setLoading(false);
   }
@@ -544,7 +491,7 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
     <div v-if="uiStore.showCloneModal || uiStore.showSettingsModal || uiStore.showBranchModal || uiStore.showTagsModal || uiStore.showRemotesModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4" style="background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);">
       <CloneModal v-if="uiStore.showCloneModal" @browse="handleBrowseClonePath" @clone="handleCloneRepo" />
       <SettingsModal v-if="uiStore.showSettingsModal" />
-      <BranchModal v-if="uiStore.showBranchModal" @checkout="(name) => gitService.checkoutBranch(name).then(() => { uiStore.closeModal('branch'); repoStore.refreshRepo(); })" @createBranch="() => gitService.createBranch(uiStore.newBranchName).then(() => { uiStore.setNewBranchName(''); uiStore.closeModal('branch'); repoStore.refreshRepo(); })" />
+      <BranchModal v-if="uiStore.showBranchModal" @checkout="(name) => gitService.checkoutBranch(name).then(() => { uiStore.closeModal('branch'); repoStore.refreshRepo(); }).catch(err => { uiStore.setError(String(err)); })" @createBranch="() => gitService.createBranch(uiStore.newBranchName).then(() => { uiStore.setNewBranchName(''); uiStore.closeModal('branch'); repoStore.refreshRepo(); }).catch(err => { uiStore.setError(String(err)); })" />
       <TagsModal v-if="uiStore.showTagsModal" />
       <RemotesModal v-if="uiStore.showRemotesModal" />
     </div>

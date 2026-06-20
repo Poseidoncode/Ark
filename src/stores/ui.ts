@@ -56,6 +56,7 @@ export const useUIStore = defineStore('ui', () => {
   };
 
   const openModal = (modal: 'clone' | 'settings' | 'branch' | 'tags' | 'remotes' | 'recentRepos') => {
+    closeAllModals();
     switch (modal) {
       case 'clone':
         showCloneModal.value = true;

@@ -188,7 +188,11 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
     <div class="px-3 py-2 border-b border-border bg-card/50">
        <input v-model="uiStore.searchCommitQuery" placeholder="Search commits..." class="w-full bg-muted/30 border border-border rounded-lg px-3 py-2 text-xs text-foreground outline-none focus:ring-1 focus:ring-accent" />
     </div>
+    <div v-show="!repoStore.commitsLoading && filteredCommits.length === 0" class="flex-1 flex items-center justify-center text-muted-foreground text-xs italic p-6">
+      No commits found
+    </div>
     <RecycleScroller
+      v-show="filteredCommits.length > 0"
       class="flex-1 overflow-auto p-3"
       :items="filteredCommits"
       :item-size="76"

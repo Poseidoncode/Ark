@@ -29,30 +29,7 @@ const currentProjectName = computed(() => {
   return name;
 });
 
-const getRepoName = (path: string) => {
-  if (!path || path.trim() === "") return "";
-  
-  // 移除尾部的斜線
-  const cleanPath = path.replace(/[/\\]+$/, '');
-  
-  // 如果路徑以 .git 結尾，取父目錄名
-  if (cleanPath.endsWith('.git')) {
-    const withoutGit = cleanPath.slice(0, -4).replace(/[/\\]+$/, '');
-    const parts = withoutGit.split(/[/\\]/);
-    return parts[parts.length - 1] || "";
-  }
-  
-  // 取最後一個路徑段
-  const parts = cleanPath.split(/[/\\]/);
-  const lastPart = parts[parts.length - 1];
-  
-  // 如果最後一部分看起來不像是目錄名（太短或只是一個點），返回倒數第二個
-  if (!lastPart || lastPart === '.' || lastPart === '..') {
-    return parts[parts.length - 2] || path;
-  }
-  
-  return lastPart || path;
-};
+import { getRepoName } from '../utils/path';
 
 const emit = defineEmits<{
   (e: 'openRepo', path?: string): void;
@@ -146,7 +123,7 @@ const handleClickOutside = (event: MouseEvent) => {
           <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
           <path d="M18 9a9 9 0 0 1-9 9"/>
         </svg>
-        <span class="font-medium text-[13px]" style="color: var(--foreground);">{{ repoStore.getCurrentBranch() }}</span>
+        <span class="font-medium text-[13px]" style="color: var(--foreground);">{{ repoStore.currentBranch }}</span>
       </div>
     </div>
 

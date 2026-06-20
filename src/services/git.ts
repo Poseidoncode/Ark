@@ -1,25 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
- * Cache entry with expiration
- */
-interface CacheEntry<T> {
-  data: T;
-  expiresAt: number;
-}
-
-/**
- * Debounced function entry
- */
-interface DebouncedEntry {
-  id: ReturnType<typeof setTimeout>;
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-}
-
-/**
- * High-performance Git service with caching and debouncing
- * Reduces unnecessary Rust backend calls for better performance
+ * High-performance Git service with caching
  */
 export interface RepositoryInfo {
   path: string;
@@ -101,102 +83,36 @@ export interface RemoteInfo {
   fetch_url: string | null;
 }
 
-class GitServiceOptimizer {
-  private cache = new Map<string, CacheEntry<unknown>>();
-  private debounceTimers = new Map<string, DebouncedEntry>();
-  private readonly DEFAULT_TTL = 5000; // 5 seconds
-  private readonly SHORT_TTL = 1000; // 1 second for frequently changing data
-  private readonly LONG_TTL = 30000; // 30 seconds for static data
-  private readonly MAX_CACHE_SIZE = 50; // Memory optimization
+/**
+ * Simple cache for local git operations
+ */
+type CacheValue<T> = { data: T; until: number };
 
-  /**
-   * Memory cleanup: Evict old cache entries when limit is reached
-   */
-  private evictOldCache() {
-    if (this.cache.size > this.MAX_CACHE_SIZE) {
-      const entries = Array.from(this.cache.entries());
-      entries.sort((a, b) => a[1].expiresAt - b[1].expiresAt);
-      // Remove oldest 25%
-      const toRemove = Math.floor(this.MAX_CACHE_SIZE * 0.25);
-      for (let i = 0; i < toRemove; i++) {
-        this.cache.delete(entries[i][0]);
-      }
-    }
-  }
+class GitService {
+  private cache = new Map<string, CacheValue<unknown>>();
+  private static TTL = 1500; // 1.5s — local git is fast
 
-  /**
-   * Get cached data or fetch from backend
-   */
-  private async getCachedOrFetch<T>(
-    key: string,
-    fetchFn: () => Promise<T>,
-    ttl: number = this.DEFAULT_TTL
-  ): Promise<T> {
+  private async cached<T>(key: string, fetch: () => Promise<T>): Promise<T> {
     const now = Date.now();
-    const cached = this.cache.get(key) as CacheEntry<T> | undefined;
-
-    if (cached && cached.expiresAt > now) {
-      return cached.data;
-    }
-
+    const entry = this.cache.get(key) as CacheValue<T> | undefined;
+    if (entry && entry.until > now) return entry.data;
     try {
-      const data = await fetchFn();
-      this.cache.set(key, { data, expiresAt: now + ttl });
-      this.evictOldCache(); // Memory optimization
+      const data = await fetch();
+      this.cache.set(key, { data, until: now + GitService.TTL });
       return data;
     } catch (error) {
-      // On error, try to return stale cache if available
-      const cached = this.cache.get(key) as CacheEntry<T> | undefined;
-      if (cached) {
-        console.warn(`Cache fallback for ${key}:`, error);
-        return cached.data;
+      if (entry) {
+        console.warn('Cache fallback for ' + key + ':', error);
+        return entry.data;
       }
       throw error;
     }
   }
 
-  /**
-   * Debounce rapid calls for the same key
-   */
-  private debounce<T>(
-    key: string,
-    fn: () => Promise<T>,
-    delay: number = 300
-  ): Promise<T> {
-    const existing = this.debounceTimers.get(key);
-
-    if (existing) {
-      clearTimeout(existing.id);
-    }
-
-    return new Promise((resolve, reject) => {
-      const id = setTimeout(async () => {
-        this.debounceTimers.delete(key);
-        try {
-          const result = await fn();
-          resolve(result);
-        } catch (error) {
-          reject(error as Error);
-        }
-      }, delay);
-
-      this.debounceTimers.set(key, { id, resolve: resolve as (value: unknown) => void, reject });
-    });
-  }
-
-  /**
-   * Invalidate cache for specific keys
-   */
-  invalidate(keyPattern?: string): void {
-    if (!keyPattern) {
-      this.cache.clear();
-      return;
-    }
-
+  invalidate(prefix?: string): void {
+    if (!prefix) { this.cache.clear(); return; }
     for (const key of this.cache.keys()) {
-      if (key.includes(keyPattern)) {
-        this.cache.delete(key);
-      }
+      if (key.startsWith(prefix)) this.cache.delete(key);
     }
   }
 
@@ -212,28 +128,15 @@ class GitServiceOptimizer {
    * Open repository with caching
    */
   async openRepository(path: string): Promise<RepositoryInfo> {
-    const cacheKey = `repo:info:${path}`;
-    return await this.getCachedOrFetch(
-      cacheKey,
-      async () => {
-        this.invalidate('repo:');
-        return await invoke("open_repository", { path });
-      },
-      this.SHORT_TTL
-    );
+    this.invalidate('repo:');
+    return await invoke("open_repository", { path });
   }
 
   /**
-   * Get repository status with debouncing
+   * Get repository status
    */
   async getStatus(): Promise<FileStatus[]> {
-    const cacheKey = 'repo:status';
-    const result = await this.debounce(
-      cacheKey,
-      () => this.getCachedOrFetch(cacheKey, () => invoke("get_repository_status"), this.SHORT_TTL),
-      150
-    );
-    return result as FileStatus[];
+    return await this.cached('repo:status', () => invoke("get_repository_status"));
   }
 
   /**
@@ -273,6 +176,7 @@ class GitServiceOptimizer {
    */
   async stageFiles(files: string[]): Promise<StageResult> {
     this.invalidate('repo:status');
+    this.invalidate('diff:');
     return await invoke("stage_files", { files });
   }
 
@@ -281,6 +185,7 @@ class GitServiceOptimizer {
    */
   async unstageFiles(files: string[]): Promise<void> {
     this.invalidate('repo:status');
+    this.invalidate('diff:');
     return await invoke("unstage_files", { files });
   }
 
@@ -289,6 +194,7 @@ class GitServiceOptimizer {
    */
   async discardChanges(filePath: string): Promise<void> {
     this.invalidate('repo:');
+    this.invalidate('diff:');
     return await invoke("discard_changes", { filePath });
   }
 
@@ -297,6 +203,7 @@ class GitServiceOptimizer {
    */
   async discardAllChanges(): Promise<void> {
     this.invalidate('repo:');
+    this.invalidate('diff:');
     return await invoke("discard_all_changes");
   }
 
@@ -304,12 +211,7 @@ class GitServiceOptimizer {
    * Get branches with caching
    */
   async getBranches(): Promise<BranchInfo[]> {
-    const cacheKey = 'repo:branches';
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("get_branches"),
-      this.DEFAULT_TTL
-    );
+    return await this.cached('repo:branches', () => invoke("get_branches"));
   }
 
   /**
@@ -332,24 +234,14 @@ class GitServiceOptimizer {
    * Get commit diff
    */
   async getCommitDiff(sha: string): Promise<DiffInfo[]> {
-    const cacheKey = `commit:diff:${sha.substring(0, 7)}`;
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("get_commit_diff", { sha }),
-      this.LONG_TTL
-    );
+    return await this.cached(`commit:diff:${sha.substring(0, 7)}`, () => invoke("get_commit_diff", { sha }));
   }
 
   /**
    * Get commit history
    */
-  async getHistory(limit: number = 50): Promise<CommitInfo[]> {
-    const cacheKey = `repo:history:${limit}`;
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("get_commit_history", { limit }),
-      this.SHORT_TTL
-    );
+  async getHistory(limit: number = 200): Promise<CommitInfo[]> {
+    return await this.cached(`repo:history:${limit}`, () => invoke("get_commit_history", { limit }));
   }
 
   /**
@@ -357,12 +249,7 @@ class GitServiceOptimizer {
    */
   async getDiff(filePath?: string): Promise<DiffInfo[]> {
     const cacheKey = filePath ? `diff:${filePath}` : 'diff:all';
-    const result = await this.debounce(
-      cacheKey,
-      () => invoke("get_diff", { filePath }),
-      200
-    );
-    return result as DiffInfo[];
+    return await this.cached(cacheKey, () => invoke("get_diff", { filePath }));
   }
 
   /**
@@ -385,7 +272,7 @@ class GitServiceOptimizer {
    * Fetch changes
    */
   async fetch(): Promise<void> {
-    this.invalidate('repo:ahead');
+    this.invalidate('repo:');
     return await invoke("fetch_changes");
   }
 
@@ -394,6 +281,7 @@ class GitServiceOptimizer {
    */
   async stashSave(message?: string): Promise<void> {
     this.invalidate('repo:stash');
+    this.invalidate('repo:status');
     return await invoke("stash_save", { options: { message } });
   }
 
@@ -409,24 +297,14 @@ class GitServiceOptimizer {
    * List stashes
    */
   async listStashes(): Promise<StashInfo[]> {
-    const cacheKey = 'repo:stashes';
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("list_stashes"),
-      this.DEFAULT_TTL
-    );
+    return await this.cached('repo:stashes', () => invoke("list_stashes"));
   }
 
   /**
    * Get conflicts
    */
   async getConflicts(): Promise<ConflictInfo[]> {
-    const cacheKey = 'repo:conflicts';
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("get_conflicts"),
-      this.SHORT_TTL
-    );
+    return await this.cached('repo:conflicts', () => invoke("get_conflicts"));
   }
 
   /**
@@ -435,6 +313,7 @@ class GitServiceOptimizer {
   async resolveConflict(path: string, useOurs: boolean): Promise<void> {
     this.invalidate('repo:conflicts');
     this.invalidate('repo:status');
+    this.invalidate('diff:');
     return await invoke("resolve_conflict", { path, useOurs });
   }
 
@@ -442,12 +321,7 @@ class GitServiceOptimizer {
    * Get settings
    */
   async getSettings(): Promise<SettingsPayload> {
-    const cacheKey = 'settings';
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("get_settings"),
-      this.LONG_TTL
-    );
+    return await this.cached('settings', () => invoke("get_settings"));
   }
 
   /**
@@ -558,12 +432,7 @@ class GitServiceOptimizer {
    * List all tags
    */
   async listTags(): Promise<TagInfo[]> {
-    const cacheKey = 'repo:tags';
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("list_tags"),
-      this.LONG_TTL
-    );
+    return await this.cached('repo:tags', () => invoke("list_tags"));
   }
 
   /**
@@ -578,12 +447,7 @@ class GitServiceOptimizer {
    * List all remotes
    */
   async listRemotes(): Promise<RemoteInfo[]> {
-    const cacheKey = 'repo:remotes';
-    return await this.getCachedOrFetch(
-      cacheKey,
-      () => invoke("list_remotes"),
-      this.LONG_TTL
-    );
+    return await this.cached('repo:remotes', () => invoke("list_remotes"));
   }
 
   /**
@@ -604,4 +468,4 @@ class GitServiceOptimizer {
 }
 
 // Export singleton instance
-export const gitService = new GitServiceOptimizer();
+export const gitService = new GitService();
