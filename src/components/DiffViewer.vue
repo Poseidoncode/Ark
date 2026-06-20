@@ -47,14 +47,21 @@ const parsedDiffs = computed(() => {
   }));
 });
 
-// Generate a consistent hue from path string
-const pathToHue = (path: string) => {
-  let hash = 0;
-  for (let i = 0; i < path.length; i++) {
-    hash = ((hash << 5) - hash) + path.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash) % 360;
+const extColors: Record<string, string> = {
+  ts: 'hsl(210, 80%, 55%)', tsx: 'hsl(210, 80%, 55%)',
+  js: 'hsl(50, 80%, 45%)', jsx: 'hsl(50, 80%, 45%)',
+  vue: 'hsl(140, 70%, 50%)',
+  css: 'hsl(270, 60%, 55%)', rs: 'hsl(20, 80%, 55%)',
+  json: 'hsl(0, 0%, 50%)', yml: 'hsl(0, 0%, 50%)',
+  md: 'hsl(200, 60%, 55%)',
+};
+const getExtColor = (ext: string) => extColors[ext] || 'hsl(0, 0%, 50%)';
+
+const getExtFileStyle = (path: string) => {
+  const color = getExtColor(getFileExt(path));
+  const bg = color.replace(/(\d+)%/, '15%');
+  const border = color.replace(/(\d+)%/, '25%');
+  return { background: bg, color, border: `1px solid ${border}` };
 };
 
 const getFileExt = (path: string) => {
@@ -92,11 +99,7 @@ const getChangeType = (diff: { additions: number; deletions: number }) => {
         <div class="flex items-center gap-3 min-w-0">
           <!-- File type avatar -->
           <div class="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center text-[9px] font-bold uppercase"
-               :style="{
-                 background: `hsl(${pathToHue(diff.path)}, 60%, 15%)`,
-                 color: `hsl(${pathToHue(diff.path)}, 60%, 65%)`,
-                 border: `1px solid hsl(${pathToHue(diff.path)}, 50%, 25%)`
-               }">
+               :style="getExtFileStyle(diff.path)">
             {{ getFileExt(diff.path) || 'f' }}
           </div>
 
