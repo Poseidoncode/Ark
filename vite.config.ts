@@ -29,7 +29,7 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
-    target: process.env.TAURI_PLATFORM == "windows" ? "chrome105" : "safari13",
+    target: process.env.TAURI_PLATFORM == "windows" ? "chrome105" : "safari16",
     // Minify for production
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
     // Sourcemaps for debug builds
@@ -47,11 +47,11 @@ export default defineConfig({
     // Manual chunks for better code splitting
     rollupOptions: {
       output: {
-        manualChunks: {
-          "vue-vendor": ["vue"],
-          "virtual-scroller": ["vue-virtual-scroller"],
-          "tauri-api": ["@tauri-apps/api"],
-          "tauri-plugins": ["@tauri-apps/plugin-dialog", "@tauri-apps/plugin-opener"],
+        manualChunks(id) {
+          if (id.includes('node_modules/vue/')) return 'vue-vendor';
+          if (id.includes('vue-virtual-scroller')) return 'virtual-scroller';
+          if (id.includes('@tauri-apps/api')) return 'tauri-api';
+          if (id.includes('@tauri-apps/plugin-')) return 'tauri-plugins';
         },
       },
     },

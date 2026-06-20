@@ -130,7 +130,7 @@ describe('Toast', () => {
 
     it('should remove toast when dismiss button is clicked', async () => {
       const wrapper = createWrapper();
-      const { success, dismiss, toasts } = useToast();
+      const { success, toasts } = useToast();  // ponytail: dismiss unused
       
       success('Test message');
       await wrapper.vm.$nextTick();

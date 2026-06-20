@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';  // ponytail: afterEach unused
 
 // Test the GitServiceOptimizer class directly
 
@@ -10,8 +10,7 @@ interface CacheEntry<T> {
 class GitServiceOptimizer {
   private cache = new Map<string, CacheEntry<unknown>>();
   private readonly DEFAULT_TTL = 5000;
-  private readonly SHORT_TTL = 1000;
-  private readonly LONG_TTL = 30000;
+  // ponytail: removed unused SHORT_TTL, LONG_TTL
   private readonly MAX_CACHE_SIZE = 50;
 
   private evictOldCache() {

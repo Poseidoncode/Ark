@@ -25,7 +25,7 @@ describe('HeaderBar', () => {
   });
 
   afterEach(() => {
-    setActivePinia(null);
+    setActivePinia(undefined);
   });
 
   const createWrapper = (props = {}) => {
@@ -115,7 +115,8 @@ describe('HeaderBar', () => {
       
       // Branch section should not be visible - check for branch icon
       // The branch section has a specific SVG with branch icon
-      const branchIcon = wrapper.findAll('svg').filter(svg => 
+      // ponytail: unused variable
+      wrapper.findAll('svg').filter(svg => 
         svg.html()?.includes('line x1="6"')
       );
       // When no repo, branch section should not exist
