@@ -4,11 +4,11 @@
 
 use git2::{Cred, FetchOptions, PushOptions, RemoteCallbacks, Repository};
 use std::path::Path;
-use std::sync::Arc;
 
 /// Build git2 credentials from SSH key path and optional passphrase.
 /// 
 /// Returns None if no SSH key is provided, or the credentials if successfully created.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_ssh_credentials(
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
@@ -58,38 +58,47 @@ pub fn create_remote_callbacks(
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
 ) -> Result<RemoteCallbacks<'static>, String> {
-    let credentials = build_ssh_credentials(ssh_key_path, ssh_passphrase)?;
+    // Clone into owned strings so the closure can capture them
+    let key_path: Option<String> = ssh_key_path.map(|s| s.to_string());
+    let passphrase: Option<String> = ssh_passphrase.map(|s| s.to_string());
     
     let mut callbacks = RemoteCallbacks::new();
     
-    if let Some(cred) = credentials {
-        // Store credentials in an Arc so we can move it into the closure
-        let _cred = Arc::new(cred);
-        
-        callbacks.credentials(move |_url, _username_from_url, allowed_types| {
-            // Return credentials if SSH authentication is allowed
-            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-                // We need to create a new credential each time since Cred is not Clone
-                // For simplicity, we'll return an error if we can't create new credentials
-                // In a real implementation, you might want to handle this differently
-                return Err(git2::Error::from_str("SSH credentials not available in callback"));
-            }
-            // Return error if we can't provide the required credentials
-            Err(git2::Error::from_str("No credentials available"))
-        });
-    }
-    
-    // Also support username/password authentication
     callbacks.credentials(move |_url, username_from_url, allowed_types| {
+        if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+            let Some(ref key_path) = key_path else {
+                return Err(git2::Error::from_str("No SSH key path configured"));
+            };
+            let kp = if key_path.trim().is_empty() {
+                return Err(git2::Error::from_str("SSH key path is empty"));
+            } else {
+                key_path.as_str()
+            };
+            let expanded = if kp.starts_with("~/") {
+                match std::env::var("HOME") {
+                    Ok(home) => kp.replacen("~", &home, 1),
+                    Err(_) => return Err(git2::Error::from_str("Could not find HOME directory")),
+                }
+            } else {
+                kp.to_string()
+            };
+            let username = username_from_url.unwrap_or("git");
+            return Cred::ssh_key(
+                username,
+                None,
+                std::path::Path::new(&expanded),
+                passphrase.as_deref(),
+            )
+            .map_err(|e| git2::Error::from_str(&format!("SSH credential error: {}", e)));
+        }
+        
         if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            // For HTTPS URLs, try to get username from URL or use a default
             if let Some(username) = username_from_url {
-                // Return a credential with empty password - user will be prompted
                 return Cred::username(username)
                     .map_err(|e| git2::Error::from_str(&format!("Failed to create username credential: {}", e)));
             }
         }
-        // Return error if we can't provide the required credentials
+        
         Err(git2::Error::from_str("No credentials available"))
     });
     
