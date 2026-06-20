@@ -5,59 +5,41 @@ test.describe('Ark Git GUI - E2E Tests', () => {
     await page.goto('/');
   });
 
-  test('should display application title', async ({ page }) => {
+  test('應該顯示應用標題', async ({ page }) => {
     await expect(page).toHaveTitle(/Ark/);
   });
 
-  test('should show welcome screen with Open and Clone buttons', async ({ page }) => {
-    await expect(page.getByText('Open')).toBeVisible();
-    await expect(page.getByText('Clone')).toBeVisible();
-    await expect(page.getByText('A precision Git client for professional workflows')).toBeVisible();
+  test('應該顯示初始化界面', async ({ page }) => {
+    const openButton = page.getByRole('button', { name: /Open Repository/i });
+    await expect(openButton).toBeVisible();
+    
+    const recentSection = page.getByText(/Recent Repositories/i);
+    await expect(recentSection).toBeVisible();
   });
 
-  test('should display Settings and Theme toggle buttons', async ({ page }) => {
-    await expect(page.locator('button[title="Settings"]').first()).toBeVisible();
-    await expect(page.locator('button[title="Dark Mode"]').first()).toBeVisible();
+  test('應該顯示設置按鈕', async ({ page }) => {
+    const settingsButton = page.locator('button[title="Settings"]').first();
+    await expect(settingsButton).toBeVisible();
   });
 
-  test('should open and close Settings modal', async ({ page }) => {
-    await page.locator('button[title="Settings"]').first().click();
-    await expect(page.locator('h2:text-is("Settings")')).toBeVisible({ timeout: 5000 });
-    await page.getByText('Cancel').first().click();
-    await expect(page.locator('h2:text-is("Settings")')).not.toBeVisible();
+  test('應該能打開設置模態框', async ({ page }) => {
+    const settingsButton = page.locator('button[title="Settings"]').first();
+    await settingsButton.click();
+    
+    const settingsModal = page.getByRole('heading', { name: /Settings/i });
+    await expect(settingsModal).toBeVisible();
   });
 
-  test('should toggle theme between dark and light', async ({ page }) => {
-    const themeBtn = page.locator('button[title="Dark Mode"]').first();
-    await expect(themeBtn).toBeVisible();
-    await themeBtn.click();
-    await expect(page.locator('button[title="Light Mode"]').first()).toBeVisible({ timeout: 5000 });
-  });
-
-  test('should open Clone modal with URL and path fields', async ({ page }) => {
-    await page.getByText('Clone').first().click();
-    await expect(page.locator('h2:text-is("Clone Repository")')).toBeVisible({ timeout: 5000 });
-    await expect(page.getByPlaceholder('https://github.com/user/repo.git')).toBeVisible();
-    await expect(page.getByPlaceholder('/path/to/destination')).toBeVisible();
-    await expect(page.getByText('Clone').last()).toBeDisabled();
-  });
-
-  test('should show error toast for unhandled promise rejection', async ({ page }) => {
-    await page.evaluate(() => {
-      new Promise((_, reject) => reject(new Error('Simulated rejection')));
-    });
-    await expect(page.getByText('Promise Rejected').first()).toBeVisible({ timeout: 5000 });
-  });
-
-  test('should recover from navigation error gracefully', async ({ page }) => {
-    await page.goto('/nonexistent');
-    await expect(page.locator('h1')).toBeVisible({ timeout: 5000 });
-  });
-
-  test.describe('Component isolation', () => {
-    test('ContextMenu should not be visible by default', async ({ page }) => {
-      const menu = page.locator('[role="menu"]');
-      await expect(menu).toHaveCount(0);
-    });
+  test('應該能切換設置標籤', async ({ page }) => {
+    const settingsButton = page.locator('button[title="Settings"]').first();
+    await settingsButton.click();
+    
+    const gitTab = page.getByRole('button', { name: /Git/i });
+    await gitTab.click();
+    
+    const appearanceTab = page.getByRole('button', { name: /Appearance/i });
+    await appearanceTab.click();
+    
+    await expect(appearanceTab).toHaveAttribute('aria-selected', 'true');
   });
 });

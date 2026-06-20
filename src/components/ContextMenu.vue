@@ -21,9 +21,11 @@ const emit = defineEmits<{
 
 const menuRef = ref<HTMLElement | null>(null)
 const menuStyles = ref({ top: '0px', left: '0px' })
+const focusedIndex = ref(-1)
 
 const calculatePosition = async () => {
   if (!props.visible) return
+  
   await nextTick()
   if (!menuRef.value) return
 
@@ -34,16 +36,31 @@ const calculatePosition = async () => {
   let newX = props.position.x
   let newY = props.position.y
 
-  if (newX + menuRect.width > windowWidth) newX = windowWidth - menuRect.width - 8
-  if (newY + menuRect.height > windowHeight) newY = windowHeight - menuRect.height - 8
+  // Prevent overflow on right
+  if (newX + menuRect.width > windowWidth) {
+    newX = windowWidth - menuRect.width - 8
+  }
+  
+  // Prevent overflow on bottom
+  if (newY + menuRect.height > windowHeight) {
+    newY = windowHeight - menuRect.height - 8
+  }
+
+  // Prevent overflow on left/top (fallback)
   if (newX < 8) newX = 8
   if (newY < 8) newY = 8
 
-  menuStyles.value = { top: `${newY}px`, left: `${newX}px` }
+  menuStyles.value = {
+    top: `${newY}px`,
+    left: `${newX}px`
+  }
 }
 
 watch([() => props.position.x, () => props.position.y, () => props.visible], () => {
-  if (props.visible) calculatePosition()
+  if (props.visible) {
+    focusedIndex.value = -1
+    calculatePosition()
+  }
 })
 
 const handleClickOutside = (e: MouseEvent) => {
@@ -52,16 +69,60 @@ const handleClickOutside = (e: MouseEvent) => {
   }
 }
 
+const handleKeyDown = (e: KeyboardEvent) => {
+  if (!props.visible) return
+
+  const items = props.items
+  const selectableItems = items.map((item, index) => ({ item, index })).filter(x => !x.item.divider)
+  
+  if (selectableItems.length === 0) return
+
+  const currentIndex = selectableItems.findIndex(x => x.index === focusedIndex.value)
+
+  switch (e.key) {
+    case 'Escape':
+      emit('close')
+      break
+    case 'ArrowDown':
+      e.preventDefault()
+      if (currentIndex < selectableItems.length - 1) {
+        focusedIndex.value = selectableItems[currentIndex + 1].index
+      } else {
+        focusedIndex.value = selectableItems[0].index
+      }
+      break
+    case 'ArrowUp':
+      e.preventDefault()
+      if (currentIndex > 0) {
+        focusedIndex.value = selectableItems[currentIndex - 1].index
+      } else {
+        focusedIndex.value = selectableItems[selectableItems.length - 1].index
+      }
+      break
+    case 'Enter':
+      e.preventDefault()
+      if (focusedIndex.value !== -1 && !items[focusedIndex.value].divider) {
+        executeAction(items[focusedIndex.value])
+      }
+      break
+  }
+}
+
 const executeAction = (item: MenuItem) => {
-  if (item.action) item.action()
+  if (item.action) {
+    item.action()
+  }
   emit('close')
 }
 
 onMounted(() => {
   document.addEventListener('mousedown', handleClickOutside)
+  document.addEventListener('keydown', handleKeyDown)
 })
+
 onUnmounted(() => {
   document.removeEventListener('mousedown', handleClickOutside)
+  document.removeEventListener('keydown', handleKeyDown)
 })
 </script>
 
@@ -76,19 +137,26 @@ onUnmounted(() => {
       tabindex="-1"
     >
       <template v-for="(item, index) in items" :key="index">
+        <!-- Divider -->
         <div
           v-if="item.divider"
           class="h-px my-1.5 mx-3"
           style="background: var(--border);"
           role="separator"
         ></div>
+        
+        <!-- Menu Item -->
         <button
           v-else
           class="text-left flex items-center gap-2.5 text-[13px] outline-none rounded-lg transition-safe font-medium"
           style="width: calc(100% - 12px); margin: 1px 6px; padding: 6px 10px;"
-          :class="item.danger ? 'hover:bg-red-500/10 focus:bg-red-500/10' : 'hover:bg-muted focus:bg-muted'"
+          :class="[
+            item.danger ? 'hover:bg-red-500/10 focus:bg-red-500/10' : 'hover:bg-muted focus:bg-muted',
+            focusedIndex === index ? (item.danger ? 'bg-red-500/10' : 'bg-muted') : ''
+          ]"
           :style="{ color: item.danger ? 'var(--error)' : 'var(--foreground)' }"
           @click="executeAction(item)"
+          @mouseenter="focusedIndex = index"
           role="menuitem"
         >
           <span v-if="item.icon" class="w-4 h-4 flex items-center justify-center opacity-50 flex-shrink-0">

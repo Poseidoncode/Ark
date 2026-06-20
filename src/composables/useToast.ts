@@ -101,3 +101,12 @@ export function useToast() {
   };
 }
 
+// Cleanup on module unload (rare, but good practice)
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    for (const timeoutId of timeoutIds.value.values()) {
+      clearTimeout(timeoutId);
+    }
+    timeoutIds.value.clear();
+  });
+}
