@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
+import { ref, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
 import { gitService, type RepositoryInfo, type FileStatus, type CommitInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
