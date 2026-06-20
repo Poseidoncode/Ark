@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
+import { onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
 import { gitService, type RepositoryInfo, type FileStatus, type CommitInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
@@ -77,8 +77,6 @@ const timeoutIds = ref<ReturnType<typeof setTimeout>[]>([]);
 
 const toast = useToast();
 const { showContextMenu, hideContextMenu, isVisible, position, menuItems } = useContextMenu();
-
-const dropdownRef = ref<HTMLElement | null>(null);
 
 // Helper functions
 const getRepoName = (path: string) => {
@@ -162,7 +160,6 @@ const refreshRepo = async () => {
 let unlisten: (() => void) | null = null;
 
 onMounted(async () => {
-  window.addEventListener('click', handleClickOutside);
   abortController.value = new AbortController();
   
   await settingsStore.fetchSettings();
@@ -185,7 +182,6 @@ onUnmounted(() => {
   if (unlisten) {
     unlisten();
   }
-  window.removeEventListener('click', handleClickOutside);
   clearTimeouts();
   abortPendingOperations();
 });
@@ -378,11 +374,7 @@ const handleStashSave = async () => {
   }
 };
 
-const handleClickOutside = (event: MouseEvent) => {
-  if (uiStore.showRecentRepos && dropdownRef.value && !dropdownRef.value.contains(event.target as Node)) {
-    uiStore.closeModal('recentRepos');
-  }
-};
+
 
 const loadTags = async () => {
   try {
@@ -538,7 +530,6 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
   <div class="app flex flex-col h-screen bg-background text-foreground overflow-hidden font-sans">
     <!-- Header -->
     <HeaderBar 
-      ref="dropdownRef"
       @openRepo="handleOpenRepo"
       @triggerCloneModal="triggerCloneModal"
       @handleFetch="handleFetch"

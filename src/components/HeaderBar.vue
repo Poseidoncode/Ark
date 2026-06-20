@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useRepoStore } from '../stores/repo';
 import { useUIStore } from '../stores/ui';
 import { useSettingsStore } from '../stores/settings';
@@ -71,17 +71,19 @@ const handleOpenRepo = (path?: string) => {
   emit('openRepo', path);
 };
 
+onMounted(() => {
+  window.addEventListener('click', handleClickOutside);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('click', handleClickOutside);
+});
+
 const handleClickOutside = (event: MouseEvent) => {
   if (uiStore.showRecentRepos && dropdownRef.value && !dropdownRef.value.contains(event.target as Node)) {
     uiStore.closeModal('recentRepos');
   }
 };
-
-// Expose for parent to call
-defineExpose({
-  handleClickOutside,
-  dropdownRef
-});
 </script>
 
 <template>
