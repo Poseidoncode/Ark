@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 REPO="Poseidoncode/Ark"
 BRANCH="main"
@@ -35,7 +35,7 @@ npm install --silent
 cd src-tauri && cargo fetch && cd ..
 
 echo "Building $APP (this may take a while)..."
-npx tauri build --ci 2>&1 | tail -5
+npx tauri build --ci
 
 # ── Locate artifact ───────────────────────────────────────────
 case "$OS" in
