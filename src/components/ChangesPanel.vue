@@ -75,6 +75,7 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
           await navigator.clipboard.writeText(file.path);
           toast.success('Path copied', { title: 'Copied' });
         } catch (err) {
+          toast.error('Failed to copy path', { title: 'Clipboard Error' });
           console.error('Clipboard error:', err);
         }
       }
@@ -187,7 +188,7 @@ const onFileHeaderContextMenu = (event: MouseEvent) => {
         <span class="truncate text-[13px]" :title="file.path">{{ file.path.split('/').pop() }}</span>
         <span class="text-[10px] font-mono truncate flex-shrink-0" style="color:var(--muted-foreground); max-width:60px;">{{ file.path.includes('/') ? file.path.substring(0, file.path.lastIndexOf('/')) : '' }}</span>
       </div>
-      <button @click.stop="handleDiscardChanges(file.path)" class="opacity-0 group-hover:opacity-100 w-5 h-5 flex items-center justify-center rounded transition-safe flex-shrink-0 text-[10px]" style="color:var(--error);" onmouseover="this.style.background='var(--error-bg)'" onmouseout="this.style.background=''">✕</button>
+      <button @click.stop="handleDiscardChanges(file.path)" class="opacity-0 group-hover:opacity-100 w-5 h-5 flex items-center justify-center rounded transition-safe flex-shrink-0 text-[10px] hover:bg-[var(--error-bg)]" style="color:var(--error);">✕</button>
     </div>
   </div>
 </template>

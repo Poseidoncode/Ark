@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
-import { gitService, type RepositoryInfo, type FileStatus, type CommitInfo, type StageResult } from './services/git';
+import { ref, reactive, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
+import { gitService, type CommitInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
 import Toast from './components/Toast.vue';
@@ -29,13 +29,19 @@ import TagsModal from './components/TagsModal.vue';
 import RemotesModal from './components/RemotesModal.vue';
 import ErrorBanner from './components/ErrorBanner.vue';
 import LoadingOverlay from './components/LoadingOverlay.vue';
+import InputModal from './components/InputModal.vue';
+
+// Helper functions
+import { getRepoName } from './utils/path';
+import { useOperationMutex } from './composables/useOperationMutex';
 
 // Initialize stores
 const repoStore = useRepoStore();
 const uiStore = useUIStore();
 const settingsStore = useSettingsStore();
+const { withLock } = useOperationMutex();
 
-onErrorCaptured((err, instance, info) => {
+onErrorCaptured((err, _instance, info) => {
   console.error('Error captured in component:', err, info);
   toast.error(err instanceof Error ? err.message : String(err), { title: 'Component Error' });
   return false;
@@ -44,12 +50,69 @@ onErrorCaptured((err, instance, info) => {
 const toast = useToast();
 const { showContextMenu, hideContextMenu, isVisible, position, menuItems } = useContextMenu();
 
-// Helper functions
-import { getRepoName } from './utils/path';
+// ── InputModal state ──
+interface InputModalState {
+  visible: boolean;
+  title: string;
+  label: string;
+  placeholder: string;
+  inputType: 'text' | 'textarea';
+  required: boolean;
+  secondLabel: string;
+  secondPlaceholder: string;
+  secondDefault: string;
+  confirmHandler: ((value: string, secondValue?: string) => void) | null;
+}
 
+const inputModal = reactive<InputModalState>({
+  visible: false,
+  title: '',
+  label: '',
+  placeholder: '',
+  inputType: 'text',
+  required: false,
+  secondLabel: '',
+  secondPlaceholder: '',
+  secondDefault: '',
+  confirmHandler: null,
+});
+
+const openInputModal = (opts: {
+  title: string;
+  label?: string;
+  placeholder?: string;
+  inputType?: 'text' | 'textarea';
+  required?: boolean;
+  secondLabel?: string;
+  secondPlaceholder?: string;
+  secondDefault?: string;
+  onConfirm: (value: string, secondValue?: string) => void;
+}) => {
+  inputModal.title = opts.title;
+  inputModal.label = opts.label || '';
+  inputModal.placeholder = opts.placeholder || '';
+  inputModal.inputType = opts.inputType || 'text';
+  inputModal.required = opts.required ?? false;
+  inputModal.secondLabel = opts.secondLabel || '';
+  inputModal.secondPlaceholder = opts.secondPlaceholder || '';
+  inputModal.secondDefault = opts.secondDefault || '';
+  inputModal.confirmHandler = opts.onConfirm;
+  inputModal.visible = true;
+};
+
+const handleInputModalConfirm = (value: string, secondValue?: string) => {
+  inputModal.visible = false;
+  inputModal.confirmHandler?.(value, secondValue);
+};
+
+const handleInputModalCancel = () => {
+  inputModal.visible = false;
+  inputModal.confirmHandler = null;
+};
+
+// ── Git operations ──
 const toggleAllStaged = async () => {
   if (repoStore.fileStatuses.length === 0) return;
-  
   try {
     const paths = repoStore.fileStatuses.map(f => f.path);
     if (repoStore.allStaged) {
@@ -88,13 +151,9 @@ const handleDiscardAllChanges = async () => {
 
 const refreshRepo = async () => {
   await repoStore.refreshRepo();
-  
-  // Check for conflicts and switch view if needed
   if (repoStore.conflicts.length > 0 && uiStore.view !== "conflicts") {
     uiStore.setView("conflicts");
   }
-  
-  // Load commits when switching to history view
   if (uiStore.view === "history") {
     try {
       await repoStore.refreshCommits();
@@ -109,7 +168,6 @@ let unlisten: (() => void) | null = null;
 
 onMounted(async () => {
   await settingsStore.fetchSettings();
-  
   try {
     const info = await gitService.getCurrentRepoInfo();
     if (info) {
@@ -119,19 +177,16 @@ onMounted(async () => {
   } catch (err) {
     console.error("Failed to fetch initial repo info", err);
   }
-
   unlisten = await listen('git-state-changed', () => {
     refreshRepo().catch(err => console.error('git-state-changed refresh failed:', err));
   });
 });
 
 onUnmounted(() => {
-  if (unlisten) {
-    unlisten();
-  }
+  if (unlisten) unlisten();
 });
 
-// Watchers
+// ── Watchers ──
 watch(() => uiStore.view, () => {
   if (repoStore.repoInfo) {
     refreshRepo().catch(err => console.error('View switch refresh failed:', err));
@@ -163,7 +218,7 @@ watch(() => repoStore.selectedCommit, async (newCommit) => {
   }
 });
 
-watch(uiStore.showRecentRepos, async (isOpen) => {
+watch(() => uiStore.showRecentRepos, async (isOpen) => {
   if (isOpen && settingsStore.settings?.recent_repositories.length) {
     try {
       const infos = await gitService.getRepositoriesInfo(settingsStore.settings?.recent_repositories || []);
@@ -174,24 +229,16 @@ watch(uiStore.showRecentRepos, async (isOpen) => {
   }
 });
 
-// Event handlers
+// ── Repo actions ──
 const handleOpenRepo = async (path?: string) => {
   try {
     uiStore.setLoading(true, "Opening repository...", true);
     uiStore.clearError();
-
     let selectedPath = path;
     if (!selectedPath) {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "Open Repository",
-      });
-      if (selected && typeof selected === "string") {
-        selectedPath = selected;
-      }
+      const selected = await open({ directory: true, multiple: false, title: "Open Repository" });
+      if (selected && typeof selected === "string") selectedPath = selected;
     }
-
     if (selectedPath) {
       const info = await gitService.openRepository(selectedPath);
       repoStore.setRepoInfo(info);
@@ -209,20 +256,12 @@ const handleOpenRepo = async (path?: string) => {
   }
 };
 
-const triggerCloneModal = () => {
-  uiStore.openModal('clone');
-};
+const triggerCloneModal = () => uiStore.openModal('clone');
 
 const handleBrowseClonePath = async () => {
   try {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Select Clone Destination",
-    });
-    if (selected && typeof selected === "string") {
-      uiStore.setClonePath(selected);
-    }
+    const selected = await open({ directory: true, multiple: false, title: "Select Clone Destination" });
+    if (selected && typeof selected === "string") uiStore.setClonePath(selected);
   } catch (err) {
     uiStore.setError(String(err));
   }
@@ -233,11 +272,9 @@ const handleCloneRepo = async () => {
   const url = uiStore.cloneUrl;
   const path = uiStore.clonePath;
   uiStore.closeModal('clone');
-
   try {
     uiStore.setLoading(true, '', true);
     uiStore.clearError();
-
     await gitService.cloneRepository(url, path);
     const info = await gitService.openRepository(path);
     repoStore.setRepoInfo(info);
@@ -256,12 +293,14 @@ const handleCloneRepo = async () => {
 
 const handlePush = async () => {
   try {
-    uiStore.setLoading(true, "Pushing changes to remote...", true);
-    uiStore.clearError();
-    await gitService.push();
-    toast.success("Pushed successfully!", { title: "Success" });
-    await repoStore.refreshRepo();
-    uiStore.clearError();
+    await withLock('push', async () => {
+      uiStore.setLoading(true, "Pushing changes to remote...", true);
+      uiStore.clearError();
+      await gitService.push();
+      toast.success("Pushed successfully!", { title: "Success" });
+      await repoStore.refreshRepo();
+      uiStore.clearError();
+    });
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handlePush();
@@ -273,12 +312,14 @@ const handlePush = async () => {
 
 const handlePull = async () => {
   try {
-    uiStore.setLoading(true, "Pulling from remote...", true);
-    uiStore.clearError();
-    await gitService.pull();
-    toast.success("Pulled successfully!", { title: "Success" });
-    await repoStore.refreshRepo();
-    uiStore.clearError();
+    await withLock('pull', async () => {
+      uiStore.setLoading(true, "Pulling from remote...", true);
+      uiStore.clearError();
+      await gitService.pull();
+      toast.success("Pulled successfully!", { title: "Success" });
+      await repoStore.refreshRepo();
+      uiStore.clearError();
+    });
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handlePull();
@@ -290,12 +331,14 @@ const handlePull = async () => {
 
 const handleFetch = async () => {
   try {
-    uiStore.setLoading(true, "Fetching from remote...", false);
-    uiStore.clearError();
-    await gitService.fetch();
-    toast.success("Fetch completed!", { title: "Success" });
-    await repoStore.refreshRepo();
-    uiStore.clearError();
+    await withLock('fetch', async () => {
+      uiStore.setLoading(true, "Fetching from remote...", false);
+      uiStore.clearError();
+      await gitService.fetch();
+      toast.success("Fetch completed!", { title: "Success" });
+      await repoStore.refreshRepo();
+      uiStore.clearError();
+    });
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handleFetch();
@@ -305,23 +348,29 @@ const handleFetch = async () => {
   }
 };
 
-const handleStashSave = async () => {
-  const message = prompt("Optional stash message:");
-  try {
-    uiStore.setLoading(true, "Saving stash...", false);
-    await gitService.stashSave(message || undefined);
-    repoStore.selectedFile = null;
-    await repoStore.refreshRepo();
-    uiStore.clearError();
-  } catch (err) {
-    uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleStashSave();
-  } finally {
-    uiStore.setLoading(false);
-  }
+const handleStashSave = () => {
+  openInputModal({
+    title: 'Save Stash',
+    label: 'Stash Message (optional)',
+    placeholder: 'Describe your stash...',
+    inputType: 'textarea',
+    required: false,
+    onConfirm: async (message) => {
+      try {
+        uiStore.setLoading(true, "Saving stash...", false);
+        await gitService.stashSave(message || undefined);
+        repoStore.selectedFile = null;
+        await repoStore.refreshRepo();
+        uiStore.clearError();
+      } catch (err) {
+        uiStore.setError(String(err));
+        uiStore.lastFailedOperation = async () => { await gitService.stashSave(message || undefined); };
+      } finally {
+        uiStore.setLoading(false);
+      }
+    }
+  });
 };
-
-
 
 const loadTags = async () => {
   try {
@@ -341,18 +390,7 @@ const loadRemotes = async () => {
   }
 };
 
-// Keyboard shortcuts
-useKeyboardShortcuts([
-  { key: 's', ctrl: true, action: () => uiStore.view === 'changes' && handleCommit(), description: 'Commit staged changes' },
-  { key: 'p', ctrl: true, action: () => repoStore.repoInfo && handlePush(), description: 'Push changes' },
-  { key: 'P', ctrl: true, action: () => repoStore.repoInfo && handlePull(), description: 'Pull changes' },
-  { key: 'f', ctrl: true, action: () => repoStore.repoInfo && handleFetch(), description: 'Fetch from remote' },
-  { key: 'b', ctrl: true, action: () => repoStore.repoInfo && (uiStore.openModal('branch')), description: 'Open branch switcher' },
-  { key: 'k', ctrl: true, action: () => repoStore.repoInfo && handleStashSave(), description: 'Stash changes' },
-  { key: 'Escape', action: () => uiStore.closeAllModals(), description: 'Close modal' },
-]);
-
-// Commit handler for keyboard shortcut
+// ── Commit ──
 const handleCommit = async () => {
   if (!uiStore.commitMessage.trim()) {
     toast.error("Please enter a commit message", { title: "Commit Error" });
@@ -362,22 +400,23 @@ const handleCommit = async () => {
     toast.error("Please select files to commit", { title: "Commit Error" });
     return;
   }
-
   try {
-    uiStore.setLoading(true, "Creating commit...", true);
-    uiStore.clearError();
-    if (uiStore.amendCommit) {
-      await gitService.amendCommit(uiStore.commitMessage);
-      toast.success("Commit amended successfully!", { title: "Success" });
-      uiStore.setAmendCommit(false);
-    } else {
-      await gitService.createCommit(uiStore.commitMessage, repoStore.stagedFiles);
-      toast.success("Commit created successfully!", { title: "Success" });
-    }
-    uiStore.setCommitMessage("");
-    repoStore.selectedFile = null;
-    await repoStore.refreshRepo();
-    uiStore.clearError();
+    await withLock('commit', async () => {
+      uiStore.setLoading(true, "Creating commit...", true);
+      uiStore.clearError();
+      if (uiStore.amendCommit) {
+        await gitService.amendCommit(uiStore.commitMessage);
+        toast.success("Commit amended successfully!", { title: "Success" });
+        uiStore.setAmendCommit(false);
+      } else {
+        await gitService.createCommit(uiStore.commitMessage, repoStore.stagedFiles);
+        toast.success("Commit created successfully!", { title: "Success" });
+      }
+      uiStore.setCommitMessage("");
+      repoStore.selectedFile = null;
+      await repoStore.refreshRepo();
+      uiStore.clearError();
+    });
   } catch (err) {
     uiStore.setError(String(err));
     uiStore.lastFailedOperation = async () => await handleCommit();
@@ -386,18 +425,65 @@ const handleCommit = async () => {
   }
 };
 
-// Commit context menu handler
+// ── HistoryPanel event handlers ──
+const handleRequestCreateBranch = (commit: CommitInfo) => {
+  openInputModal({
+    title: 'Create Branch',
+    label: `Branch from ${commit.sha.substring(0, 7)}`,
+    placeholder: 'feature/new-branch',
+    required: true,
+    onConfirm: async (name) => {
+      try {
+        uiStore.setLoading(true, '', false);
+        await gitService.createBranch(name, commit.sha);
+        await repoStore.refreshRepo();
+        toast.success(`Created branch ${name}`, { title: 'Success' });
+      } catch (e) {
+        uiStore.setError(String(e));
+      } finally {
+        uiStore.setLoading(false);
+      }
+    }
+  });
+};
+
+const handleRequestCreateTag = (commit: CommitInfo) => {
+  openInputModal({
+    title: 'Create Tag',
+    label: `Tag for ${commit.sha.substring(0, 7)}`,
+    placeholder: 'v1.0.0',
+    required: true,
+    secondLabel: 'Tag Message (optional)',
+    secondPlaceholder: 'Describe this tag...',
+    onConfirm: async (tagName, tagMessage) => {
+      try {
+        uiStore.setLoading(true, '', false);
+        await gitService.createTag(tagName, tagMessage || '', commit.sha);
+        await repoStore.refreshRepo();
+        toast.success(`Created tag ${tagName}`, { title: 'Success' });
+      } catch (e) {
+        uiStore.setError(String(e));
+      } finally {
+        uiStore.setLoading(false);
+      }
+    }
+  });
+};
+
+// ── Commit detail actions ──
 const handleCherryPick = async (sha: string) => {
   const confirmed = await ask(`Cherry-pick commit ${sha.substring(0, 7)}?`, { title: 'Cherry-pick', kind: 'info' });
   if (!confirmed) return;
   try {
-    uiStore.setLoading(true, "Cherry-picking commit...", false);
-    await gitService.cherryPick(sha);
-    await repoStore.refreshRepo();
-    toast.success("Cherry-pick successful", { title: "Success" });
-    uiStore.clearError();
-  } catch (err) {
-    uiStore.setError(String(err));
+    await withLock('cherry-pick', async () => {
+      uiStore.setLoading(true, "Cherry-picking commit...", false);
+      await gitService.cherryPick(sha);
+      await repoStore.refreshRepo();
+      toast.success("Cherry-pick successful", { title: "Success" });
+      uiStore.clearError();
+    });
+  } catch (e) {
+    uiStore.setError(String(e));
     uiStore.lastFailedOperation = async () => await handleCherryPick(sha);
   } finally {
     uiStore.setLoading(false);
@@ -408,38 +494,61 @@ const handleRevertCommit = async (sha: string) => {
   const confirmed = await ask(`Revert commit ${sha.substring(0, 7)}?`, { title: 'Revert Commit', kind: 'warning' });
   if (!confirmed) return;
   try {
-    uiStore.setLoading(true, "Reverting commit...", false);
-    await gitService.revertCommit(sha);
-    await repoStore.refreshRepo();
-    toast.success("Revert successful", { title: "Success" });
-    uiStore.clearError();
-  } catch (err) {
-    uiStore.setError(String(err));
+    await withLock('revert', async () => {
+      uiStore.setLoading(true, "Reverting commit...", false);
+      await gitService.revertCommit(sha);
+      await repoStore.refreshRepo();
+      toast.success("Revert successful", { title: "Success" });
+      uiStore.clearError();
+    });
+  } catch (e) {
+    uiStore.setError(String(e));
     uiStore.lastFailedOperation = async () => await handleRevertCommit(sha);
   } finally {
     uiStore.setLoading(false);
   }
 };
 
-// Expose for child components
-const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
-  // This is handled in HistoryPanel
+// ── StashPanel event handler ──
+const handleRequestStashBranch = (stash: { sha: string; message: string }) => {
+  openInputModal({
+    title: 'Create Branch from Stash',
+    label: `Branch from stash ${stash.sha.substring(0, 7)}`,
+    placeholder: 'stash-branch',
+    required: true,
+    onConfirm: async (branchName) => {
+      try {
+        uiStore.setLoading(true, "Creating branch from stash...", false);
+        await gitService.branchFromStash(stash.sha, branchName);
+        await repoStore.refreshRepo();
+        toast.success(`Branch ${branchName} created from stash`, { title: 'Success' });
+      } catch (err) {
+        uiStore.setError(String(err));
+        uiStore.lastFailedOperation = async () => await gitService.branchFromStash(stash.sha, branchName);
+      } finally {
+        uiStore.setLoading(false);
+      }
+    }
+  });
 };
 
+// ── Commit file context menu ──
 const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
   showContextMenu(event, [
     {
       label: 'Copy Path',
       action: async () => {
-        await navigator.clipboard.writeText(filePath);
-        toast.success('Path copied', { title: 'Copied' });
+        try {
+          await navigator.clipboard.writeText(filePath);
+          toast.success('Path copied', { title: 'Copied' });
+        } catch {
+          toast.error('Failed to copy path', { title: 'Clipboard Error' });
+        }
       }
     },
     {
       label: 'View File History',
-      action: async () => {
-        uiStore.setSearchCommitQuery(filePath);
-      }
+      action: () => uiStore.setSearchCommitQuery(filePath)
     },
     { divider: true },
     {
@@ -469,11 +578,35 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
     }
   ]);
 };
+
+// ── Keyboard shortcuts ──
+useKeyboardShortcuts([
+  { key: 's', ctrl: true, action: () => uiStore.view === 'changes' && handleCommit(), description: 'Commit staged changes' },
+  { key: 'p', ctrl: true, action: () => repoStore.repoInfo && handlePush(), description: 'Push changes' },
+  { key: 'P', ctrl: true, action: () => repoStore.repoInfo && handlePull(), description: 'Pull changes' },
+  { key: 'f', ctrl: true, action: () => repoStore.repoInfo && handleFetch(), description: 'Fetch from remote' },
+  { key: 'b', ctrl: true, action: () => repoStore.repoInfo && uiStore.openModal('branch'), description: 'Open branch switcher' },
+  { key: 'k', ctrl: true, action: () => repoStore.repoInfo && handleStashSave(), description: 'Stash changes' },
+  { key: 'Escape', action: () => { uiStore.closeAllModals(); inputModal.visible = false; }, description: 'Close modal' },
+]);
 </script>
 
 <template>
   <Toast />
   <ContextMenu :visible="isVisible" :position="position" :items="menuItems" @close="hideContextMenu" />
+  <InputModal
+    :visible="inputModal.visible"
+    :title="inputModal.title"
+    :label="inputModal.label"
+    :placeholder="inputModal.placeholder"
+    :input-type="inputModal.inputType"
+    :required="inputModal.required"
+    :second-label="inputModal.secondLabel"
+    :second-placeholder="inputModal.secondPlaceholder"
+    :second-default-value="inputModal.secondDefault"
+    @confirm="handleInputModalConfirm"
+    @cancel="handleInputModalCancel"
+  />
   <div class="app flex flex-col h-screen bg-background text-foreground overflow-hidden font-sans">
     <!-- Header -->
     <HeaderBar 
@@ -531,8 +664,8 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
 
         <div class="flex-1 overflow-auto p-3">
           <ChangesPanel v-if="uiStore.view === 'changes'" @toggleAllStaged="toggleAllStaged" @handleDiscardAllChanges="handleDiscardAllChanges" />
-          <HistoryPanel v-else-if="uiStore.view === 'history'" @commitContextMenu="(e, c) => { if (c) { handleCherryPick(c.sha); } }" />
-          <StashPanel v-else-if="uiStore.view === 'stashes'" />
+          <HistoryPanel v-else-if="uiStore.view === 'history'" @requestCreateBranch="handleRequestCreateBranch" @requestCreateTag="handleRequestCreateTag" />
+          <StashPanel v-else-if="uiStore.view === 'stashes'" @requestStashBranch="handleRequestStashBranch" />
           <ConflictsPanel v-else-if="uiStore.view === 'conflicts'" />
         </div>
 
@@ -624,10 +757,8 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
         <p class="text-[14px] mb-10" style="color: var(--muted-foreground);">A precision Git client for professional workflows</p>
 
         <div class="grid grid-cols-2 gap-3 mb-8">
-          <button @click="handleOpenRepo()" class="group p-5 rounded-xl border text-left transition-safe"
-            style="background: var(--card); border-color: var(--border);"
-            onmouseover="this.style.background='var(--muted)'"
-            onmouseout="this.style.background='var(--card)'">
+          <button @click="handleOpenRepo()" class="group p-5 rounded-xl border text-left transition-safe hover:bg-muted"
+            style="background: var(--card); border-color: var(--border);">
             <div class="w-8 h-8 rounded-lg flex items-center justify-center mb-3" style="background: var(--muted-foreground); opacity:0.15;">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="stroke: var(--foreground); opacity:1;">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -636,10 +767,8 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
             <div class="font-medium text-[14px] mb-0.5" style="color: var(--foreground);">Open</div>
             <div class="text-[12px]" style="color: var(--muted-foreground);">Load from filesystem</div>
           </button>
-          <button @click="triggerCloneModal" class="group p-5 rounded-xl border text-left transition-safe"
-            style="background: var(--card); border-color: var(--border);"
-            onmouseover="this.style.background='var(--muted)'"
-            onmouseout="this.style.background='var(--card)'">
+          <button @click="triggerCloneModal" class="group p-5 rounded-xl border text-left transition-safe hover:bg-muted"
+            style="background: var(--card); border-color: var(--border);">
             <div class="w-8 h-8 rounded-lg flex items-center justify-center mb-3" style="background: var(--muted);">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="stroke: var(--mark);">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -661,16 +790,14 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
           <div class="space-y-1.5">
             <div v-for="path in settingsStore.settings.recent_repositories.slice(0, 5)" :key="path"
                  @click="handleOpenRepo(path)"
-                 class="group flex items-center gap-3 px-4 py-3 rounded-xl border cursor-pointer transition-safe"
-                 style="background: var(--card); border-color: var(--border);"
-                 onmouseover="this.style.borderColor='var(--accent)'"
-                 onmouseout="this.style.borderColor='var(--border)'">
+                 class="group flex items-center gap-3 px-4 py-3 rounded-xl border cursor-pointer transition-safe hover:border-[var(--accent)]"
+                 style="background: var(--card); border-color: var(--border);">
               <div class="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 text-[11px] font-bold" style="background:var(--muted); color:var(--accent);">{{ getRepoName(path)[0]?.toUpperCase() }}</div>
               <div class="flex-1 min-w-0">
                 <div class="font-semibold truncate text-[13px]">{{ getRepoName(path) }}</div>
                 <div class="text-[11px] font-mono truncate" style="color:var(--muted-foreground);">{{ path }}</div>
               </div>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="flex-shrink-0 transition-safe" style="color:var(--muted-foreground);" onmouseover="this.style.color='var(--accent)'">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="flex-shrink-0 transition-safe group-hover:text-[var(--accent)]" style="color:var(--muted-foreground);">
                 <polyline points="9 18 15 12 9 6"/>
               </svg>
             </div>

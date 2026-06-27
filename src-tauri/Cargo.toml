@@ -24,7 +24,6 @@ tokio = { version = "1", features = ["full", "tracing"] }
 notify = { version = "6.1", features = ["crossbeam-channel"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 once_cell = "1.19"
-lru = "0.16"
 rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

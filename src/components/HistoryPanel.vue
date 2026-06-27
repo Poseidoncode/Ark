@@ -8,6 +8,7 @@ import { gitService, type CommitInfo } from '../services/git';
 import { useToast } from '../composables/useToast';
 import { useContextMenu } from '../composables/useContextMenu';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { ask } from '@tauri-apps/plugin-dialog';
 
 const repoStore = useRepoStore();
 const uiStore = useUIStore();
@@ -15,7 +16,8 @@ const toast = useToast();
 const { showContextMenu } = useContextMenu();
 
 const emit = defineEmits<{
-  (e: 'commitContextMenu', event: MouseEvent, commit: CommitInfo): void;
+  (e: 'requestCreateBranch', commit: CommitInfo): void;
+  (e: 'requestCreateTag', commit: CommitInfo): void;
 }>();
 
 const filteredCommits = computed(() => {
@@ -28,81 +30,97 @@ const filteredCommits = computed(() => {
   );
 });
 
+const handleCherryPick = async (commit: CommitInfo) => {
+  const confirmed = await ask(`Cherry-pick commit ${commit.sha.substring(0, 7)}?`, { title: 'Cherry-pick', kind: 'info' });
+  if (!confirmed) return;
+  try {
+    uiStore.setLoading(true, "Cherry-picking commit...", false);
+    await gitService.cherryPick(commit.sha);
+    await repoStore.refreshRepo();
+    toast.success("Cherry-pick successful", { title: "Success" });
+    uiStore.clearError();
+  } catch (e) {
+    uiStore.setError(String(e));
+    uiStore.lastFailedOperation = async () => handleCherryPick(commit);
+  } finally {
+    uiStore.setLoading(false);
+  }
+};
+
+const handleRevertCommit = async (commit: CommitInfo) => {
+  const confirmed = await ask(`Revert commit ${commit.sha.substring(0, 7)}?`, { title: 'Revert Commit', kind: 'warning' });
+  if (!confirmed) return;
+  try {
+    uiStore.setLoading(true, "Reverting commit...", false);
+    await gitService.revertCommit(commit.sha);
+    await repoStore.refreshRepo();
+    toast.success("Revert successful", { title: "Success" });
+    uiStore.clearError();
+  } catch (e) {
+    uiStore.setError(String(e));
+    uiStore.lastFailedOperation = async () => handleRevertCommit(commit);
+  } finally {
+    uiStore.setLoading(false);
+  }
+};
+
 const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
   showContextMenu(event, [
     {
       label: 'Copy SHA',
       action: async () => {
-        await navigator.clipboard.writeText(commit.sha.substring(0, 7));
-        toast.success('SHA copied', { title: 'Copied' });
+        try {
+          await navigator.clipboard.writeText(commit.sha.substring(0, 7));
+          toast.success('SHA copied', { title: 'Copied' });
+        } catch {
+          toast.error('Failed to copy SHA', { title: 'Clipboard Error' });
+        }
       }
     },
     {
       label: 'Copy Full SHA',
       action: async () => {
-        await navigator.clipboard.writeText(commit.sha);
-        toast.success('Full SHA copied', { title: 'Copied' });
+        try {
+          await navigator.clipboard.writeText(commit.sha);
+          toast.success('Full SHA copied', { title: 'Copied' });
+        } catch {
+          toast.error('Failed to copy SHA', { title: 'Clipboard Error' });
+        }
       }
     },
     {
       label: 'Copy Commit Message',
       action: async () => {
-        await navigator.clipboard.writeText(commit.message);
-        toast.success('Message copied', { title: 'Copied' });
+        try {
+          await navigator.clipboard.writeText(commit.message);
+          toast.success('Message copied', { title: 'Copied' });
+        } catch {
+          toast.error('Failed to copy message', { title: 'Clipboard Error' });
+        }
       }
     },
     { divider: true },
     {
       label: 'Create Branch from Commit',
-      action: async () => {
-        const name = prompt(`Enter new branch name from ${commit.sha.substring(0, 7)}:`);
-        if (name && name.trim()) {
-          try {
-            uiStore.setLoading(true, '', false);
-            await gitService.createBranch(name.trim(), commit.sha);
-            await repoStore.refreshRepo();
-            toast.success(`Created branch ${name}`, { title: 'Success' });
-          } catch (e) {
-            uiStore.setError(String(e));
-          } finally {
-            uiStore.setLoading(false);
-          }
-        }
-      }
+      action: () => emit('requestCreateBranch', commit)
     },
     {
       label: 'Create Tag',
-      action: async () => {
-        const tagName = prompt(`Enter tag name for ${commit.sha.substring(0, 7)}:`);
-        if (tagName && tagName.trim()) {
-          const tagMessage = prompt(`Enter tag message (optional):`) || '';
-          try {
-            uiStore.setLoading(true, '', false);
-            await gitService.createTag(tagName.trim(), tagMessage, commit.sha);
-            await repoStore.refreshRepo();
-            toast.success(`Created tag ${tagName}`, { title: 'Success' });
-          } catch (e) {
-            uiStore.setError(String(e));
-          } finally {
-            uiStore.setLoading(false);
-          }
-        }
-      }
+      action: () => emit('requestCreateTag', commit)
     },
     {
       label: 'Cherry-pick Commit',
-      action: () => emit('commitContextMenu', new MouseEvent('click'), commit)
+      action: () => handleCherryPick(commit)
     },
     {
       label: 'Revert Commit',
       danger: true,
-      action: () => emit('commitContextMenu', new MouseEvent('click'), commit)
+      action: () => handleRevertCommit(commit)
     },
     {
       label: 'Reset Branch to this Commit',
       danger: true,
       action: async () => {
-        const { ask } = await import('@tauri-apps/plugin-dialog');
         const confirmed = await ask(`Reset current branch to ${commit.sha.substring(0, 7)}? This will discard all commits after this point.`, { 
           title: 'Reset Branch', 
           kind: 'warning' 
@@ -125,7 +143,6 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
     {
       label: 'Merge into Current Branch',
       action: async () => {
-        const { ask } = await import('@tauri-apps/plugin-dialog');
         const confirmed = await ask(`Merge commit ${commit.sha.substring(0, 7)} into current branch?`, { 
           title: 'Merge Commit', 
           kind: 'info' 

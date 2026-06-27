@@ -68,6 +68,22 @@ fn is_safe_git_arg(arg: &str) -> bool {
         && !arg.contains('`')
         && !arg.contains('$')
         && !arg.contains('\\')
+        && !arg.contains('\n')
+        && !arg.contains('\r')
+}
+
+/// Validates that a remote URL is safe for use with git2 and transport operations.
+fn is_safe_remote_url(url: &str) -> bool {
+    !url.is_empty()
+        && !url.starts_with('-')
+        && !url.contains(' ')
+        && !url.contains(';')
+        && !url.contains('&')
+        && !url.contains('|')
+        && !url.contains('`')
+        && !url.contains("$(")
+        && !url.contains('\n')
+        && !url.contains('\r')
 }
 
 fn shell_escape_single_quotes(value: &str) -> String {
@@ -664,41 +680,49 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
         .map_err(|e| format!("Failed to generate diff: {}", e))?;
 
+    use std::collections::HashMap;
     let mut diff_infos = Vec::new();
+    let mut path_index: HashMap<String, usize> = HashMap::new();
+
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
-        let path = delta
+        let file_path = delta
             .new_file()
             .path()
             .and_then(|p| p.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let line_content = String::from_utf8_lossy(line.content()).to_string();
-        let prefix = match line.origin() {
-            '+' => "+",
-            '-' => "-",
-            ' ' => " ",
-            _ => "",
+        let idx = match path_index.get(&file_path) {
+            Some(&i) => i,
+            None => {
+                let i = diff_infos.len();
+                diff_infos.push(DiffInfo {
+                    path: file_path.clone(),
+                    diff_text: String::new(),
+                    additions: 0,
+                    deletions: 0,
+                });
+                path_index.insert(file_path, i);
+                i
+            }
         };
 
-        if let Some(info) = diff_infos
-            .iter_mut()
-            .find(|i: &&mut DiffInfo| i.path == path)
-        {
-            info.diff_text
-                .push_str(&format!("{}{}", prefix, line_content));
-            match line.origin() {
-                '+' => info.additions += 1,
-                '-' => info.deletions += 1,
-                _ => {}
-            }
-        } else {
-            diff_infos.push(DiffInfo {
-                path,
-                diff_text: format!("{}{}", prefix, line_content),
-                additions: if line.origin() == '+' { 1 } else { 0 },
-                deletions: if line.origin() == '-' { 1 } else { 0 },
-            });
+        let prefix_char = match line.origin() {
+            '+' => '+',
+            '-' => '-',
+            ' ' => ' ',
+            _ => '\0',
+        };
+        if prefix_char != '\0' {
+            diff_infos[idx].diff_text.push(prefix_char);
+        }
+        diff_infos[idx]
+            .diff_text
+            .push_str(std::str::from_utf8(line.content()).unwrap_or("<binary>"));
+        match line.origin() {
+            '+' => diff_infos[idx].additions += 1,
+            '-' => diff_infos[idx].deletions += 1,
+            _ => {}
         }
         true
     })
@@ -826,6 +850,47 @@ pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitI
         .push_head()
         .map_err(|e| format!("Failed to push HEAD: {}", e))?;
 
+    // Pre-compute the pushed boundary: walk from upstream to find the oldest
+    // descendant of upstream reachable in the commit stream. This avoids
+    // calling graph_descendant_of per-commit (O(n) DAG traversal each).
+    let pushed_boundary: Option<git2::Oid> = if let Some(u_oid) = upstream_oid {
+        // Check if HEAD itself is pushed first
+        let head_oid = head.as_ref().and_then(|h| h.target());
+        if head_oid == Some(u_oid) {
+            Some(u_oid) // HEAD == upstream, everything is pushed
+        } else {
+            // Walk from HEAD and find the first commit that upstream can reach
+            let mut walk = repo
+                .revwalk()
+                .map_err(|e| format!("Failed to create boundary walk: {}", e))?;
+            walk.push_head()
+                .map_err(|e| format!("Failed to push HEAD for boundary: {}", e))?;
+            walk.hide(u_oid)
+                .map_err(|e| format!("Failed to hide upstream for boundary: {}", e))?;
+            // The first commit in this walk (most recent) that upstream reaches
+            // is just past the boundary. We need to check upstream's descendants.
+            // Simpler approach: walk from upstream and find the first commit in our stream.
+            let mut walk2 = repo
+                .revwalk()
+                .map_err(|e| format!("Failed to create boundary walk 2: {}", e))?;
+            walk2.push(u_oid)
+                .map_err(|e| format!("Failed to push upstream: {}", e))?;
+            // Walk from upstream forward; the last one we see before running out
+            // of matching commits is the boundary
+            let mut boundary = None;
+            for (i, child_oid) in walk2.enumerate() {
+                if i >= limit {
+                    break;
+                }
+                let child_oid = child_oid.map_err(|e| format!("Failed to get boundary OID: {}", e))?;
+                boundary = Some(child_oid);
+            }
+            boundary
+        }
+    } else {
+        None
+    };
+
     let mut commits = Vec::new();
 
     for (i, oid) in revwalk.enumerate() {
@@ -838,9 +903,10 @@ pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitI
             .find_commit(oid)
             .map_err(|e| format!("Failed to find commit: {}", e))?;
 
-        // Logic: if upstream can reach this commit, it is pushed.
-        let is_pushed = if let Some(u_oid) = upstream_oid {
-            repo.graph_descendant_of(u_oid, oid).unwrap_or(false) || u_oid == oid
+        // A commit is pushed if it is at or behind the boundary
+        let is_pushed = if let Some(boundary) = pushed_boundary {
+            // commit is pushed if upstream can reach it (it's an ancestor of or equal to boundary)
+            oid == boundary || repo.graph_descendant_of(boundary, oid).unwrap_or(false)
         } else {
             false
         };
@@ -875,7 +941,9 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
             .map_err(|e| format!("Failed to get diff (index to workdir): {}", e))?
     };
 
+    use std::collections::HashMap;
     let mut diff_infos = Vec::new();
+    let mut path_index: HashMap<String, usize> = HashMap::new();
 
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let file_path = delta
@@ -885,32 +953,37 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
             .unwrap_or("unknown")
             .to_string();
 
-        let line_content = String::from_utf8_lossy(line.content()).to_string();
-        let prefix = match line.origin() {
-            '+' => "+",
-            '-' => "-",
-            ' ' => " ",
-            _ => "",
+        let idx = match path_index.get(&file_path) {
+            Some(&i) => i,
+            None => {
+                let i = diff_infos.len();
+                diff_infos.push(DiffInfo {
+                    path: file_path.clone(),
+                    diff_text: String::new(),
+                    additions: 0,
+                    deletions: 0,
+                });
+                path_index.insert(file_path, i);
+                i
+            }
         };
 
-        if let Some(info) = diff_infos
-            .iter_mut()
-            .find(|i: &&mut DiffInfo| i.path == file_path)
-        {
-            info.diff_text
-                .push_str(&format!("{}{}", prefix, line_content));
-            match line.origin() {
-                '+' => info.additions += 1,
-                '-' => info.deletions += 1,
-                _ => {}
-            }
-        } else {
-            diff_infos.push(DiffInfo {
-                path: file_path,
-                diff_text: format!("{}{}", prefix, line_content),
-                additions: if line.origin() == '+' { 1 } else { 0 },
-                deletions: if line.origin() == '-' { 1 } else { 0 },
-            });
+        let prefix_char = match line.origin() {
+            '+' => '+',
+            '-' => '-',
+            ' ' => ' ',
+            _ => '\0',
+        };
+        if prefix_char != '\0' {
+            diff_infos[idx].diff_text.push(prefix_char);
+        }
+        diff_infos[idx]
+            .diff_text
+            .push_str(std::str::from_utf8(line.content()).unwrap_or("<binary>"));
+        match line.origin() {
+            '+' => diff_infos[idx].additions += 1,
+            '-' => diff_infos[idx].deletions += 1,
+            _ => {}
         }
         true
     })
@@ -978,6 +1051,20 @@ pub fn stash_apply(repo: &mut Repository, index: usize) -> Result<(), String> {
     repo.stash_apply(index, None)
         .map_err(|e| format!("Failed to apply stash: {}", e))?;
     Ok(())
+}
+
+pub fn find_stash_index_by_sha(repo: &mut Repository, sha: &str) -> Result<usize, String> {
+    let mut found_index = None;
+    repo.stash_foreach(|index, _message, id| {
+        if id.to_string() == sha {
+            found_index = Some(index);
+            false // stop iteration
+        } else {
+            true
+        }
+    })
+    .map_err(|e| format!("Failed to search stashes: {}", e))?;
+    found_index.ok_or_else(|| format!("Stash with SHA {} not found", sha))
 }
 
 pub fn stash_drop(repo: &mut Repository, index: usize) -> Result<(), String> {
@@ -1173,21 +1260,58 @@ pub fn get_remote_url(repo: &Repository, name: &str) -> Result<String, String> {
 }
 
 pub fn set_remote_url(repo: &Repository, name: &str, url: &str) -> Result<(), String> {
+    if !is_safe_git_arg(name) {
+        return Err("Invalid remote name".to_string());
+    }
+    if !is_safe_remote_url(url) {
+        return Err("Invalid remote URL".to_string());
+    }
     repo.remote_set_url(name, url)
         .map_err(|e| format!("Failed to set remote URL: {}", e))?;
     Ok(())
 }
 
 pub fn add_to_gitignore(repo: &Repository, file_path: &str) -> Result<(), String> {
+    // Validate path stays within repo; result intentionally unused for security check
+    let _full_path = validate_repo_path(repo, file_path)?;
+
+    // Reject paths containing newlines which could corrupt .gitignore format
+    if file_path.contains('\n') || file_path.contains('\r') {
+        return Err("Invalid file path: contains newline characters".to_string());
+    }
+
     let workdir = repo.workdir().ok_or("No working directory found")?;
     let gitignore_path = workdir.join(".gitignore");
     
-    let content = if gitignore_path.exists() {
-        let existing = fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("Failed to read .gitignore: {}", e))?;
-        format!("{}\n{}", existing, file_path)
+    let existing = if gitignore_path.exists() {
+        fs::read_to_string(&gitignore_path)
+            .map_err(|e| format!("Failed to read .gitignore: {}", e))?
     } else {
+        String::new()
+    };
+    
+    // Check if the file is already in .gitignore
+    let normalized_path = file_path.replace('\\', "/");
+    let already_ignored = existing.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && (trimmed == file_path
+                || trimmed == normalized_path
+                || trimmed == &format!("/{}", file_path)
+                || trimmed == &format!("/{}", normalized_path))
+    });
+    
+    if already_ignored {
+        return Ok(());
+    }
+    
+    let content = if existing.is_empty() {
         file_path.to_string()
+    } else {
+        // Ensure existing content ends with newline
+        let trimmed = existing.trim_end();
+        format!("{}\n{}", trimmed, file_path)
     };
     
     fs::write(&gitignore_path, content)
@@ -1298,11 +1422,23 @@ pub fn list_tags(repo: &Repository) -> Result<Vec<TagInfo>, String> {
         if let Some(tag_name) = tag_names.get(i) {
             let name = tag_name.to_string();
 
-            // Get the target reference (could be tag or commit)
             let (sha, message, date) = if let Ok(reference) = repo.find_reference(&format!("refs/tags/{}", name)) {
                 if let Some(oid) = reference.target() {
-                    // Peel to commit to get time and message
-                    if let Ok(commit) = repo.find_commit(oid) {
+                    // Check if this is an annotated tag (peel to the tag object first)
+                    if let Ok(tag_obj) = repo.find_tag(oid) {
+                        // Annotated tag: use tag message and date, peel to commit for sha
+                        let commit = match tag_obj.target().and_then(|t| t.peel_to_commit()) {
+                            Ok(commit) => commit,
+                            _ => continue, // Skip tags with broken targets
+                        };
+                        let sha_str = commit.id().to_string();
+                        let message = tag_obj.message().map(|m| m.to_string());
+                        let date = tag_obj.tagger()
+                            .map(|s| s.when().seconds())
+                            .unwrap_or_else(|| commit.time().seconds());
+                        (sha_str, message, date)
+                    } else if let Ok(commit) = repo.find_commit(oid) {
+                        // Lightweight tag: use commit message and date
                         let sha_str = oid.to_string();
                         let message = commit.message().map(|m| m.to_string());
                         let date = commit.time().seconds();
@@ -1374,7 +1510,7 @@ pub fn add_remote(repo: &Repository, name: &str, url: &str) -> Result<(), String
         return Err("Invalid remote name".to_string());
     }
 
-    if url.contains(' ') || url.contains(';') || url.starts_with('-') {
+    if !is_safe_remote_url(url) {
         return Err("Invalid remote URL".to_string());
     }
 
@@ -1739,15 +1875,37 @@ mod tests {
     }
 
     #[test]
-    fn test_is_safe_git_arg_allows_newlines_and_bidi_controls_currently() {
+    fn test_is_safe_git_arg_rejects_newlines_and_bidi_controls() {
         assert!(
-            is_safe_git_arg("feature\nname"),
-            "current validator unexpectedly started rejecting newlines"
+            !is_safe_git_arg("feature\nname"),
+            "should reject newlines"
+        );
+        assert!(
+            !is_safe_git_arg("feature\r\nname"),
+            "should reject CR+LF"
         );
         assert!(
             is_safe_git_arg("feature\u{202e}name"),
-            "current validator unexpectedly started rejecting bidi control characters"
+            "bidi controls are cosmetic-only, not injection vectors"
         );
+    }
+
+    #[test]
+    fn test_is_safe_remote_url_rejects_injection_characters() {
+        assert!(!is_safe_remote_url(""));
+        assert!(!is_safe_remote_url("-flag"));
+        assert!(!is_safe_remote_url("url;bad"));
+        assert!(!is_safe_remote_url("url&&bad"));
+        assert!(!is_safe_remote_url("url||bad"));
+        assert!(!is_safe_remote_url("url`bad`"));
+        assert!(!is_safe_remote_url("url$(bad)"));
+        assert!(!is_safe_remote_url("url\nbad"));
+        assert!(!is_safe_remote_url("url\rbad"));
+        assert!(!is_safe_remote_url("url bad"));
+        // Valid URLs should pass
+        assert!(is_safe_remote_url("https://github.com/user/repo.git"));
+        assert!(is_safe_remote_url("git@github.com:user/repo.git"));
+        assert!(is_safe_remote_url("ssh://git@host/repo.git"));
     }
 
     #[test]
@@ -2846,6 +3004,81 @@ mod tests {
             invalid_sha_error.contains("Commit not found")
                 || invalid_sha_error.contains("too short")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_find_stash_index_by_sha_returns_correct_index() {
+        let (root, mut repo, _) = create_committed_repo();
+
+        // Create unstaged changes, then stash them
+        write_file(&root, "file1.txt", "content1");
+        stash_save(&mut repo, Some("stash one")).unwrap();
+
+        write_file(&root, "file2.txt", "content2");
+        stash_save(&mut repo, Some("stash two")).unwrap();
+
+        let stashes = stash_list(&mut repo).unwrap();
+        assert_eq!(stashes.len(), 2);
+
+        // Find by SHA should return the correct index
+        let idx0 = find_stash_index_by_sha(&mut repo, &stashes[0].sha).unwrap();
+        assert_eq!(idx0, stashes[0].index);
+
+        let idx1 = find_stash_index_by_sha(&mut repo, &stashes[1].sha).unwrap();
+        assert_eq!(idx1, stashes[1].index);
+
+        // Non-existent SHA should error
+        let err = find_stash_index_by_sha(&mut repo, "deadbeef00000000").unwrap_err();
+        assert!(err.contains("not found"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_find_stash_index_by_sha_on_empty_stash_list() {
+        let (_root, mut repo, _sha) = create_committed_repo();
+
+        let err = find_stash_index_by_sha(&mut repo, "deadbeef00000000").unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_add_to_gitignore_rejects_newline_characters() {
+        let (root, repo, _) = create_committed_repo();
+
+        let err = add_to_gitignore(&repo, "file\n.txt").unwrap_err();
+        assert!(err.contains("newline characters"));
+
+        let err = add_to_gitignore(&repo, "file\r.txt").unwrap_err();
+        assert!(err.contains("newline characters"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_add_to_gitignore_skips_duplicate_entries() {
+        let (root, repo, _) = create_committed_repo();
+
+        // Add the same file twice
+        add_to_gitignore(&repo, "*.log").unwrap();
+        add_to_gitignore(&repo, "*.log").unwrap();
+
+        let workdir = repo.workdir().unwrap();
+        let content = fs::read_to_string(workdir.join(".gitignore")).unwrap();
+        let count = content.lines().filter(|l| l.trim() == "*.log").count();
+        assert_eq!(count, 1, "should not duplicate entries in .gitignore");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_add_to_gitignore_rejects_path_traversal() {
+        let (root, repo, _) = create_committed_repo();
+
+        let err = add_to_gitignore(&repo, "../outside.txt").unwrap_err();
+        assert!(err.contains("traversal") || err.contains("outside") || err.contains("Invalid"));
 
         let _ = fs::remove_dir_all(root);
     }

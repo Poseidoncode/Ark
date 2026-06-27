@@ -11,19 +11,19 @@ const toast = useToast();
 const { showContextMenu } = useContextMenu();
 
 const emit = defineEmits<{
-  (e: 'stashContextMenu', event: MouseEvent, stash: StashInfo): void;
+  (e: 'requestStashBranch', stash: StashInfo): void;
 }>();
 
-const handleStashPop = async (index: number) => {
+const handleStashPop = async (stash: StashInfo) => {
   try {
     uiStore.setLoading(true, "Popping stash...", false);
     uiStore.clearError();
-    await gitService.stashPop(index);
+    await gitService.stashPop(stash.sha);
     await repoStore.refreshRepo();
     uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleStashPop(index);
+    uiStore.lastFailedOperation = async () => await gitService.stashPop(stash.sha);
   } finally {
     uiStore.setLoading(false);
   }
@@ -37,13 +37,13 @@ const onStashContextMenu = (event: MouseEvent, stash: StashInfo) => {
         try {
           uiStore.setLoading(true, "Applying stash...", false);
           uiStore.clearError();
-          await gitService.applyStash(stash.index);
+          await gitService.applyStash(stash.sha);
           await repoStore.refreshRepo();
           toast.success("Stash applied successfully", { title: 'Success' });
           uiStore.clearError();
         } catch (err) {
           uiStore.setError(String(err));
-          uiStore.lastFailedOperation = async () => await gitService.applyStash(stash.index);
+          uiStore.lastFailedOperation = async () => await gitService.applyStash(stash.sha);
         } finally {
           uiStore.setLoading(false);
         }
@@ -51,7 +51,7 @@ const onStashContextMenu = (event: MouseEvent, stash: StashInfo) => {
     },
     {
       label: 'Pop Stash',
-      action: () => handleStashPop(stash.index)
+      action: () => handleStashPop(stash)
     },
     {
       label: 'Drop Stash',
@@ -66,13 +66,13 @@ const onStashContextMenu = (event: MouseEvent, stash: StashInfo) => {
         try {
           uiStore.setLoading(true, "Dropping stash...", false);
           uiStore.clearError();
-          await gitService.dropStash(stash.index);
+          await gitService.dropStash(stash.sha);
           await repoStore.refreshRepo();
           toast.success("Stash dropped successfully", { title: 'Success' });
           uiStore.clearError();
         } catch (err) {
           uiStore.setError(String(err));
-          uiStore.lastFailedOperation = async () => await gitService.dropStash(stash.index);
+          uiStore.lastFailedOperation = async () => await gitService.dropStash(stash.sha);
         } finally {
           uiStore.setLoading(false);
         }
@@ -81,29 +81,17 @@ const onStashContextMenu = (event: MouseEvent, stash: StashInfo) => {
     { divider: true },
     {
       label: 'Create Branch from Stash',
-      action: async () => {
-        const branchName = prompt("Enter new branch name:");
-        if (!branchName || !branchName.trim()) return;
-        try {
-          uiStore.setLoading(true, "Creating branch from stash...", false);
-          uiStore.clearError();
-          await gitService.branchFromStash(stash.index, branchName.trim());
-          await repoStore.refreshRepo();
-          toast.success(`Branch ${branchName} created from stash`, { title: 'Success' });
-          uiStore.clearError();
-        } catch (err) {
-          uiStore.setError(String(err));
-          uiStore.lastFailedOperation = async () => await gitService.branchFromStash(stash.index, branchName.trim());
-        } finally {
-          uiStore.setLoading(false);
-        }
-      }
+      action: () => emit('requestStashBranch', stash)
     },
     {
       label: 'Copy SHA',
       action: async () => {
-        await navigator.clipboard.writeText(stash.sha);
-        toast.success('SHA copied', { title: 'Copied' });
+        try {
+          await navigator.clipboard.writeText(stash.sha);
+          toast.success('SHA copied', { title: 'Copied' });
+        } catch {
+          toast.error('Failed to copy SHA', { title: 'Clipboard Error' });
+        }
       }
     }
   ]);
@@ -119,7 +107,7 @@ const onStashContextMenu = (event: MouseEvent, stash: StashInfo) => {
         <div class="text-sm font-semibold truncate">{{ stash.message || 'No message' }}</div>
         <div class="text-xs text-muted-foreground font-mono mt-1">{{ stash.sha.substring(0, 7) }}</div>
       </div>
-      <button @click="handleStashPop(index)" class="opacity-0 group-hover:opacity-100 gradient-bg text-accent-foreground text-xs px-3 py-1.5 rounded-lg hover:shadow-accent transition-safe font-medium">Pop</button>
+      <button @click="handleStashPop(stash)" class="opacity-0 group-hover:opacity-100 gradient-bg text-accent-foreground text-xs px-3 py-1.5 rounded-lg hover:shadow-accent transition-safe font-medium">Pop</button>
     </div>
   </div>
 </template>

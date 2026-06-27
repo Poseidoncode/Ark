@@ -41,10 +41,11 @@ export function useKeyboardShortcuts(shortcuts: KeyboardShortcut[]) {
   });
 
   onUnmounted(() => {
-    for (const shortcut of shortcuts) {
-      const index = registeredShortcuts.indexOf(shortcut);
-      if (index > -1) {
-        registeredShortcuts.splice(index, 1);
+    // Use Set for O(1) lookup instead of indexOf in a loop
+    const shortcutSet = new Set(shortcuts);
+    for (let i = registeredShortcuts.length - 1; i >= 0; i--) {
+      if (shortcutSet.has(registeredShortcuts[i])) {
+        registeredShortcuts.splice(i, 1);
       }
     }
     window.removeEventListener('keydown', handleKeydown);

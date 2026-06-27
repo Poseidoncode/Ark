@@ -85,16 +85,16 @@ const saveSettings = async () => {
       <div>
         <label class="block text-sm font-semibold text-foreground mb-1">Git User Name</label>
         <p class="text-[11px] text-muted-foreground mb-2 leading-tight">Identifies you as the author of commits</p>
-        <input v-model="settingsStore.settings.user_name" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent bg-white shadow-sm" />
+        <input v-model="settingsStore.settings.user_name" class="input" />
       </div>
       <div>
         <label class="block text-sm font-semibold text-foreground mb-1">Git User Email</label>
         <p class="text-[11px] text-muted-foreground mb-2 leading-tight">Email address associated with your commits</p>
-        <input v-model="settingsStore.settings.user_email" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent bg-white shadow-sm" />
+        <input v-model="settingsStore.settings.user_email" class="input" />
       </div>
       <div>
         <label class="block text-sm font-semibold text-foreground mb-1">SSH Key Path</label>
-        <input v-model="settingsStore.settings.ssh_key_path" placeholder="~/.ssh/id_rsa" class="w-full border border-border rounded-lg p-3 text-foreground text-sm outline-none focus:ring-2 focus:ring-accent focus:border-transparent font-mono bg-white shadow-sm" />
+        <input v-model="settingsStore.settings.ssh_key_path" placeholder="~/.ssh/id_rsa" class="input font-mono" />
       </div>
       <div class="pt-4 border-t border-border">
         <button @click="handleSwitchToSSH" class="text-sm text-accent hover:underline font-semibold flex items-center gap-2">

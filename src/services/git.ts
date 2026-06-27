@@ -90,15 +90,23 @@ type CacheValue<T> = { data: T; until: number };
 
 class GitService {
   private cache = new Map<string, CacheValue<unknown>>();
-  private static TTL = 1500; // 1.5s — local git is fast
+  private static SHORT_TTL = 1500;  // status, branches
+  private static MEDIUM_TTL = 5000;  // stashes, conflicts
+  private static LONG_TTL = 15000;   // settings, tags, remotes, commit diffs
+  private static MAX_CACHE_SIZE = 50;
 
-  private async cached<T>(key: string, fetch: () => Promise<T>): Promise<T> {
+  private async cached<T>(key: string, fetch: () => Promise<T>, ttl = GitService.SHORT_TTL): Promise<T> {
     const now = Date.now();
     const entry = this.cache.get(key) as CacheValue<T> | undefined;
     if (entry && entry.until > now) return entry.data;
     try {
       const data = await fetch();
-      this.cache.set(key, { data, until: now + GitService.TTL });
+      // Evict oldest entries when cache is full
+      if (this.cache.size >= GitService.MAX_CACHE_SIZE) {
+        const oldestKey = this.cache.keys().next().value;
+        if (oldestKey) this.cache.delete(oldestKey);
+      }
+      this.cache.set(key, { data, until: now + ttl });
       return data;
     } catch (error) {
       if (entry) {
@@ -136,7 +144,7 @@ class GitService {
    * Get repository status
    */
   async getStatus(): Promise<FileStatus[]> {
-    return await this.cached('repo:status', () => invoke("get_repository_status"));
+    return await this.cached('repo:status', () => invoke("get_repository_status"), GitService.SHORT_TTL);
   }
 
   /**
@@ -211,7 +219,7 @@ class GitService {
    * Get branches with caching
    */
   async getBranches(): Promise<BranchInfo[]> {
-    return await this.cached('repo:branches', () => invoke("get_branches"));
+    return await this.cached('repo:branches', () => invoke("get_branches"), GitService.SHORT_TTL);
   }
 
   /**
@@ -234,14 +242,14 @@ class GitService {
    * Get commit diff
    */
   async getCommitDiff(sha: string): Promise<DiffInfo[]> {
-    return await this.cached(`commit:diff:${sha.substring(0, 7)}`, () => invoke("get_commit_diff", { sha }));
+    return await this.cached(`commit:diff:${sha}`, () => invoke("get_commit_diff", { sha }), GitService.LONG_TTL);
   }
 
   /**
    * Get commit history
    */
   async getHistory(limit: number = 200): Promise<CommitInfo[]> {
-    return await this.cached(`repo:history:${limit}`, () => invoke("get_commit_history", { limit }));
+    return await this.cached(`repo:history:${limit}`, () => invoke("get_commit_history", { limit }), GitService.SHORT_TTL);
   }
 
   /**
@@ -288,23 +296,23 @@ class GitService {
   /**
    * Stash pop
    */
-  async stashPop(index: number): Promise<void> {
+  async stashPop(sha: string): Promise<void> {
     this.invalidate('repo:');
-    return await invoke("stash_pop", { index });
+    return await invoke("stash_pop", { sha });
   }
 
   /**
    * List stashes
    */
   async listStashes(): Promise<StashInfo[]> {
-    return await this.cached('repo:stashes', () => invoke("list_stashes"));
+    return await this.cached('repo:stashes', () => invoke("list_stashes"), GitService.MEDIUM_TTL);
   }
 
   /**
    * Get conflicts
    */
   async getConflicts(): Promise<ConflictInfo[]> {
-    return await this.cached('repo:conflicts', () => invoke("get_conflicts"));
+    return await this.cached('repo:conflicts', () => invoke("get_conflicts"), GitService.MEDIUM_TTL);
   }
 
   /**
@@ -321,7 +329,7 @@ class GitService {
    * Get settings
    */
   async getSettings(): Promise<SettingsPayload> {
-    return await this.cached('settings', () => invoke("get_settings"));
+    return await this.cached('settings', () => invoke("get_settings"), GitService.LONG_TTL);
   }
 
   /**
@@ -391,25 +399,25 @@ class GitService {
   /**
    * Drop stash
    */
-  async dropStash(index: number): Promise<void> {
+  async dropStash(sha: string): Promise<void> {
     this.invalidate('repo:stash');
-    return await invoke("drop_stash", { index });
+    return await invoke("drop_stash", { sha });
   }
 
   /**
    * Apply stash
    */
-  async applyStash(index: number): Promise<void> {
+  async applyStash(sha: string): Promise<void> {
     this.invalidate('repo:');
-    return await invoke("apply_stash", { index });
+    return await invoke("apply_stash", { sha });
   }
 
   /**
    * Branch from stash
    */
-  async branchFromStash(index: number, branchName: string): Promise<void> {
+  async branchFromStash(sha: string, branchName: string): Promise<void> {
     this.invalidate('repo:branches');
-    return await invoke("branch_from_stash", { index, branchName });
+    return await invoke("branch_from_stash", { sha, branchName });
   }
 
   /**
@@ -432,7 +440,7 @@ class GitService {
    * List all tags
    */
   async listTags(): Promise<TagInfo[]> {
-    return await this.cached('repo:tags', () => invoke("list_tags"));
+    return await this.cached('repo:tags', () => invoke("list_tags"), GitService.LONG_TTL);
   }
 
   /**
@@ -447,7 +455,7 @@ class GitService {
    * List all remotes
    */
   async listRemotes(): Promise<RemoteInfo[]> {
-    return await this.cached('repo:remotes', () => invoke("list_remotes"));
+    return await this.cached('repo:remotes', () => invoke("list_remotes"), GitService.LONG_TTL);
   }
 
   /**

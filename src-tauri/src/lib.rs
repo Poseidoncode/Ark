@@ -1,4 +1,4 @@
-use lru::LruCache;
+
 mod credential_store;
 mod git_operations;
 mod remote_ops;
@@ -126,13 +126,7 @@ struct AppState {
     repo: Option<git2::Repository>,
     settings: Settings,
     watcher: Option<notify::RecommendedWatcher>,
-    // Performance optimization: cache for frequently accessed data
-    #[allow(dead_code)]
-    branch_cache: Option<LruCache<(), (Vec<BranchInfo>, std::time::Instant)>>,
-    #[allow(dead_code)]
-    history_cache: Option<LruCache<(), (Vec<CommitInfo>, std::time::Instant)>>,
-    #[allow(dead_code)]
-    last_refresh: Option<std::time::Instant>,
+    branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
 }
 
 impl Default for AppState {
@@ -142,8 +136,6 @@ impl Default for AppState {
             settings: default_settings(),
             watcher: None,
             branch_cache: None,
-            history_cache: None,
-            last_refresh: None,
         }
     }
 }
@@ -437,7 +429,6 @@ fn open_repository(
             state.repo = Some(repo);
             // Invalidate all caches when changing repo
             state.branch_cache = None;
-            state.history_cache = None;
             stop_watcher(state.watcher.take());
             state.watcher = start_watcher(app_handle.clone(), &path);
 
@@ -559,11 +550,9 @@ fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
 
     // Check cache first (cache for 5 seconds)
-    if let Some(ref mut cache) = state.branch_cache {
-        if let Some((ref branches, ref time)) = cache.get(&()) {
-            if time.elapsed().as_secs() < 5 {
-                return Ok(branches.clone());
-            }
+    if let Some((ref branches, ref time)) = state.branch_cache {
+        if time.elapsed().as_secs() < 5 {
+            return Ok(branches.clone());
         }
     }
 
@@ -571,9 +560,7 @@ fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
     let branches = git_operations::get_branches(repo).map_err(|e| AppError::Git(e.into()))?;
 
     // Update cache
-    let mut cache = LruCache::new(std::num::NonZeroUsize::new(2).unwrap());
-    cache.put((), (branches.clone(), std::time::Instant::now()));
-    state.branch_cache = Some(cache);
+    state.branch_cache = Some((branches.clone(), std::time::Instant::now()));
 
     Ok(branches)
 }
@@ -595,7 +582,6 @@ fn checkout_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<(
     git_operations::checkout_branch(repo, &options.name).map_err(|e| AppError::Git(e.into()))?;
     // Invalidate caches
     state.branch_cache = None;
-    state.history_cache = None;
     Ok(())
 }
 
@@ -629,7 +615,6 @@ async fn push_changes(state: State<'_, App>) -> AppResult<()> {
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
         // Invalidate caches before remote operation
         state.branch_cache = None;
-        state.history_cache = None;
         (path, ssh_key, ssh_pass)
     };
 
@@ -654,7 +639,6 @@ async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
         let (ssh_key, ssh_pass) = get_ssh_credentials(&state.settings)?;
         // Invalidate caches before remote operation
         state.branch_cache = None;
-        state.history_cache = None;
         (path, ssh_key, ssh_pass)
     };
 
@@ -702,9 +686,10 @@ fn stash_save(state: State<'_, App>, options: StashOptions) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn stash_pop(state: State<'_, App>, index: usize) -> AppResult<()> {
+fn stash_pop(state: State<'_, App>, sha: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
     git_operations::stash_pop(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
@@ -905,23 +890,26 @@ fn create_tag(state: State<'_, App>, options: TagOptions) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn drop_stash(state: State<'_, App>, index: usize) -> AppResult<()> {
+fn drop_stash(state: State<'_, App>, sha: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
     git_operations::stash_drop(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
-fn apply_stash(state: State<'_, App>, index: usize) -> AppResult<()> {
+fn apply_stash(state: State<'_, App>, sha: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
     git_operations::stash_apply(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
-fn branch_from_stash(state: State<'_, App>, index: usize, branch_name: String) -> AppResult<()> {
+fn branch_from_stash(state: State<'_, App>, sha: String, branch_name: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
     git_operations::stash_branch(repo, index, &branch_name).map_err(|e| AppError::Git(e.into()))
 }
 
@@ -940,10 +928,19 @@ fn merge_commit(state: State<'_, App>, sha: String) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn list_tags(state: State<'_, App>) -> AppResult<Vec<TagInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::list_tags(repo).map_err(|e| AppError::Git(e.into()))
+async fn list_tags(state: State<'_, App>) -> AppResult<Vec<TagInfo>> {
+    let repo_path = {
+        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+        repo.path().to_path_buf()
+    };
+    tokio::task::spawn_blocking(move || {
+        let repo = git2::Repository::open(&repo_path)
+            .map_err(|e| AppError::Git(GitError::Other(e.to_string())))?;
+        git_operations::list_tags(&repo).map_err(|e| AppError::Git(e.into()))
+    })
+    .await
+    .map_err(|e| AppError::Lock(format!("Task failed: {}", e)))?
 }
 
 #[tauri::command]
@@ -993,8 +990,6 @@ pub fn run() {
                 settings,
                 watcher,
                 branch_cache: None,
-                history_cache: None,
-                last_refresh: None,
             })));
 
             // Cleanup on app exit

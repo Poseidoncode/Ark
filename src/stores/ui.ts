@@ -110,6 +110,7 @@ export const useUIStore = defineStore('ui', () => {
     showBranchModal.value = false;
     showTagsModal.value = false;
     showRemotesModal.value = false;
+    showRecentRepos.value = false;
   };
 
   const setView = (newView: ViewType) => {

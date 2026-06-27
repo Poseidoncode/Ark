@@ -11,10 +11,6 @@ const uiStore = useUIStore();
 const toast = useToast();
 const { showContextMenu } = useContextMenu();
 
-const emit = defineEmits<{
-  (e: 'conflictContextMenu', event: MouseEvent, conflict: ConflictInfo): void;
-}>();
-
 const handleResolve = async (path: string, ours: boolean) => {
   try {
     uiStore.setLoading(true, "Resolving conflict...", false);
@@ -44,8 +40,12 @@ const onConflictContextMenu = (event: MouseEvent, conflict: ConflictInfo) => {
     {
       label: 'Copy Path',
       action: async () => {
-        await navigator.clipboard.writeText(conflict.path);
-        toast.success('Path copied', { title: 'Copied' });
+        try {
+          await navigator.clipboard.writeText(conflict.path);
+          toast.success('Path copied', { title: 'Copied' });
+        } catch {
+          toast.error('Failed to copy path', { title: 'Clipboard Error' });
+        }
       }
     },
     {
