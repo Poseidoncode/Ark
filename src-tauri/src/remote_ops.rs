@@ -133,15 +133,9 @@ pub fn push_changes(
     let branch_name = if head.is_branch() {
         head.shorthand().unwrap_or("HEAD")
     } else {
-        // For detached HEAD, we need to push the specific commit
-        // Get the current commit SHA
-        let oid = head.target().ok_or("No commit to push")?;
-        let short_oid = oid.to_string()[..7].to_string();
-        // Push the specific ref
-        let refspec = format!("{}:refs/heads/{}", oid, short_oid);
-        remote.push(&[&refspec], Some(&mut push_options))
-            .map_err(|e| format!("Push failed: {}", e))?;
-        return Ok(());
+        // Detached HEAD: pushing to a random branch name is not meaningful.
+        // Reject and ask the user to checkout a branch first.
+        return Err("Cannot push in detached HEAD state. Please checkout a branch first.".to_string());
     };
 
     // Push the current branch to origin
@@ -250,12 +244,13 @@ pub fn pull_changes(
             .find_commit(upstream_oid)
             .map_err(|e| format!("Failed to find upstream commit: {}", e))?;
 
-        // Checkout to the upstream commit using the commit object
-        repo.checkout_tree(commit.as_object(), None)
+        // Force checkout to the upstream commit to update working directory and index
+        let mut checkout_opts = git2::build::CheckoutBuilder::new();
+        checkout_opts.force();
+        repo.checkout_tree(commit.as_object(), Some(&mut checkout_opts))
             .map_err(|e| format!("Failed to checkout upstream commit: {}", e))?;
 
         // Update the branch reference to point to the upstream commit
-        // We need to get a mutable reference to the branch
         let branch_name = branch.name().map_err(|e| format!("Invalid branch name: {}", e))?
             .ok_or("Invalid branch name")?;
         repo.reference(&format!("refs/heads/{}", branch_name), upstream_oid, true, "Fast-forward to upstream")
@@ -307,7 +302,7 @@ fn pull_via_subprocess(repo: &Repository, branch_name: &str, ssh_key_path: Optio
 
     // Use git pull via subprocess as fallback
     let mut command = Command::new("git");
-    command.args(&["pull", "origin", branch_name]);
+    command.args(["pull", "origin", branch_name]);
     command.current_dir(path);
     command.env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_PAGER", "cat");

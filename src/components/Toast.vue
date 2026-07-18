@@ -49,9 +49,8 @@
           <!-- Dismiss -->
           <button
             @click="dismiss(toast.id)"
-            class="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-md transition-safe -mt-0.5 -mr-1"
+            class="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-md transition-safe -mt-0.5 -mr-1 toast-dismiss-btn"
             style="color: var(--muted-foreground);"
-            :style="{ ':hover': { background: 'var(--muted)', color: 'var(--foreground)' } }"
             aria-label="Dismiss"
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -129,7 +128,7 @@ const typeClasses = {
 }
 
 /* Dismiss button hover */
-button:hover {
+.toast-dismiss-btn:hover {
   background: var(--muted);
   color: var(--foreground);
 }

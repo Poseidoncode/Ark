@@ -2,7 +2,6 @@
 import { useUIStore } from '../stores/ui';
 import { useRepoStore } from '../stores/repo';
 import { useSettingsStore } from '../stores/settings';
-import { gitService } from '../services/git';
 import { homeDir } from '@tauri-apps/api/path';
 
 const uiStore = useUIStore();

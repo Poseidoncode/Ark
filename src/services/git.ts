@@ -417,6 +417,8 @@ class GitService {
    */
   async branchFromStash(sha: string, branchName: string): Promise<void> {
     this.invalidate('repo:branches');
+    this.invalidate('repo:stash');
+    this.invalidate('repo:status');
     return await invoke("branch_from_stash", { sha, branchName });
   }
 

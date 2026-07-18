@@ -56,3 +56,4 @@ src-tauri/test_upstream.rs
 
 # Worktrees
 .worktrees/
+.pi-subagents

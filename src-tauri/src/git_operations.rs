@@ -189,7 +189,7 @@ pub fn get_repository_info(repo: &Repository) -> Result<RepositoryInfo, String> 
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| repo.path().to_string_lossy().to_string());
 
-    // 移除末尾斜線，確保路徑格式一致
+    // Strip trailing slashes to ensure consistent path format
     while path.ends_with('/') || path.ends_with('\\') {
         path.pop();
     }
@@ -317,6 +317,7 @@ fn validate_repo_path(repo: &Repository, path: &str) -> Result<PathBuf, String> 
     Ok(full_path)
 }
 
+#[allow(dead_code)]
 fn validate_workdir_entries(repo: &Repository) -> Result<(), String> {
     fn visit(repo: &Repository, root: &Path, dir: &Path) -> Result<(), String> {
         for entry in fs::read_dir(dir).map_err(|e| format!("Failed to scan repository: {}", e))? {
@@ -604,8 +605,9 @@ pub fn discard_changes(repo: &Repository, path: &str) -> Result<(), String> {
 }
 
 pub fn discard_all_changes(repo: &Repository) -> Result<(), String> {
-    validate_workdir_entries(repo)?;
-
+    // Validate only the changed entries (from git status) rather than scanning
+    // the entire working directory. This avoids a full recursive traversal for
+    // large repositories — git status already identifies all modified paths.
     let mut status_opts = StatusOptions::new();
     status_opts.include_untracked(true);
     status_opts.recurse_untracked_dirs(true);
@@ -758,7 +760,6 @@ pub fn create_commit(repo: &Repository, message: &str) -> Result<String, String>
         vec![]
     };
 
-    let parent_refs: Vec<&git2::Commit> = parents.to_vec();
     let commit_id = repo
         .commit(
             Some("HEAD"),
@@ -766,7 +767,7 @@ pub fn create_commit(repo: &Repository, message: &str) -> Result<String, String>
             &signature,
             message,
             &tree,
-            &parent_refs,
+            &parents,
         )
         .map_err(|e| format!("Failed to create commit: {}", e))?;
 
@@ -850,43 +851,24 @@ pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitI
         .push_head()
         .map_err(|e| format!("Failed to push HEAD: {}", e))?;
 
-    // Pre-compute the pushed boundary: walk from upstream to find the oldest
-    // descendant of upstream reachable in the commit stream. This avoids
-    // calling graph_descendant_of per-commit (O(n) DAG traversal each).
-    let pushed_boundary: Option<git2::Oid> = if let Some(u_oid) = upstream_oid {
-        // Check if HEAD itself is pushed first
-        let head_oid = head.as_ref().and_then(|h| h.target());
-        if head_oid == Some(u_oid) {
-            Some(u_oid) // HEAD == upstream, everything is pushed
-        } else {
-            // Walk from HEAD and find the first commit that upstream can reach
-            let mut walk = repo
-                .revwalk()
-                .map_err(|e| format!("Failed to create boundary walk: {}", e))?;
-            walk.push_head()
-                .map_err(|e| format!("Failed to push HEAD for boundary: {}", e))?;
-            walk.hide(u_oid)
-                .map_err(|e| format!("Failed to hide upstream for boundary: {}", e))?;
-            // The first commit in this walk (most recent) that upstream reaches
-            // is just past the boundary. We need to check upstream's descendants.
-            // Simpler approach: walk from upstream and find the first commit in our stream.
-            let mut walk2 = repo
-                .revwalk()
-                .map_err(|e| format!("Failed to create boundary walk 2: {}", e))?;
-            walk2.push(u_oid)
-                .map_err(|e| format!("Failed to push upstream: {}", e))?;
-            // Walk from upstream forward; the last one we see before running out
-            // of matching commits is the boundary
-            let mut boundary = None;
-            for (i, child_oid) in walk2.enumerate() {
-                if i >= limit {
-                    break;
-                }
-                let child_oid = child_oid.map_err(|e| format!("Failed to get boundary OID: {}", e))?;
-                boundary = Some(child_oid);
+    // Pre-compute the set of pushed commit OIDs by walking from upstream.
+    // All commits reachable from upstream are pushed. This is O(n) once
+    // instead of O(n²) with per-commit graph_descendant_of calls.
+    use std::collections::HashSet;
+    let pushed_oids: Option<HashSet<git2::Oid>> = if let Some(u_oid) = upstream_oid {
+        let mut walk = repo
+            .revwalk()
+            .map_err(|e| format!("Failed to create pushed walk: {}", e))?;
+        walk.push(u_oid)
+            .map_err(|e| format!("Failed to push upstream: {}", e))?;
+        let mut set = HashSet::new();
+        for oid_result in walk {
+            match oid_result {
+                Ok(oid) => { set.insert(oid); }
+                Err(_) => break,
             }
-            boundary
         }
+        Some(set)
     } else {
         None
     };
@@ -903,13 +885,8 @@ pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitI
             .find_commit(oid)
             .map_err(|e| format!("Failed to find commit: {}", e))?;
 
-        // A commit is pushed if it is at or behind the boundary
-        let is_pushed = if let Some(boundary) = pushed_boundary {
-            // commit is pushed if upstream can reach it (it's an ancestor of or equal to boundary)
-            oid == boundary || repo.graph_descendant_of(boundary, oid).unwrap_or(false)
-        } else {
-            false
-        };
+        // A commit is pushed if it is in the pre-computed set of upstream-reachable OIDs
+        let is_pushed = pushed_oids.as_ref().is_some_and(|set| set.contains(&oid));
 
         commits.push(CommitInfo {
             sha: commit.id().to_string(),
@@ -1077,46 +1054,73 @@ pub fn stash_branch(repo: &mut Repository, index: usize, branch_name: &str) -> R
     if !is_safe_git_arg(branch_name) {
         return Err("Invalid branch name".to_string());
     }
+    create_safety_ref(repo, "stash-branch")?;
+
+    // Capture the current HEAD commit OID as the parent for the new branch.
+    // We extract the OID before any mutable borrows to satisfy the borrow checker.
+    // `git stash branch` creates a branch from the commit the stash was originally created on,
+    // then applies the stash changes on top. We approximate by using current HEAD as parent.
+    let parent_oid = {
+        let head = repo
+            .head()
+            .map_err(|e| format!("Failed to get HEAD: {}", e))?;
+        head.peel_to_commit()
+            .map_err(|e| format!("Failed to peel HEAD to commit: {}", e))?
+            .id()
+    };
+
+    // Apply the stash to the working directory
     repo.stash_apply(index, None)
         .map_err(|e| format!("Failed to apply stash for branch: {}", e))?;
-    
+
     let signature = repo
         .signature()
         .or_else(|_| Signature::now("User", "user@example.com"))
         .map_err(|e| format!("Failed to create signature: {}", e))?;
-    
-    let mut index = repo
+
+    let mut idx = repo
         .index()
         .map_err(|e| format!("Failed to get index: {}", e))?;
-    
-    let tree_id = index
+
+    let tree_id = idx
         .write_tree()
         .map_err(|e| format!("Failed to write tree: {}", e))?;
-    
-    let tree = repo
-        .find_tree(tree_id)
-        .map_err(|e| format!("Failed to find tree: {}", e))?;
-    
-    let _head = repo
-        .head()
-        .map_err(|e| format!("Failed to get HEAD: {}", e))?;
-    
-    repo.commit(
-        Some(&format!("refs/heads/{}", branch_name)),
-        &signature,
-        &signature,
-        "Branch from stash",
-        &tree,
-        &[],
-    )
-    .map_err(|e| format!("Failed to create branch from stash: {}", e))?;
-    
-    repo.checkout_tree(tree.as_object(), None)
-        .map_err(|e| format!("Failed to checkout tree: {}", e))?;
-    
+
+    // Re-find the parent commit and tree inside a scope so their immutable
+    // borrows of repo are dropped before the mutable stash_drop call.
+    {
+        let tree = repo
+            .find_tree(tree_id)
+            .map_err(|e| format!("Failed to find tree: {}", e))?;
+
+        let parent_commit = repo
+            .find_commit(parent_oid)
+            .map_err(|e| format!("Failed to find parent commit: {}", e))?;
+
+        // Create the commit on the new branch with the correct parent
+        repo.commit(
+            Some(&format!("refs/heads/{}", branch_name)),
+            &signature,
+            &signature,
+            "Branch from stash",
+            &tree,
+            &[&parent_commit],
+        )
+        .map_err(|e| format!("Failed to create branch from stash: {}", e))?;
+
+        // Checkout the new branch
+        let mut checkout_opts = git2::build::CheckoutBuilder::new();
+        checkout_opts.force();
+        repo.checkout_tree(tree.as_object(), Some(&mut checkout_opts))
+            .map_err(|e| format!("Failed to checkout tree: {}", e))?;
+    }
+
     repo.set_head(&format!("refs/heads/{}", branch_name))
         .map_err(|e| format!("Failed to set HEAD: {}", e))?;
-    
+
+    // Drop the stash after successful branch creation
+    let _ = repo.stash_drop(index);
+
     Ok(())
 }
 
@@ -1298,8 +1302,8 @@ pub fn add_to_gitignore(repo: &Repository, file_path: &str) -> Result<(), String
             && !trimmed.starts_with('#')
             && (trimmed == file_path
                 || trimmed == normalized_path
-                || trimmed == &format!("/{}", file_path)
-                || trimmed == &format!("/{}", normalized_path))
+                || trimmed == format!("/{}", file_path)
+                || trimmed == format!("/{}", normalized_path))
     });
     
     if already_ignored {
@@ -1323,7 +1327,19 @@ pub fn add_to_gitignore(repo: &Repository, file_path: &str) -> Result<(), String
 pub fn read_file(repo: &Repository, file_path: &str) -> Result<String, String> {
     let _workdir = repo.workdir().ok_or("No working directory found")?;
     let full_path = validate_repo_path(repo, file_path)?;
-    
+
+    // Reject files larger than 10 MB to avoid OOM from reading huge files into memory
+    const MAX_READ_FILE_SIZE: u64 = 10 * 1024 * 1024;
+    if let Ok(metadata) = fs::metadata(&full_path) {
+        if metadata.len() > MAX_READ_FILE_SIZE {
+            return Err(format!(
+                "File is too large to read ({} bytes, max {} bytes)",
+                metadata.len(),
+                MAX_READ_FILE_SIZE
+            ));
+        }
+    }
+
     fs::read_to_string(full_path)
         .map_err(|e| format!("Failed to read file: {}", e))
 }

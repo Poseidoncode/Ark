@@ -1,6 +1,6 @@
 //!
-//! 專案入口
-//! 啟動 Rust backend，提供 Tauri 指令注入與組件註冊。
+//! Application entry point.
+//! Starts the Rust backend, providing Tauri command registration and component setup.
 
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

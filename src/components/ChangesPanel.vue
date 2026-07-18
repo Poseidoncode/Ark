@@ -9,7 +9,7 @@ import { openPath } from '@tauri-apps/plugin-opener';
 const repoStore = useRepoStore();
 const uiStore = useUIStore();
 const toast = useToast();
-const { showContextMenu, hideContextMenu } = useContextMenu();
+const { showContextMenu } = useContextMenu();
 
 const emit = defineEmits<{
   (e: 'toggleAllStaged'): void;

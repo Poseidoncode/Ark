@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
+import { reactive, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
 import { gitService, type CommitInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
@@ -34,6 +34,7 @@ import InputModal from './components/InputModal.vue';
 // Helper functions
 import { getRepoName } from './utils/path';
 import { useOperationMutex } from './composables/useOperationMutex';
+import { useDebouncedAsync } from './composables/useDebouncedAsync';
 
 // Initialize stores
 const repoStore = useRepoStore();
@@ -164,6 +165,9 @@ const refreshRepo = async () => {
   }
 };
 
+// Debounced version for watcher events to coalesce rapid file-system notifications
+const { trigger: debouncedRefresh, cancel: cancelDebouncedRefresh } = useDebouncedAsync(refreshRepo, 300);
+
 let unlisten: (() => void) | null = null;
 
 onMounted(async () => {
@@ -178,12 +182,14 @@ onMounted(async () => {
     console.error("Failed to fetch initial repo info", err);
   }
   unlisten = await listen('git-state-changed', () => {
-    refreshRepo().catch(err => console.error('git-state-changed refresh failed:', err));
+    // Use debounced refresh to coalesce rapid watcher events into a single refresh
+    debouncedRefresh().catch((err: unknown) => console.error('git-state-changed refresh failed:', err));
   });
 });
 
 onUnmounted(() => {
   if (unlisten) unlisten();
+  cancelDebouncedRefresh();
 });
 
 // ── Watchers ──

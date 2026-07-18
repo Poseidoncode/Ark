@@ -3,7 +3,6 @@ import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useRepoStore } from '../stores/repo';
 import { useUIStore } from '../stores/ui';
 import { useSettingsStore } from '../stores/settings';
-import { gitService } from '../services/git';
 
 const repoStore = useRepoStore();
 const uiStore = useUIStore();

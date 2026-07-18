@@ -126,6 +126,7 @@ struct AppState {
     repo: Option<git2::Repository>,
     settings: Settings,
     watcher: Option<notify::RecommendedWatcher>,
+    watched_paths: Vec<std::path::PathBuf>,
     branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
 }
 
@@ -135,6 +136,7 @@ impl Default for AppState {
             repo: None,
             settings: default_settings(),
             watcher: None,
+            watched_paths: Vec::new(),
             branch_cache: None,
         }
     }
@@ -148,30 +150,39 @@ fn require_open_repository(repo: Option<&git2::Repository>) -> AppResult<&git2::
     repo.ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))
 }
 
-fn stop_watcher(watcher: Option<notify::RecommendedWatcher>) {
+fn stop_watcher(watcher: Option<notify::RecommendedWatcher>, watched_paths: &[std::path::PathBuf]) {
     if let Some(mut w) = watcher {
-        let _ = w.unwatch(&std::path::PathBuf::from(".git/index"));
-        let _ = w.unwatch(&std::path::PathBuf::from(".git/HEAD"));
-        let _ = w.unwatch(&std::path::PathBuf::from(".git/refs"));
+        for path in watched_paths {
+            let _ = w.unwatch(path);
+        }
     }
 }
 
-fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> Option<notify::RecommendedWatcher> {
+fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> (Option<notify::RecommendedWatcher>, Vec<std::path::PathBuf>) {
     let path = std::path::Path::new(repo_path);
     let git_path = path.join(".git");
 
     if !git_path.exists() {
-        return None;
+        return (None, Vec::new());
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let mut watcher = notify::RecommendedWatcher::new(tx, Config::default()).ok()?;
+    let mut watcher = match notify::RecommendedWatcher::new(tx, Config::default()) {
+        Ok(w) => w,
+        Err(_) => return (None, Vec::new()),
+    };
 
-    // Watch key git files for state changes
-    let _ = watcher.watch(&git_path.join("index"), RecursiveMode::NonRecursive);
-    let _ = watcher.watch(&git_path.join("HEAD"), RecursiveMode::NonRecursive);
-    let _ = watcher.watch(&git_path.join("refs"), RecursiveMode::Recursive);
+    // Watch key git files for state changes; track paths for cleanup
+    let watched_paths = vec![
+        git_path.join("index"),
+        git_path.join("HEAD"),
+        git_path.join("refs"),
+    ];
+
+    let _ = watcher.watch(&watched_paths[0], RecursiveMode::NonRecursive);
+    let _ = watcher.watch(&watched_paths[1], RecursiveMode::NonRecursive);
+    let _ = watcher.watch(&watched_paths[2], RecursiveMode::Recursive);
 
     std::thread::spawn(move || {
         let mut last_emit = std::time::Instant::now();
@@ -194,7 +205,7 @@ fn start_watcher(app_handle: tauri::AppHandle, repo_path: &str) -> Option<notify
         }
     });
 
-    Some(watcher)
+    (Some(watcher), watched_paths)
 }
 
 fn get_settings_path(app_handle: &tauri::AppHandle) -> AppResult<std::path::PathBuf> {
@@ -332,7 +343,14 @@ fn save_settings_payload_to_path(payload: &SettingsPayload, path: &Path) -> AppR
 
     let json = serde_json::to_string_pretty(&DiskSettings::from(payload.settings.clone()))
         .map_err(|e| AppError::Config(e.to_string()))?;
-    std::fs::write(path, json).map_err(|e| AppError::Io(e.to_string()))?;
+
+    // Atomic write: write to a temp file then rename to avoid corruption on crash
+    let temp_path = path.with_extension("json.tmp");
+    std::fs::write(&temp_path, &json).map_err(|e| AppError::Io(e.to_string()))?;
+    std::fs::rename(&temp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        AppError::Io(e.to_string())
+    })?;
     Ok(())
 }
 
@@ -349,7 +367,14 @@ fn migrate_legacy_passphrase(path: &Path, legacy: LegacyDiskSettings) -> AppResu
     let settings = Settings::from(legacy);
     let json = serde_json::to_string_pretty(&DiskSettings::from(settings.clone()))
         .map_err(|e| AppError::Config(e.to_string()))?;
-    std::fs::write(path, json).map_err(|e| AppError::Io(e.to_string()))?;
+
+    // Atomic write: write to temp file then rename
+    let temp_path = path.with_extension("json.tmp");
+    std::fs::write(&temp_path, &json).map_err(|e| AppError::Io(e.to_string()))?;
+    std::fs::rename(&temp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        AppError::Io(e.to_string())
+    })?;
     Ok(settings)
 }
 
@@ -429,8 +454,10 @@ fn open_repository(
             state.repo = Some(repo);
             // Invalidate all caches when changing repo
             state.branch_cache = None;
-            stop_watcher(state.watcher.take());
-            state.watcher = start_watcher(app_handle.clone(), &path);
+            stop_watcher(state.watcher.take(), &state.watched_paths);
+            let (watcher, watched_paths) = start_watcher(app_handle.clone(), &path);
+            state.watcher = watcher;
+            state.watched_paths = watched_paths;
 
             // Add to recent repositories if not already there
             if !state.settings.recent_repositories.contains(&path) {
@@ -492,8 +519,10 @@ async fn clone_repository(
     match git_operations::open_repository(&path) {
         Ok(repo) => {
             state_lock.repo = Some(repo);
-            stop_watcher(state_lock.watcher.take());
-            state_lock.watcher = start_watcher(app_handle.clone(), &path);
+            stop_watcher(state_lock.watcher.take(), &state_lock.watched_paths);
+            let (watcher, watched_paths) = start_watcher(app_handle.clone(), &path);
+            state_lock.watcher = watcher;
+            state_lock.watched_paths = watched_paths;
 
             if !state_lock.settings.recent_repositories.contains(&path) {
                 state_lock.settings.recent_repositories.insert(0, path.clone());
@@ -835,12 +864,35 @@ fn get_current_repo_info(state: State<'_, App>) -> AppResult<Option<RepositoryIn
 }
 
 #[tauri::command]
-fn reveal_in_finder(path: String) -> AppResult<()> {
+fn reveal_in_finder(state: State<'_, App>, path: String) -> AppResult<()> {
+    // Validate that the path is within the currently open repository's workdir
+    // to prevent revealing arbitrary filesystem locations.
+    let canonical_path = {
+        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+        let workdir = repo.workdir().ok_or(AppError::Git(GitError::InvalidRef("No working directory found".to_string())))?;
+        let canonical_workdir = workdir
+            .canonicalize()
+            .map_err(|e| AppError::Io(format!("Failed to resolve repository path: {}", e)))?;
+
+        let target = std::path::Path::new(&path);
+        let canonical = target
+            .canonicalize()
+            .map_err(|e| AppError::Io(format!("Failed to resolve path '{}': {}", path, e)))?;
+
+        if !canonical.starts_with(&canonical_workdir) {
+            return Err(AppError::Git(GitError::PermissionDenied(
+                "Path is outside the repository".to_string(),
+            )));
+        }
+        canonical
+    };
+
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .arg("-R")
-            .arg(&path)
+            .arg(&canonical_path)
             .spawn()
             .map_err(|e| AppError::Io(e.to_string()))?;
     }
@@ -848,17 +900,16 @@ fn reveal_in_finder(path: String) -> AppResult<()> {
     {
         std::process::Command::new("explorer")
             .arg("/select,")
-            .arg(&path)
+            .arg(&canonical_path)
             .spawn()
             .map_err(|e| AppError::Io(e.to_string()))?;
     }
     #[cfg(target_os = "linux")]
     {
-        let p = std::path::Path::new(&path);
-        let dir = if p.is_dir() {
-            p
+        let dir = if canonical_path.is_dir() {
+            &canonical_path
         } else {
-            p.parent().unwrap_or(p)
+            canonical_path.parent().unwrap_or(&canonical_path)
         };
         std::process::Command::new("xdg-open")
             .arg(dir)
@@ -979,16 +1030,20 @@ pub fn run() {
             let settings = load_settings_from_disk(app_handle);
             let mut repo = None;
             let mut watcher = None;
+            let mut watched_paths = Vec::new();
             if let Some(path) = &settings.last_opened_repository {
                 if let Ok(opened_repo) = git_operations::open_repository(path) {
                     repo = Some(opened_repo);
-                    watcher = start_watcher(app_handle.clone(), path);
+                    let (w, wp) = start_watcher(app_handle.clone(), path);
+                    watcher = w;
+                    watched_paths = wp;
                 }
             }
             app.manage(App(Mutex::new(AppState {
                 repo,
                 settings,
                 watcher,
+                watched_paths,
                 branch_cache: None,
             })));
 
@@ -997,7 +1052,7 @@ pub fn run() {
             app.listen("tauri://close-requested", move |_| {
                 if let Some(state) = app_handle_clone.try_state::<App>() {
                     if let Ok(mut app_state) = state.0.lock() {
-                        stop_watcher(app_state.watcher.take());
+                        stop_watcher(app_state.watcher.take(), &app_state.watched_paths);
                     }
                 }
             });
