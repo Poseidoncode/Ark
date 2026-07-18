@@ -38,3 +38,13 @@ strip = true
 [profile.dev]
 opt-level = 1
 debug = true
+
+[patch.crates-io]
+# Patched glib 0.18.5 to fix RUSTSEC-2024-0429:
+# Unsoundness in VariantStrIter Iterator/DoubleEndedIterator impls.
+# The original passes &p to a C variadic out-argument that writes through
+# the pointer (UB); &mut p is required. No backport to 0.18.x exists
+# from upstream (gtk-rs). Only affects the transitive glib 0.18.x dep
+# pulled by gtk 0.18.x; our direct dep on glib = "0.20" is unaffected.
+# See: https://rustsec.org/advisories/RUSTSEC-2024-0429.html
+glib = { path = "patches/glib" }
