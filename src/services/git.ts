@@ -105,7 +105,7 @@ type CacheValue<T> = { data: T; until: number };
 class GitService {
   private cache = new Map<string, CacheValue<unknown>>();
   private static SHORT_TTL = 1500;  // status, branches
-  private static MEDIUM_TTL = 5000;  // stashes, conflicts
+  private static MEDIUM_TTL = 5000;  // conflicts (stashes uncached)
   private static LONG_TTL = 15000;   // settings, tags, remotes, commit diffs
   private static MAX_CACHE_SIZE = 50;
 
@@ -123,7 +123,10 @@ class GitService {
       this.cache.set(key, { data, until: now + ttl });
       return data;
     } catch (error) {
-      if (entry) {
+      // Only fall back to cache if the entry is still within its TTL.
+      // Serving an expired entry would mask real errors and can leak data
+      // from a previous repository state (e.g. phantom stashes).
+      if (entry && entry.until > now) {
         console.warn('Cache fallback for ' + key + ':', error);
         return entry.data;
       }
@@ -319,7 +322,11 @@ class GitService {
    * List stashes
    */
   async listStashes(): Promise<StashInfo[]> {
-    return await this.cached('repo:stashes', () => invoke("list_stashes"), GitService.MEDIUM_TTL);
+    // Stash list must always reflect the real repository state.
+    // External tools (terminal, other GUIs) can modify stashes at any time,
+    // and the file watcher will trigger refreshes — caching here would serve
+    // stale data that makes ARK show non-existent stashes.
+    return await invoke("list_stashes");
   }
 
   /**

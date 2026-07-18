@@ -47,10 +47,16 @@ export const useRepoStore = defineStore('repo', () => {
   const refreshRepo = async () => {
     if (!repoInfo.value) return;
     try {
+      // listStashes is uncached and always hits the backend, so a transient
+      // failure there must not break the rest of the refresh (status, branches,
+      // conflicts all still degrade to cache). Treat stashes as best-effort.
       const [status, branchList, stashList, conflictList, info] = await Promise.all([
         gitService.getStatus(),
         gitService.getBranches(),
-        gitService.listStashes(),
+        gitService.listStashes().catch((e) => {
+          console.error('Failed to list stashes:', e);
+          return [] as StashInfo[];
+        }),
         gitService.getConflicts(),
         gitService.getCurrentRepoInfo()
       ]);

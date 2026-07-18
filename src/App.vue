@@ -176,6 +176,9 @@ onMounted(async () => {
   try {
     const info = await gitService.getCurrentRepoInfo();
     if (info) {
+      // Clear any stale cache from a previous App lifecycle (HMR, background
+      // resume, etc.) so refreshRepo fetches fresh data from the backend.
+      gitService.invalidate('repo:');
       repoStore.setRepoInfo(info);
       await refreshRepo();
     }
