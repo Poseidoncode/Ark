@@ -52,19 +52,23 @@ pub fn build_ssh_credentials(
 }
 
 /// Create RemoteCallbacks with credentials for authentication.
-/// 
+///
 /// The callback will be invoked by git2 when it needs credentials for authentication.
+/// Supports both SSH key authentication and HTTPS token (OAuth/PAT) authentication.
 pub fn create_remote_callbacks(
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<RemoteCallbacks<'static>, String> {
     // Clone into owned strings so the closure can capture them
     let key_path: Option<String> = ssh_key_path.map(|s| s.to_string());
     let passphrase: Option<String> = ssh_passphrase.map(|s| s.to_string());
-    
+    let token: Option<String> = https_token.map(|s| s.to_string());
+
     let mut callbacks = RemoteCallbacks::new();
-    
+
     callbacks.credentials(move |_url, username_from_url, allowed_types| {
+        // Try SSH key authentication first if configured
         if allowed_types.contains(git2::CredentialType::SSH_KEY) {
             let Some(ref key_path) = key_path else {
                 return Err(git2::Error::from_str("No SSH key path configured"));
@@ -91,17 +95,23 @@ pub fn create_remote_callbacks(
             )
             .map_err(|e| git2::Error::from_str(&format!("SSH credential error: {}", e)));
         }
-        
+
+        // HTTPS token authentication (OAuth or PAT)
         if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            if let Some(username) = username_from_url {
-                return Cred::username(username)
-                    .map_err(|e| git2::Error::from_str(&format!("Failed to create username credential: {}", e)));
+            if let Some(ref token) = token {
+                if !token.trim().is_empty() {
+                    // GitHub accepts the OAuth token as the password with any username.
+                    // Using "oauth2" or the username from the URL both work.
+                    let username = username_from_url.unwrap_or("oauth2");
+                    return Cred::userpass_plaintext(username, token)
+                        .map_err(|e| git2::Error::from_str(&format!("HTTPS credential error: {}", e)));
+                }
             }
         }
-        
+
         Err(git2::Error::from_str("No credentials available"))
     });
-    
+
     Ok(callbacks)
 }
 
@@ -112,6 +122,7 @@ pub fn push_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<(), String> {
     // Find the origin remote
     let mut remote = repo
@@ -119,7 +130,7 @@ pub fn push_changes(
         .map_err(|e| format!("Failed to find remote 'origin': {}", e))?;
 
     // Create remote callbacks with credentials
-    let callbacks = create_remote_callbacks(ssh_key_path, ssh_passphrase)?;
+    let callbacks = create_remote_callbacks(ssh_key_path, ssh_passphrase, https_token)?;
 
     // Create push options with callbacks
     let mut push_options = PushOptions::new();
@@ -154,6 +165,7 @@ pub fn fetch_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<(), String> {
     // Find the origin remote
     let mut remote = repo
@@ -161,7 +173,7 @@ pub fn fetch_changes(
         .map_err(|e| format!("Failed to find remote 'origin': {}", e))?;
 
     // Create remote callbacks with credentials
-    let callbacks = create_remote_callbacks(ssh_key_path, ssh_passphrase)?;
+    let callbacks = create_remote_callbacks(ssh_key_path, ssh_passphrase, https_token)?;
 
     // Create fetch options with callbacks
     let mut fetch_options = FetchOptions::new();
@@ -185,9 +197,10 @@ pub fn pull_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<(), String> {
     // First, fetch changes from origin using git2
-    fetch_changes(repo, ssh_key_path, ssh_passphrase)?;
+    fetch_changes(repo, ssh_key_path, ssh_passphrase, https_token)?;
 
     // Get the current branch
     let head = repo
@@ -209,7 +222,7 @@ pub fn pull_changes(
         Err(_) => {
             // No upstream tracking branch - try to use git pull via subprocess
             // This handles the case where the clone doesn't set up tracking
-            return pull_via_subprocess(repo, branch_name, ssh_key_path);
+            return pull_via_subprocess(repo, branch_name, ssh_key_path, https_token);
         }
     };
 
@@ -271,7 +284,7 @@ pub fn pull_changes(
 }
 
 /// Fallback to subprocess-based pull when there's no tracking branch
-fn pull_via_subprocess(repo: &Repository, branch_name: &str, ssh_key_path: Option<&str>) -> Result<(), String> {
+fn pull_via_subprocess(repo: &Repository, branch_name: &str, ssh_key_path: Option<&str>, https_token: Option<&str>) -> Result<(), String> {
     use std::process::Command;
     use std::path::Path;
     
@@ -302,11 +315,25 @@ fn pull_via_subprocess(repo: &Repository, branch_name: &str, ssh_key_path: Optio
 
     // Use git pull via subprocess as fallback
     let mut command = Command::new("git");
-    command.args(["pull", "origin", branch_name]);
     command.current_dir(path);
     command.env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_PAGER", "cat");
-    
+
+    // If the remote is HTTPS and we have a token, pass it via GIT_CONFIG_*
+    // env vars to keep the token out of the process argument list (`ps`).
+    let remote_url = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().map(|s| s.to_string()));
+    let auth_envs = build_auth_header_envs(
+        remote_url.as_deref().unwrap_or(""),
+        https_token,
+    );
+    for (key, val) in &auth_envs {
+        command.env(key, val);
+    }
+
+    command.args(["pull", "origin", branch_name]);
     for (key, val) in envs {
         command.env(key, val);
     }
@@ -329,6 +356,27 @@ fn pull_via_subprocess(repo: &Repository, branch_name: &str, ssh_key_path: Optio
             format!("Git pull failed with status: {}", output.status)
         })
     }
+}
+
+/// Build environment variables for HTTPS token authentication via git config.
+/// Uses `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` env vars
+/// instead of `-c` args to keep the token out of the process argument list (`ps`).
+/// Returns an empty vec if no token is provided or the URL is not HTTPS.
+pub fn build_auth_header_envs(url: &str, token: Option<&str>) -> Vec<(&'static str, String)> {
+    if !url.starts_with("https://") {
+        return Vec::new();
+    }
+    let Some(token) = token else {
+        return Vec::new();
+    };
+    if token.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ("GIT_CONFIG_COUNT", "1".to_string()),
+        ("GIT_CONFIG_KEY_1", "http.extraHeader".to_string()),
+        ("GIT_CONFIG_VALUE_1", format!("Authorization: Bearer {}", token)),
+    ]
 }
 
 #[cfg(test)]
@@ -397,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_create_remote_callbacks_works() {
-        let callbacks = create_remote_callbacks(None, None);
+        let callbacks = create_remote_callbacks(None, None, None);
         assert!(callbacks.is_ok());
     }
 }

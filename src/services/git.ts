@@ -83,6 +83,20 @@ export interface RemoteInfo {
   fetch_url: string | null;
 }
 
+export interface DeviceFlowInfo {
+  user_code: string;
+  verification_uri: string;
+  device_code: string;
+  interval: number;
+  expires_in: number;
+}
+
+export interface GitHubUser {
+  login: string;
+  name: string | null;
+  email: string | null;
+}
+
 /**
  * Simple cache for local git operations
  */
@@ -474,6 +488,55 @@ class GitService {
   async removeRemote(name: string): Promise<void> {
     this.invalidate('repo:remotes');
     return await invoke("remove_remote", { name });
+  }
+
+  // ── GitHub OAuth Device Flow ────────────────────────────────
+
+  /**
+   * Check if GitHub OAuth is enabled (client ID configured at build time).
+   */
+  async oauthIsEnabled(): Promise<boolean> {
+    return await invoke("oauth_is_enabled");
+  }
+
+  /**
+   * Start the OAuth Device Flow — request a device code from GitHub.
+   * Returns the user code and verification URI to display to the user.
+   */
+  async oauthStartDeviceFlow(): Promise<DeviceFlowInfo> {
+    return await invoke("oauth_start_device_flow");
+  }
+
+  /**
+   * Poll GitHub for an access token. Blocks until the user approves
+   * or the device code expires. Returns the authenticated user's profile.
+   */
+  async oauthPollForToken(deviceCode: string, interval: number, expiresIn: number): Promise<GitHubUser> {
+    return await invoke("oauth_poll_for_token", {
+      deviceCode, interval, expiresIn
+    });
+  }
+
+  /**
+   * Check if the user is authenticated with GitHub.
+   * Returns the GitHub user info if authenticated, or null if not.
+   */
+  async oauthGetStatus(): Promise<GitHubUser | null> {
+    return await invoke("oauth_get_status");
+  }
+
+  /**
+   * Sign out — delete the stored OAuth token.
+   */
+  async oauthSignOut(): Promise<void> {
+    return await invoke("oauth_sign_out");
+  }
+
+  /**
+   * Cancel an in-progress OAuth polling loop.
+   */
+  async oauthCancelPolling(): Promise<void> {
+    return await invoke("oauth_cancel_polling");
   }
 }
 

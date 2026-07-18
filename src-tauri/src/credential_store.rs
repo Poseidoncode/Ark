@@ -109,4 +109,25 @@ impl CredentialStore {
 
         Self::delete_passphrase_impl(key_path)
     }
+
+    // ── OAuth token storage ───────────────────────────────────
+    //
+    // The OAuth token is stored under a fixed key (not per-repo), since
+    // a single GitHub token works for all repositories owned by the user.
+
+    /// Store the GitHub OAuth token in the OS keychain.
+    pub fn set_oauth_token(token: &str) -> Result<(), String> {
+        Self::set_passphrase_impl(crate::oauth::TOKEN_KEYCHAIN_ID, token)
+    }
+
+    /// Retrieve the GitHub OAuth token from the OS keychain.
+    /// Returns `Ok(None)` if no token has been stored.
+    pub fn get_oauth_token() -> Result<Option<String>, String> {
+        Self::get_passphrase_impl(crate::oauth::TOKEN_KEYCHAIN_ID)
+    }
+
+    /// Delete the stored GitHub OAuth token.
+    pub fn delete_oauth_token() -> Result<(), String> {
+        Self::delete_passphrase_impl(crate::oauth::TOKEN_KEYCHAIN_ID)
+    }
 }

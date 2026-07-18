@@ -123,8 +123,9 @@ pub fn clone_repository(
     path: &str,
     ssh_key_path: Option<&str>,
     _ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<Repository, String> {
-    if url.contains(' ') || url.contains(';') || url.starts_with('-') {
+    if !is_safe_remote_url(url) {
         return Err("Invalid clone URL".to_string());
     }
 
@@ -132,6 +133,12 @@ pub fn clone_repository(
     if let Some(command) = build_git_ssh_command(ssh_key_path)? {
         envs.push(("GIT_SSH_COMMAND", command));
     }
+
+    // For HTTPS URLs with a token, pass it via GIT_CONFIG_* env vars to keep
+    // the token out of the process argument list (`ps`).
+    let auth_envs = crate::remote_ops::build_auth_header_envs(url, https_token);
+    envs.extend(auth_envs);
+
     run_git_command(vec!["clone", "--", url, path], None, envs)?;
     open_repository(path)
 }
@@ -973,18 +980,20 @@ pub fn push_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<(), String> {
     // Use git2-based remote operations instead of subprocess
-    crate::remote_ops::push_changes(repo, ssh_key_path, ssh_passphrase)
+    crate::remote_ops::push_changes(repo, ssh_key_path, ssh_passphrase, https_token)
 }
 
 pub fn pull_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<(), String> {
     // Use git2-based remote operations instead of subprocess
-    crate::remote_ops::pull_changes(repo, ssh_key_path, ssh_passphrase)
+    crate::remote_ops::pull_changes(repo, ssh_key_path, ssh_passphrase, https_token)
 }
 
 pub fn stash_save(repo: &mut Repository, message: Option<&str>) -> Result<(), String> {
@@ -1251,9 +1260,10 @@ pub fn fetch_changes(
     repo: &Repository,
     ssh_key_path: Option<&str>,
     ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
 ) -> Result<(), String> {
     // Use git2-based remote operations instead of subprocess
-    crate::remote_ops::fetch_changes(repo, ssh_key_path, ssh_passphrase)
+    crate::remote_ops::fetch_changes(repo, ssh_key_path, ssh_passphrase, https_token)
 }
 
 pub fn get_remote_url(repo: &Repository, name: &str) -> Result<String, String> {
@@ -1951,7 +1961,7 @@ mod tests {
             "https://example.com/repo.git injected",
             "--upload-pack=sh",
         ] {
-            let err = match clone_repository(url, clone_path.to_str().unwrap(), None, None) {
+            let err = match clone_repository(url, clone_path.to_str().unwrap(), None, None, None) {
                 Ok(_) => panic!("expected invalid clone URL to be rejected: {url}"),
                 Err(err) => err,
             };
@@ -2145,6 +2155,7 @@ mod tests {
             clone_path.to_str().unwrap(),
             Some(missing_key.to_str().unwrap()),
             Some("secret-passphrase"),
+            None,
         ) {
             Ok(_) => panic!("clone_repository unexpectedly succeeded"),
             Err(err) => err,
@@ -2180,6 +2191,7 @@ mod tests {
             &seed_repo,
             Some(key_path.to_str().unwrap()),
             Some("ignored-passphrase"),
+            None,
         )
         .unwrap();
         let branch_name = seed_repo.head().unwrap().shorthand().unwrap().to_string();
@@ -2190,6 +2202,7 @@ mod tests {
             clone_path.to_str().unwrap(),
             Some(key_path.to_str().unwrap()),
             Some("ignored-passphrase"),
+            None,
         )
         .unwrap();
 
@@ -2222,6 +2235,7 @@ mod tests {
             &local_repo,
             Some(key_path.to_str().unwrap()),
             Some("ignored-passphrase"),
+            None,
         )
         .unwrap();
 
@@ -2242,6 +2256,7 @@ mod tests {
             &peer_repo,
             Some(key_path.to_str().unwrap()),
             Some("ignored-passphrase"),
+            None,
         )
         .unwrap();
 
@@ -2292,6 +2307,7 @@ mod tests {
             &local_repo,
             Some(key_path.to_str().unwrap()),
             Some("ignored-passphrase"),
+            None,
         )
         .unwrap();
 
@@ -2391,7 +2407,7 @@ mod tests {
         .unwrap();
 
         // Run pull_changes
-        let result = pull_changes(&local, None, None);
+        let result = pull_changes(&local, None, None, None);
         assert!(result.is_ok(), "pull_changes failed: {:?}", result.err());
 
         // Verify local has the commit
@@ -2636,6 +2652,7 @@ mod tests {
             clone_path.to_str().unwrap(),
             None,
             None,
+            None,
         ) {
             Ok(_) => panic!("clone_repository unexpectedly succeeded"),
             Err(err) => err,
@@ -2675,6 +2692,7 @@ mod tests {
         let err = match clone_repository(
             origin_path.to_str().unwrap(),
             clone_path.to_str().unwrap(),
+            None,
             None,
             None,
         ) {

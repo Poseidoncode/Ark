@@ -4,6 +4,8 @@ import type { TagInfo, RemoteInfo } from '../services/git';
 
 export type ViewType = 'changes' | 'history' | 'stashes' | 'conflicts';
 
+export type ModalName = 'clone' | 'settings' | 'branch' | 'tags' | 'remotes' | 'recentRepos' | 'auth';
+
 export const useUIStore = defineStore('ui', () => {
   // View state
   const view = ref<ViewType>('changes');
@@ -27,6 +29,7 @@ export const useUIStore = defineStore('ui', () => {
   const showRecentRepos = ref(false);
   const showTagsModal = ref(false);
   const showRemotesModal = ref(false);
+  const showAuthModal = ref(false);
   
   // Tags and remotes
   const tags = ref<TagInfo[]>([]);
@@ -55,7 +58,7 @@ export const useUIStore = defineStore('ui', () => {
     isMajorOperation.value = major;
   };
 
-  const openModal = (modal: 'clone' | 'settings' | 'branch' | 'tags' | 'remotes' | 'recentRepos') => {
+  const openModal = (modal: ModalName) => {
     closeAllModals();
     switch (modal) {
       case 'clone':
@@ -78,10 +81,13 @@ export const useUIStore = defineStore('ui', () => {
       case 'recentRepos':
         showRecentRepos.value = true;
         break;
+      case 'auth':
+        showAuthModal.value = true;
+        break;
     }
   };
 
-  const closeModal = (modal: 'clone' | 'settings' | 'branch' | 'tags' | 'remotes' | 'recentRepos') => {
+  const closeModal = (modal: ModalName) => {
     switch (modal) {
       case 'clone':
         showCloneModal.value = false;
@@ -101,6 +107,9 @@ export const useUIStore = defineStore('ui', () => {
       case 'recentRepos':
         showRecentRepos.value = false;
         break;
+      case 'auth':
+        showAuthModal.value = false;
+        break;
     }
   };
 
@@ -111,6 +120,7 @@ export const useUIStore = defineStore('ui', () => {
     showTagsModal.value = false;
     showRemotesModal.value = false;
     showRecentRepos.value = false;
+    showAuthModal.value = false;
   };
 
   const setView = (newView: ViewType) => {
@@ -179,6 +189,7 @@ export const useUIStore = defineStore('ui', () => {
     showRecentRepos,
     showTagsModal,
     showRemotesModal,
+    showAuthModal,
     tags,
     remotes,
     newRemoteName,

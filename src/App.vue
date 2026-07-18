@@ -27,6 +27,7 @@ import SettingsModal from './components/SettingsModal.vue';
 import BranchModal from './components/BranchModal.vue';
 import TagsModal from './components/TagsModal.vue';
 import RemotesModal from './components/RemotesModal.vue';
+import AuthModal from './components/AuthModal.vue';
 import ErrorBanner from './components/ErrorBanner.vue';
 import LoadingOverlay from './components/LoadingOverlay.vue';
 import InputModal from './components/InputModal.vue';
@@ -335,6 +336,11 @@ const handlePull = async () => {
   }
 };
 
+const handleOAuthAuthenticated = (_user: { login: string; name: string | null; email: string | null }) => {
+  // Close the auth modal. The toast is already shown by AuthModal.
+  uiStore.closeModal('auth');
+};
+
 const handleFetch = async () => {
   try {
     await withLock('fetch', async () => {
@@ -627,12 +633,13 @@ useKeyboardShortcuts([
     <ErrorBanner />
 
     <!-- Modals -->
-    <div v-if="uiStore.showCloneModal || uiStore.showSettingsModal || uiStore.showBranchModal || uiStore.showTagsModal || uiStore.showRemotesModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4" style="background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);">
+    <div v-if="uiStore.showCloneModal || uiStore.showSettingsModal || uiStore.showBranchModal || uiStore.showTagsModal || uiStore.showRemotesModal || uiStore.showAuthModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4" style="background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);">
       <CloneModal v-if="uiStore.showCloneModal" @browse="handleBrowseClonePath" @clone="handleCloneRepo" />
       <SettingsModal v-if="uiStore.showSettingsModal" />
       <BranchModal v-if="uiStore.showBranchModal" @checkout="(name) => gitService.checkoutBranch(name).then(() => { uiStore.closeModal('branch'); repoStore.refreshRepo(); }).catch(err => { uiStore.setError(String(err)); })" @createBranch="() => gitService.createBranch(uiStore.newBranchName).then(() => { uiStore.setNewBranchName(''); uiStore.closeModal('branch'); repoStore.refreshRepo(); }).catch(err => { uiStore.setError(String(err)); })" />
       <TagsModal v-if="uiStore.showTagsModal" />
       <RemotesModal v-if="uiStore.showRemotesModal" />
+      <AuthModal v-if="uiStore.showAuthModal" @close="uiStore.closeModal('auth')" @authenticated="handleOAuthAuthenticated" />
     </div>
 
     <!-- Main Content Area -->

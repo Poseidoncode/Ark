@@ -1,6 +1,7 @@
 
 mod credential_store;
 mod git_operations;
+mod oauth;
 mod remote_ops;
 mod models;
 
@@ -12,6 +13,7 @@ use models::{
 use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Listener, Manager, State};
 
@@ -414,6 +416,11 @@ fn get_ssh_credentials(settings: &Settings) -> AppResult<(Option<String>, Option
     Ok((ssh_key, ssh_passphrase))
 }
 
+/// Retrieve the stored GitHub OAuth token from the OS keychain.
+fn get_https_token() -> Option<String> {
+    CredentialStore::get_oauth_token().ok().flatten()
+}
+
 fn save_settings_to_disk(state: &AppState, app_handle: &tauri::AppHandle) -> AppResult<()> {
     let path = get_settings_path(app_handle)?;
     save_settings_payload_to_path(
@@ -494,6 +501,7 @@ async fn clone_repository(
         let state_lock = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         get_ssh_credentials(&state_lock.settings)?
     };
+    let https_token = get_https_token();
 
     let url = options.url.clone();
     let path = options.path.clone();
@@ -506,6 +514,7 @@ async fn clone_repository(
             &repo_path,
             ssh_key.as_deref(),
             ssh_pass.as_deref(),
+            https_token.as_deref(),
         )
     })
     .await
@@ -637,6 +646,7 @@ fn get_diff(state: State<'_, App>, file_path: Option<String>) -> AppResult<Vec<D
 
 #[tauri::command]
 async fn push_changes(state: State<'_, App>) -> AppResult<()> {
+    let https_token = get_https_token();
     let (path, ssh_key, ssh_pass) = {
         let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
@@ -653,6 +663,7 @@ async fn push_changes(state: State<'_, App>) -> AppResult<()> {
             &repo,
             ssh_key.as_deref(),
             ssh_pass.as_deref(),
+            https_token.as_deref(),
         ).map_err(|e| AppError::Git(e.into()))
     })
     .await
@@ -661,6 +672,7 @@ async fn push_changes(state: State<'_, App>) -> AppResult<()> {
 
 #[tauri::command]
 async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
+    let https_token = get_https_token();
     let (path, ssh_key, ssh_pass) = {
         let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
@@ -677,6 +689,7 @@ async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
             &repo,
             ssh_key.as_deref(),
             ssh_pass.as_deref(),
+            https_token.as_deref(),
         ).map_err(|e| AppError::Git(e.into()))
     })
     .await
@@ -685,6 +698,7 @@ async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
 
 #[tauri::command]
 async fn fetch_changes(state: State<'_, App>) -> AppResult<()> {
+    let https_token = get_https_token();
     let (path, ssh_key, ssh_pass) = {
         let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
         let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
@@ -701,6 +715,7 @@ async fn fetch_changes(state: State<'_, App>) -> AppResult<()> {
             &repo,
             ssh_key.as_deref(),
             ssh_pass.as_deref(),
+            https_token.as_deref(),
         ).map_err(|e| AppError::Git(e.into()))
     })
     .await
@@ -1022,6 +1037,104 @@ fn remove_remote(state: State<'_, App>, name: String) -> AppResult<()> {
     git_operations::remove_remote(repo, &name).map_err(|e| AppError::Git(e.into()))
 }
 
+// ── GitHub OAuth Device Flow commands ─────────────────────────────
+
+/// Cancellation flag for the OAuth polling loop. The frontend can set this
+/// to `true` via `oauth_cancel_polling` to abort a running poll.
+static OAUTH_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Check if GitHub OAuth is enabled (client ID was configured at build time).
+#[tauri::command]
+fn oauth_is_enabled() -> bool {
+    oauth::oauth_enabled()
+}
+
+/// Step 1: Start the OAuth Device Flow by requesting a device code.
+/// Returns the user code and verification URI to display to the user.
+#[tauri::command]
+async fn oauth_start_device_flow() -> AppResult<oauth::DeviceFlowInfo> {
+    tauri::async_runtime::spawn_blocking(|| {
+        oauth::request_device_code().map_err(|e| AppError::Git(GitError::Other(e.to_string())))
+    })
+    .await
+    .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
+}
+
+/// Step 2: Poll for the access token. This blocks until the user approves
+/// or the device code expires. The frontend should call this after displaying
+/// the user code and opening the browser.
+#[tauri::command]
+async fn oauth_poll_for_token(
+    device_code: String,
+    interval: u64,
+    expires_in: u64,
+) -> AppResult<oauth::GitHubUser> {
+    // Reset cancellation flag at the start of a new poll
+    OAUTH_CANCEL.store(false, Ordering::SeqCst);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = oauth::poll_for_token(&device_code, interval, expires_in, &|| {
+            OAUTH_CANCEL.load(Ordering::SeqCst)
+        })
+            .map_err(|e| AppError::Git(GitError::AuthenticationFailed(e.to_string())))?;
+
+        // Store the token in the OS keychain
+        CredentialStore::set_oauth_token(&token)
+            .map_err(|e| AppError::Config(e.to_string()))?;
+
+        // Fetch the user's profile
+        let user = oauth::fetch_github_user(&token)
+            .map_err(|e| AppError::Git(GitError::Other(e.to_string())))?;
+
+        Ok(user)
+    })
+    .await
+    .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
+}
+
+/// Cancel an in-progress OAuth polling loop. The `oauth_poll_for_token`
+/// command checks this flag between poll iterations and aborts if set.
+#[tauri::command]
+fn oauth_cancel_polling() {
+    OAUTH_CANCEL.store(true, Ordering::SeqCst);
+}
+
+/// Check if a GitHub OAuth token is currently stored.
+/// Returns the GitHub username if authenticated, or null if not.
+/// Only deletes the stored token if GitHub reports it is invalid (auth error);
+/// transient network errors preserve the token.
+#[tauri::command]
+async fn oauth_get_status() -> AppResult<Option<oauth::GitHubUser>> {
+    let token = get_https_token();
+    if let Some(token) = token {
+        // Validate the token by fetching the user profile
+        tauri::async_runtime::spawn_blocking(move || {
+            match oauth::fetch_github_user(&token) {
+                Ok(user) => Ok(Some(user)),
+                Err(e) => {
+                    // Only delete the token on authentication errors (401/403).
+                    // Network errors, timeouts, and parse errors should preserve
+                    // the token so the user isn't silently signed out.
+                    if matches!(e, oauth::OAuthError::Auth) {
+                        let _ = CredentialStore::delete_oauth_token();
+                    }
+                    Ok(None)
+                }
+            }
+        })
+        .await
+        .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
+    } else {
+        Ok(None)
+    }
+}
+
+/// Sign out: delete the stored OAuth token from the keychain.
+#[tauri::command]
+fn oauth_sign_out() -> AppResult<()> {
+    CredentialStore::delete_oauth_token().map_err(AppError::Config)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1107,6 +1220,13 @@ pub fn run() {
             list_remotes,
             add_remote,
             remove_remote,
+            // OAuth
+            oauth_is_enabled,
+            oauth_start_device_flow,
+            oauth_poll_for_token,
+            oauth_cancel_polling,
+            oauth_get_status,
+            oauth_sign_out,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
