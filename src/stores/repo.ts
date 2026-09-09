@@ -46,30 +46,28 @@ export const useRepoStore = defineStore('repo', () => {
 
   const refreshRepo = async () => {
     if (!repoInfo.value) return;
-    try {
-      // listStashes is uncached and always hits the backend, so a transient
-      // failure there must not break the rest of the refresh (status, branches,
-      // conflicts all still degrade to cache). Treat stashes as best-effort.
-      const [status, branchList, stashList, conflictList, info] = await Promise.all([
-        gitService.getStatus(),
-        gitService.getBranches(),
-        gitService.listStashes().catch((e) => {
-          console.error('Failed to list stashes:', e);
-          return [] as StashInfo[];
-        }),
-        gitService.getConflicts(),
-        gitService.getCurrentRepoInfo()
-      ]);
-      fileStatuses.value = status;
-      branches.value = branchList;
-      stashes.value = stashList.slice(0, MAX_STASHES);
-      conflicts.value = conflictList;
-      if (info) {
-        repoInfo.value = info;
-      }
-    } catch (err) {
-      console.error('Failed to refresh repo:', err);
-      throw err;
+    const results = await Promise.allSettled([
+      gitService.getStatus(),
+      gitService.getBranches(),
+      gitService.listStashes(),
+      gitService.getConflicts(),
+      gitService.getCurrentRepoInfo()
+    ]);
+    if (results[0].status === 'fulfilled') fileStatuses.value = results[0].value;
+    else console.error('Failed to get status:', results[0].reason);
+    if (results[1].status === 'fulfilled') branches.value = results[1].value;
+    else console.error('Failed to get branches:', results[1].reason);
+    if (results[2].status === 'fulfilled') stashes.value = results[2].value.slice(0, MAX_STASHES);
+    else console.error('Failed to list stashes:', results[2].reason);
+    if (results[3].status === 'fulfilled') conflicts.value = results[3].value;
+    else console.error('Failed to get conflicts:', results[3].reason);
+    if (results[4].status === 'fulfilled' && results[4].value) {
+      repoInfo.value = results[4].value;
+    } else if (results[4].status === 'rejected') {
+      console.error('Failed to get repo info:', results[4].reason);
+    }
+    if (results.every((r) => r.status === 'rejected')) {
+      throw results[0].status === 'rejected' ? results[0].reason : new Error('Refresh failed');
     }
   };
 

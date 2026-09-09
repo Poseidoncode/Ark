@@ -1,16 +1,5 @@
 import { ref, type Ref } from 'vue';
 
-/**
- * Creates a debounced version of an async function.
- *
- * Multiple rapid calls within the delay window collapse into a single
- * invocation. If a call is already in-flight, the latest call is queued
- * and executed after the current one completes, ensuring the most
- * recent state is always fetched.
- *
- * @param fn - The async function to debounce
- * @param delay - Debounce window in milliseconds
- */
 export function useDebouncedAsync<T>(
   fn: () => Promise<T>,
   delay: number = 300,
@@ -29,15 +18,19 @@ export function useDebouncedAsync<T>(
     inflight.value = true;
     try {
       return await fn();
+    } catch (err) {
+      if (pending) {
+        pending = false;
+      }
+      throw err;
     } finally {
       executing = false;
       inflight.value = false;
       if (pending) {
         pending = false;
-        // Small delay to batch the pending call
         timer = setTimeout(() => {
           timer = null;
-          execute();
+          execute().catch((e) => console.error('Debounced follow-up failed:', e));
         }, 50);
       }
     }
@@ -47,10 +40,10 @@ export function useDebouncedAsync<T>(
     if (timer) {
       clearTimeout(timer);
     }
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       timer = setTimeout(() => {
         timer = null;
-        execute().then(resolve);
+        execute().then(resolve, reject);
       }, delay);
     });
   };

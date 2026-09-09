@@ -55,10 +55,10 @@ window.addEventListener('unhandledrejection', (event) => {
   event.preventDefault();
 });
 
-// Performance monitoring
+// Performance monitoring (dev only to avoid prod noise/timers)
 const observePerformance = () => {
+  if (!import.meta.env.DEV) return;
   if ('PerformanceObserver' in window) {
-    // Observe long tasks
     try {
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
@@ -74,8 +74,9 @@ const observePerformance = () => {
   }
 };
 
-// Memory monitoring (if available)
+// Memory monitoring (dev only)
 const logMemoryUsage = () => {
+  if (!import.meta.env.DEV) return;
   if ('memory' in performance) {
     const memory = (performance as unknown as { memory: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;
     console.log(`Memory: used ${(memory.usedJSHeapSize / 1024 / 1024).toFixed(2)}MB / ${(memory.jsHeapSizeLimit / 1024 / 1024).toFixed(2)}MB`);
@@ -84,9 +85,8 @@ const logMemoryUsage = () => {
 
 // Initialize performance monitoring
 observePerformance();
-setInterval(logMemoryUsage, 30000);
-if (import.meta.env.PROD) {
-  console.log("Performance monitoring active in production");
+if (import.meta.env.DEV) {
+  setInterval(logMemoryUsage, 30000);
 }
 
 // Register virtual scroller

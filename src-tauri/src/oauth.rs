@@ -259,8 +259,11 @@ pub fn poll_for_token(
     expires_in: u64,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<String, OAuthError> {
-    let poll_interval = Duration::from_secs(interval.max(1));
-    let deadline = std::time::Instant::now() + Duration::from_secs(expires_in);
+    if device_code.trim().is_empty() || device_code.len() > 1024 {
+        return Err(OAuthError::Other("Invalid device code".to_string()));
+    }
+    let poll_interval = Duration::from_secs(interval.clamp(1, 10));
+    let deadline = std::time::Instant::now() + Duration::from_secs(expires_in.clamp(60, 1800));
     let mut current_interval = poll_interval;
 
     loop {
@@ -294,8 +297,7 @@ pub fn poll_for_token(
                 std::thread::sleep(current_interval);
             }
             Some("slow_down") => {
-                // GitHub asked us to slow down; increase interval by 5 seconds
-                current_interval = current_interval + Duration::from_secs(5);
+                current_interval = (current_interval + Duration::from_secs(5)).min(Duration::from_secs(30));
                 std::thread::sleep(current_interval);
             }
             Some("expired_token") => return Err(OAuthError::Expired),

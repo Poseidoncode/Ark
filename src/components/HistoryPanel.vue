@@ -169,12 +169,21 @@ const onCommitContextMenu = (event: MouseEvent, commit: CommitInfo) => {
         try {
           let url = await gitService.getRemoteUrl("origin");
           if (url) {
+            let httpsUrl = "";
             if (url.startsWith('git@github.com:')) {
-               url = url.replace('git@github.com:', 'https://github.com/').replace(/\.git$/, '');
-            } else if (url.startsWith('https://')) {
-               url = url.replace(/\.git$/, '');
+               httpsUrl = url.replace('git@github.com:', 'https://github.com/').replace(/\.git$/, '');
+            } else if (url.startsWith('https://github.com/') || url.startsWith('http://github.com/')) {
+               httpsUrl = url.replace(/\.git$/, '');
+            } else {
+              toast.error("Remote is not a GitHub URL", { title: "Error" });
+              return;
             }
-            await openUrl(`${url}/commit/${commit.sha}`);
+            const parsed = new URL(httpsUrl);
+            if (parsed.hostname.toLowerCase() !== 'github.com') {
+              toast.error("Remote is not a GitHub URL", { title: "Error" });
+              return;
+            }
+            await openUrl(`${parsed.origin}${parsed.pathname.replace(/\/$/, '')}/commit/${commit.sha}`);
           } else {
             toast.error("No origin remote found", { title: "Error" });
           }

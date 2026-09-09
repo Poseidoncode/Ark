@@ -403,7 +403,12 @@ fn load_settings_from_path(path: &Path) -> AppResult<Settings> {
         return migrate_legacy_passphrase(path, legacy);
     }
 
-    Ok(default_settings())
+    let backup = path.with_extension("json.corrupt");
+    let _ = std::fs::copy(path, &backup);
+    Err(AppError::Config(format!(
+        "Settings file is corrupt and was backed up to {}. Delete it or restore a valid file.",
+        backup.display()
+    )))
 }
 
 fn get_ssh_credentials(settings: &Settings) -> AppResult<(Option<String>, Option<String>)> {
@@ -658,7 +663,7 @@ async fn push_changes(state: State<'_, App>) -> AppResult<()> {
     };
 
     tauri::async_runtime::spawn_blocking(move || {
-        let repo = git_operations::open_repository(path.to_str().ok_or("Invalid path")?)?;
+        let repo = git_operations::open_repository_by_path(&path)?;
         git_operations::push_changes(
             &repo,
             ssh_key.as_deref(),
@@ -684,7 +689,7 @@ async fn pull_changes(state: State<'_, App>) -> AppResult<()> {
     };
 
     tauri::async_runtime::spawn_blocking(move || {
-        let repo = git_operations::open_repository(path.to_str().ok_or("Invalid path")?)?;
+        let repo = git_operations::open_repository_by_path(&path)?;
         git_operations::pull_changes(
             &repo,
             ssh_key.as_deref(),
@@ -710,7 +715,7 @@ async fn fetch_changes(state: State<'_, App>) -> AppResult<()> {
     };
 
     tauri::async_runtime::spawn_blocking(move || {
-        let repo = git_operations::open_repository(path.to_str().ok_or("Invalid path")?)?;
+        let repo = git_operations::open_repository_by_path(&path)?;
         git_operations::fetch_changes(
             &repo,
             ssh_key.as_deref(),
@@ -891,9 +896,20 @@ fn reveal_in_finder(state: State<'_, App>, path: String) -> AppResult<()> {
             .map_err(|e| AppError::Io(format!("Failed to resolve repository path: {}", e)))?;
 
         let target = std::path::Path::new(&path);
-        let canonical = target
-            .canonicalize()
-            .map_err(|e| AppError::Io(format!("Failed to resolve path '{}': {}", path, e)))?;
+        let canonical = match target.canonicalize() {
+            Ok(c) => c,
+            Err(_) => {
+                if let Some(parent) = target.parent() {
+                    let canon_parent = parent.canonicalize().map_err(|e| AppError::Io(format!("Failed to resolve parent of '{}': {}", path, e)))?;
+                    if !canon_parent.starts_with(&canonical_workdir) {
+                        return Err(AppError::Git(GitError::PermissionDenied("Path is outside the repository".to_string())));
+                    }
+                    canon_parent.join(target.file_name().unwrap_or_default())
+                } else {
+                    return Err(AppError::Io(format!("Failed to resolve path '{}'", path)));
+                }
+            }
+        };
 
         if !canonical.starts_with(&canonical_workdir) {
             return Err(AppError::Git(GitError::PermissionDenied(
@@ -939,6 +955,30 @@ fn add_to_gitignore(state: State<'_, App>, file_path: String) -> AppResult<()> {
     let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
     git_operations::add_to_gitignore(repo, &file_path).map_err(|e| AppError::Git(e.into()))
+}
+
+#[tauri::command]
+fn resolve_repo_file(state: State<'_, App>, file_path: String) -> AppResult<String> {
+    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    let workdir = repo.workdir().ok_or(AppError::Git(GitError::InvalidRef("No working directory found".to_string())))?;
+    let input = if std::path::Path::new(&file_path).is_absolute() {
+        match std::path::Path::new(&file_path).strip_prefix(workdir) {
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => {
+                let canonical_workdir = workdir.canonicalize().map_err(|e| AppError::Io(e.to_string()))?;
+                let canonical = std::path::Path::new(&file_path).canonicalize().map_err(|e| AppError::Io(e.to_string()))?;
+                if !canonical.starts_with(&canonical_workdir) {
+                    return Err(AppError::Git(GitError::PermissionDenied("Path is outside the repository".to_string())));
+                }
+                return Ok(canonical.to_string_lossy().into_owned());
+            }
+        }
+    } else {
+        file_path
+    };
+    let validated = git_operations::resolve_repo_relative_path(repo, &input).map_err(|e| AppError::Git(e.into()))?;
+    Ok(validated.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -1209,6 +1249,7 @@ pub fn run() {
             reveal_in_finder,
             add_to_gitignore,
             read_file,
+            resolve_repo_file,
             create_tag,
             drop_stash,
             apply_stash,

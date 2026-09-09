@@ -13,6 +13,10 @@ pub fn open_repository(path: &str) -> Result<Repository, String> {
     Repository::open(path).map_err(|e| format!("Failed to open repository: {}", e))
 }
 
+pub fn open_repository_by_path(path: &Path) -> Result<Repository, String> {
+    Repository::open(path).map_err(|e| format!("Failed to open repository: {}", e))
+}
+
 /// Executes a git command safely.
 /// Prevents shell injection by using Command::args directly.
 /// Sanitizes critical inputs like URLs and branch names in caller functions.
@@ -58,7 +62,6 @@ fn run_git_command(
 }
 
 fn is_safe_git_arg(arg: &str) -> bool {
-    // Prevent common shell/command injection patterns and flag injection
     !arg.is_empty()
         && !arg.starts_with('-')
         && !arg.contains(' ')
@@ -70,6 +73,37 @@ fn is_safe_git_arg(arg: &str) -> bool {
         && !arg.contains('\\')
         && !arg.contains('\n')
         && !arg.contains('\r')
+}
+
+fn is_valid_ref_name(name: &str) -> bool {
+    if !is_safe_git_arg(name) {
+        return false;
+    }
+    if name.len() > 250 || name == "@" {
+        return false;
+    }
+    if name.contains("..")
+        || name.contains("@{")
+        || name.contains('~')
+        || name.contains('^')
+        || name.contains(':')
+        || name.contains('?')
+        || name.contains('*')
+        || name.contains('[')
+        || name.contains('\0')
+    {
+        return false;
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.ends_with('.') {
+        return false;
+    }
+    if name.contains("//") || name.contains("/.") || name.ends_with(".lock") {
+        return false;
+    }
+    if name.split('/').any(|c| c.is_empty() || c == "." || c == ".." || c.ends_with(".lock")) {
+        return false;
+    }
+    true
 }
 
 /// Validates that a remote URL is safe for use with git2 and transport operations.
@@ -355,6 +389,10 @@ fn validate_workdir_entries(repo: &Repository) -> Result<(), String> {
     visit(repo, workdir, workdir)
 }
 
+pub fn resolve_repo_relative_path(repo: &Repository, path: &str) -> Result<PathBuf, String> {
+    validate_repo_path(repo, path)
+}
+
 pub fn stage_files(repo: &Repository, paths: Vec<String>) -> Result<StageResult, String> {
     let mut index = repo
         .index()
@@ -441,16 +479,23 @@ pub fn unstage_files(repo: &Repository, paths: Vec<String>) -> Result<(), String
 }
 
 pub fn create_safety_ref(repo: &Repository, action_name: &str) -> Result<(), String> {
+    if !action_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || action_name.is_empty()
+        || action_name.len() > 64
+    {
+        return Err("Invalid safety ref action".to_string());
+    }
     let head = match repo.head() {
         Ok(h) => h,
-        Err(_) => return Ok(()), // No HEAD yet, nothing to snapshot
+        Err(_) => return Ok(()),
     };
     let commit = head.peel_to_commit().map_err(|e| e.to_string())?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Use a specific namespace for safety refs
     let ref_name = format!("refs/safety/{}/{}", action_name, timestamp);
     repo.reference(
         &ref_name,
@@ -459,7 +504,28 @@ pub fn create_safety_ref(repo: &Repository, action_name: &str) -> Result<(), Str
         &format!("safety snapshot before {}", action_name),
     )
     .map_err(|e| format!("Failed to create safety ref: {}", e))?;
+    prune_safety_refs(repo, action_name, 20);
     Ok(())
+}
+
+fn prune_safety_refs(repo: &Repository, action_name: &str, keep: usize) {
+    let prefix = format!("refs/safety/{}/", action_name);
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(refs) = repo.references_glob(&format!("{}*", prefix)) {
+        for r in refs.flatten() {
+            if let Some(n) = r.name() {
+                names.push(n.to_string());
+            }
+        }
+    }
+    names.sort();
+    if names.len() > keep {
+        for old in names.iter().take(names.len() - keep) {
+            if let Ok(mut r) = repo.find_reference(old) {
+                let _ = r.delete();
+            }
+        }
+    }
 }
 
 pub fn amend_last_commit(repo: &Repository, message: &str) -> Result<String, String> {
@@ -602,8 +668,10 @@ pub fn discard_changes(repo: &Repository, path: &str) -> Result<(), String> {
             if metadata.file_type().is_symlink() || metadata.is_file() {
                 fs::remove_file(full_path).map_err(|e| format!("Failed to delete file: {}", e))?;
             } else if metadata.is_dir() {
-                fs::remove_dir_all(full_path)
-                    .map_err(|e| format!("Failed to delete dir: {}", e))?;
+                return Err(format!(
+                    "Refusing to delete directory '{}': confirm recursive delete explicitly",
+                    path
+                ));
             }
         }
     }
@@ -629,7 +697,7 @@ pub fn discard_all_changes(repo: &Repository) -> Result<(), String> {
         }
     }
 
-    let _ = create_safety_ref(repo, "discard-all");
+    create_safety_ref(repo, "discard-all").map_err(|e| format!("Safety snapshot failed, refusing discard: {}", e))?;
     let mut checkout_opts = git2::build::CheckoutBuilder::new();
     checkout_opts.force();
     repo.checkout_head(Some(&mut checkout_opts))
@@ -637,7 +705,7 @@ pub fn discard_all_changes(repo: &Repository) -> Result<(), String> {
 }
 
 pub fn create_branch(repo: &Repository, name: &str, start_sha: Option<&str>) -> Result<(), String> {
-    if !is_safe_git_arg(name) {
+    if !is_valid_ref_name(name) {
         return Err("Invalid branch name".to_string());
     }
 
@@ -815,7 +883,7 @@ pub fn get_branches(repo: &Repository) -> Result<Vec<BranchInfo>, String> {
 }
 
 pub fn checkout_branch(repo: &Repository, name: &str) -> Result<(), String> {
-    if !is_safe_git_arg(name) {
+    if !is_valid_ref_name(name) {
         return Err("Invalid branch name".to_string());
     }
     let obj = repo
@@ -914,7 +982,15 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
 
     let mut opts = DiffOptions::new();
     if let Some(p) = path {
-        opts.pathspec(p);
+        if p.len() > 4096 || p.contains('\0') || p.contains('\n') || p.contains('\r') {
+            return Err("Invalid diff path".to_string());
+        }
+        let full = validate_repo_path(repo, p)?;
+        let workdir = repo.workdir().ok_or("No working directory found")?;
+        let rel = full
+            .strip_prefix(workdir)
+            .map_err(|_| "Diff path is outside the repository".to_string())?;
+        opts.pathspec(rel.to_string_lossy().replace('\\', "/"));
     }
 
     let diff = if let Some(tree) = head_tree {
@@ -1060,22 +1136,42 @@ pub fn stash_drop(repo: &mut Repository, index: usize) -> Result<(), String> {
 }
 
 pub fn stash_branch(repo: &mut Repository, index: usize, branch_name: &str) -> Result<(), String> {
-    if !is_safe_git_arg(branch_name) {
+    if !is_valid_ref_name(branch_name) {
         return Err("Invalid branch name".to_string());
     }
     create_safety_ref(repo, "stash-branch")?;
 
-    // Capture the current HEAD commit OID as the parent for the new branch.
-    // We extract the OID before any mutable borrows to satisfy the borrow checker.
-    // `git stash branch` creates a branch from the commit the stash was originally created on,
-    // then applies the stash changes on top. We approximate by using current HEAD as parent.
+    // Use the stash commit's first parent as the branch base, matching
+    // `git stash branch` semantics instead of current HEAD.
     let parent_oid = {
-        let head = repo
-            .head()
-            .map_err(|e| format!("Failed to get HEAD: {}", e))?;
-        head.peel_to_commit()
-            .map_err(|e| format!("Failed to peel HEAD to commit: {}", e))?
-            .id()
+        let mut target_id: Option<git2::Oid> = None;
+        repo.stash_foreach(|i, _msg, id| {
+            if i == index {
+                target_id = Some(*id);
+                return false;
+            }
+            true
+        })
+        .map_err(|e| format!("Failed to inspect stash: {}", e))?;
+        let mut base_oid: Option<git2::Oid> = None;
+        if let Some(sid) = target_id {
+            if let Ok(c) = repo.find_commit(sid) {
+                if c.parent_count() > 0 {
+                    base_oid = c.parent_id(0).ok();
+                }
+            }
+        }
+        match base_oid {
+            Some(oid) => oid,
+            None => {
+                let head = repo
+                    .head()
+                    .map_err(|e| format!("Failed to get HEAD: {}", e))?;
+                head.peel_to_commit()
+                    .map_err(|e| format!("Failed to peel HEAD to commit: {}", e))?
+                    .id()
+            }
+        }
     };
 
     // Apply the stash to the working directory
@@ -1127,8 +1223,8 @@ pub fn stash_branch(repo: &mut Repository, index: usize, branch_name: &str) -> R
     repo.set_head(&format!("refs/heads/{}", branch_name))
         .map_err(|e| format!("Failed to set HEAD: {}", e))?;
 
-    // Drop the stash after successful branch creation
-    let _ = repo.stash_drop(index);
+    repo.stash_drop(index)
+        .map_err(|e| format!("Failed to drop stash after branch creation: {}", e))?;
 
     Ok(())
 }
@@ -1173,6 +1269,14 @@ pub fn get_conflicts(repo: &Repository) -> Result<Vec<ConflictInfo>, String> {
 }
 
 pub fn resolve_conflict(repo: &Repository, path: &str, use_ours: bool) -> Result<(), String> {
+    // H1 fix: validate path stays inside workdir before any fs/index write.
+    let full_path = validate_repo_path(repo, path)?;
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let relative_path = full_path
+        .strip_prefix(workdir)
+        .map_err(|_| format!("Validated path '{}' is outside the repository", path))?;
+    let relative_owned = relative_path.to_path_buf();
+    let file_path = full_path;
     let mut index = repo
         .index()
         .map_err(|e| format!("Failed to get index: {}", e))?;
@@ -1210,8 +1314,7 @@ pub fn resolve_conflict(repo: &Repository, path: &str, use_ours: bool) -> Result
         return Err(format!("Failed to resolve '{}': conflict not found", path));
     }
 
-    let workdir = repo.workdir().ok_or("No working directory found")?;
-    let file_path = workdir.join(path);
+    // file_path/relative_path already validated at function entry.
 
     match selected_blob_id {
         Some(blob_id) => {
@@ -1236,12 +1339,12 @@ pub fn resolve_conflict(repo: &Repository, path: &str, use_ours: bool) -> Result
     }
 
     index
-        .remove_path(Path::new(path))
+        .remove_path(&relative_owned)
         .map_err(|e| format!("Failed to clear conflict: {}", e))?;
 
     if selected_blob_id.is_some() {
         index
-            .add_path(Path::new(path))
+            .add_path(&relative_owned)
             .map_err(|e| format!("Failed to resolve: {}", e))?;
     }
 
@@ -1274,7 +1377,7 @@ pub fn get_remote_url(repo: &Repository, name: &str) -> Result<String, String> {
 }
 
 pub fn set_remote_url(repo: &Repository, name: &str, url: &str) -> Result<(), String> {
-    if !is_safe_git_arg(name) {
+    if !is_valid_ref_name(name) {
         return Err("Invalid remote name".to_string());
     }
     if !is_safe_remote_url(url) {
@@ -1286,12 +1389,13 @@ pub fn set_remote_url(repo: &Repository, name: &str, url: &str) -> Result<(), St
 }
 
 pub fn add_to_gitignore(repo: &Repository, file_path: &str) -> Result<(), String> {
-    // Validate path stays within repo; result intentionally unused for security check
     let _full_path = validate_repo_path(repo, file_path)?;
 
-    // Reject paths containing newlines which could corrupt .gitignore format
-    if file_path.contains('\n') || file_path.contains('\r') {
+    if file_path.contains('\n') || file_path.contains('\r') || file_path.contains('\0') {
         return Err("Invalid file path: contains newline characters".to_string());
+    }
+    if file_path.starts_with('!') || file_path.starts_with('#') {
+        return Err("Invalid file path: must not start with '!' or '#'".to_string());
     }
 
     let workdir = repo.workdir().ok_or("No working directory found")?;
@@ -1355,7 +1459,7 @@ pub fn read_file(repo: &Repository, file_path: &str) -> Result<String, String> {
 }
 
 pub fn create_tag(repo: &Repository, name: &str, message: &str, sha: &str) -> Result<(), String> {
-    if !is_safe_git_arg(name) {
+    if !is_valid_ref_name(name) {
         return Err("Invalid tag name".to_string());
     }
     
@@ -1492,18 +1596,19 @@ pub fn list_tags(repo: &Repository) -> Result<Vec<TagInfo>, String> {
 }
 
 pub fn delete_tag(repo: &Repository, name: &str) -> Result<(), String> {
-    if !is_safe_git_arg(name) {
+    if !is_valid_ref_name(name) {
         return Err("Invalid tag name".to_string());
     }
 
-    // Try to delete the tag reference
     let tag_ref = format!("refs/tags/{}", name);
-    if let Ok(reference) = repo.find_reference(&tag_ref) {
-        let mut ref_mut = reference;
-        ref_mut.delete().map_err(|e| format!("Failed to delete tag: {}", e))?;
+    match repo.find_reference(&tag_ref) {
+        Ok(reference) => {
+            let mut ref_mut = reference;
+            ref_mut.delete().map_err(|e| format!("Failed to delete tag: {}", e))?;
+            Ok(())
+        }
+        Err(_) => Err(format!("Tag '{}' not found", name)),
     }
-
-    Ok(())
 }
 
 pub fn list_remotes(repo: &Repository) -> Result<Vec<RemoteInfo>, String> {
@@ -1532,7 +1637,7 @@ pub fn list_remotes(repo: &Repository) -> Result<Vec<RemoteInfo>, String> {
 }
 
 pub fn add_remote(repo: &Repository, name: &str, url: &str) -> Result<(), String> {
-    if !is_safe_git_arg(name) {
+    if !is_valid_ref_name(name) {
         return Err("Invalid remote name".to_string());
     }
 
@@ -1547,7 +1652,7 @@ pub fn add_remote(repo: &Repository, name: &str, url: &str) -> Result<(), String
 }
 
 pub fn remove_remote(repo: &Repository, name: &str) -> Result<(), String> {
-    if !is_safe_git_arg(name) {
+    if !is_valid_ref_name(name) {
         return Err("Invalid remote name".to_string());
     }
 

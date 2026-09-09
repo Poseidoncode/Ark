@@ -145,7 +145,7 @@ class GitService {
    * Clone repository
    */
   async cloneRepository(url: string, path: string): Promise<string> {
-    this.invalidate('repo:');
+    this.invalidate();
     return await invoke("clone_repository", { options: { url, path } });
   }
 
@@ -153,7 +153,7 @@ class GitService {
    * Open repository with caching
    */
   async openRepository(path: string): Promise<RepositoryInfo> {
-    this.invalidate('repo:');
+    this.invalidate();
     return await invoke("open_repository", { path });
   }
 
@@ -401,6 +401,14 @@ class GitService {
    */
   async addToGitignore(filePath: string): Promise<void> {
     return await invoke("add_to_gitignore", { filePath });
+  }
+
+  /**
+   * Resolve a repo-relative path to a validated absolute path.
+   * Must be called before opening files with the OS.
+   */
+  async resolveRepoFile(filePath: string): Promise<string> {
+    return await invoke("resolve_repo_file", { filePath });
   }
 
   /**

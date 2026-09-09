@@ -51,24 +51,22 @@ const onConflictContextMenu = (event: MouseEvent, conflict: ConflictInfo) => {
     {
       label: 'Reveal in Finder/Explorer',
       action: async () => {
-        if (repoStore.repoInfo) {
-          try {
-            await gitService.revealInFinder(`${repoStore.repoInfo.path}/${conflict.path}`);
-          } catch (e) {
-            uiStore.setError(String(e));
-          }
+        try {
+          const abs = await gitService.resolveRepoFile(conflict.path);
+          await gitService.revealInFinder(abs);
+        } catch (e) {
+          uiStore.setError(String(e));
         }
       }
     },
     {
       label: 'Open in Editor',
       action: async () => {
-        if (repoStore.repoInfo) {
-          try {
-            await openPath(`${repoStore.repoInfo.path}/${conflict.path}`);
-          } catch (e) {
-            uiStore.setError(String(e));
-          }
+        try {
+          const abs = await gitService.resolveRepoFile(conflict.path);
+          await openPath(abs);
+        } catch (e) {
+          uiStore.setError(String(e));
         }
       }
     }

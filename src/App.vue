@@ -176,9 +176,9 @@ onMounted(async () => {
   try {
     const info = await gitService.getCurrentRepoInfo();
     if (info) {
-      // Clear any stale cache from a previous App lifecycle (HMR, background
-      // resume, etc.) so refreshRepo fetches fresh data from the backend.
-      gitService.invalidate('repo:');
+      // Clear all cached state from a previous App lifecycle (HMR, background
+      // resume, repo switch) so refreshRepo fetches fresh data from the backend.
+      gitService.invalidate();
       repoStore.setRepoInfo(info);
       await refreshRepo();
     }
@@ -569,25 +569,23 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
     {
       label: 'Reveal in Finder/Explorer',
       action: async () => {
-        if (repoStore.repoInfo) {
-          try {
-            await gitService.revealInFinder(`${repoStore.repoInfo.path}/${filePath}`);
-          } catch (e) {
-            uiStore.setError(String(e));
-          }
+        try {
+          const abs = await gitService.resolveRepoFile(filePath);
+          await gitService.revealInFinder(abs);
+        } catch (e) {
+          uiStore.setError(String(e));
         }
       }
     },
     {
       label: 'Open in Editor',
       action: async () => {
-        if (repoStore.repoInfo) {
-          try {
-            const { openPath } = await import('@tauri-apps/plugin-opener');
-            await openPath(`${repoStore.repoInfo.path}/${filePath}`);
-          } catch (e) {
-            uiStore.setError(String(e));
-          }
+        try {
+          const abs = await gitService.resolveRepoFile(filePath);
+          const { openPath } = await import('@tauri-apps/plugin-opener');
+          await openPath(abs);
+        } catch (e) {
+          uiStore.setError(String(e));
         }
       }
     }
@@ -597,8 +595,8 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
 // ── Keyboard shortcuts ──
 useKeyboardShortcuts([
   { key: 's', ctrl: true, action: () => uiStore.view === 'changes' && handleCommit(), description: 'Commit staged changes' },
-  { key: 'p', ctrl: true, action: () => repoStore.repoInfo && handlePush(), description: 'Push changes' },
-  { key: 'P', ctrl: true, action: () => repoStore.repoInfo && handlePull(), description: 'Pull changes' },
+  { key: 'p', ctrl: true, shift: false, action: () => repoStore.repoInfo && handlePush(), description: 'Push changes' },
+  { key: 'p', ctrl: true, shift: true, action: () => repoStore.repoInfo && handlePull(), description: 'Pull changes' },
   { key: 'f', ctrl: true, action: () => repoStore.repoInfo && handleFetch(), description: 'Fetch from remote' },
   { key: 'b', ctrl: true, action: () => repoStore.repoInfo && uiStore.openModal('branch'), description: 'Open branch switcher' },
   { key: 'k', ctrl: true, action: () => repoStore.repoInfo && handleStashSave(), description: 'Stash changes' },

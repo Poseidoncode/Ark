@@ -103,11 +103,9 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
       label: 'Copy File Contents',
       action: async () => {
         try {
-          if (repoStore.repoInfo) {
-            const content = await gitService.readFile(`${repoStore.repoInfo.path}/${file.path}`);
-            await navigator.clipboard.writeText(content);
-            toast.success('File contents copied', { title: 'Copied' });
-          }
+          const content = await gitService.readFile(file.path);
+          await navigator.clipboard.writeText(content);
+          toast.success('File contents copied', { title: 'Copied' });
         } catch (e) {
           uiStore.setError(String(e));
         }
@@ -119,7 +117,8 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
       action: async () => {
         if (repoStore.repoInfo) {
           try {
-            await gitService.revealInFinder(`${repoStore.repoInfo.path}/${file.path}`);
+            const abs = await gitService.resolveRepoFile(file.path);
+            await gitService.revealInFinder(abs);
           } catch (e) {
             uiStore.setError(String(e));
           }
@@ -129,12 +128,11 @@ const onFileContextMenu = (event: MouseEvent, file: FileStatus) => {
     {
       label: 'Open in Editor',
       action: async () => {
-        if (repoStore.repoInfo) {
-          try {
-            await openPath(`${repoStore.repoInfo.path}/${file.path}`);
-          } catch (e) {
-            uiStore.setError(String(e));
-          }
+        try {
+          const abs = await gitService.resolveRepoFile(file.path);
+          await openPath(abs);
+        } catch (e) {
+          uiStore.setError(String(e));
         }
       }
     }
