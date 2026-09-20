@@ -213,16 +213,16 @@ pub fn pull_changes(
         return Err("Cannot pull in detached HEAD state".to_string());
     };
 
-    // Find the upstream branch (origin/<branch_name>)
-    let upstream_name = format!("origin/{}", branch_name);
-    
+    // Find the upstream branch (refs/remotes/origin/<branch_name>)
+    let upstream_name = format!("refs/remotes/origin/{}", branch_name);
+
     // Check if the upstream branch exists (it might not be set up as a tracking branch)
     let upstream_ref = match repo.find_reference(&upstream_name) {
         Ok(ref_) => ref_,
         Err(_) => {
             // No upstream tracking branch - try to use git pull via subprocess
             // This handles the case where the clone doesn't set up tracking
-            return pull_via_subprocess(repo, branch_name, ssh_key_path, https_token);
+            return pull_via_subprocess(repo, branch_name, ssh_key_path, ssh_passphrase, https_token);
         }
     };
 
@@ -284,32 +284,33 @@ pub fn pull_changes(
 }
 
 /// Fallback to subprocess-based pull when there's no tracking branch
-fn pull_via_subprocess(repo: &Repository, branch_name: &str, ssh_key_path: Option<&str>, https_token: Option<&str>) -> Result<(), String> {
+fn pull_via_subprocess(
+    repo: &Repository,
+    branch_name: &str,
+    ssh_key_path: Option<&str>,
+    ssh_passphrase: Option<&str>,
+    https_token: Option<&str>,
+) -> Result<(), String> {
     use std::process::Command;
-    use std::path::Path;
-    
+
     let path = repo
         .workdir()
         .ok_or("No working directory found")?
         .to_str()
         .ok_or("Invalid path")?;
-    
-    // Build SSH command if key path is provided
-    let mut envs = Vec::new();
-    if let Some(key) = ssh_key_path {
-        if !key.trim().is_empty() {
-            let expanded_path = if key.starts_with("~/") {
-                let home = std::env::var("HOME").map_err(|_| "Could not find HOME directory".to_string())?;
-                key.replacen("~", &home, 1)
-            } else {
-                key.to_string()
-            };
 
-            if Path::new(&expanded_path).exists() {
-                let escaped_path = expanded_path.replace('\'', "'\''");
-                let command = format!("ssh -i '{}' -o IdentitiesOnly=yes", escaped_path);
-                envs.push(("GIT_SSH_COMMAND", command));
-            }
+    // Build SSH command if key path is provided, forwarding the passphrase
+    // via sshpass when one is configured (same helper as clone).
+    // A stale key path must not break HTTPS/local pulls, so key errors here
+    // fall back to no GIT_SSH_COMMAND (the git2 fetch above already
+    // authenticated successfully to reach this point).
+    let mut envs: Vec<(&str, String)> = Vec::new();
+    if let Ok(Some(command)) = crate::git_operations::build_git_ssh_command(ssh_key_path) {
+        let (command, extra) =
+            crate::git_operations::apply_ssh_passphrase(command, ssh_passphrase);
+        envs.push(("GIT_SSH_COMMAND", command));
+        if let Some((key, val)) = extra {
+            envs.push((key, val));
         }
     }
 

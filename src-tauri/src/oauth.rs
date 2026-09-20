@@ -180,9 +180,28 @@ fn run_command_with_input(
         .map_err(|e| OAuthError::Network(format!("Failed to wait for curl: {}", e)))
 }
 
+/// Marker separating the curl response body from the `-w` status suffix,
+/// so a body that happens to end in digits is never mistaken for a code.
+const HTTP_CODE_MARKER: &str = "\n__ARK_HTTP_CODE__:";
+
+/// Split a curl response body produced with
+/// `-w "\n__ARK_HTTP_CODE__:%{http_code}"` into `(body, status_code)`.
+/// Returns `None` for the code when the suffix is missing or unparsable
+/// (e.g. curl never connected).
+fn split_body_and_status(stdout: &str) -> (String, Option<u16>) {
+    match stdout.rsplit_once(HTTP_CODE_MARKER) {
+        Some((body, tail)) => match tail.trim().parse::<u16>() {
+            Ok(code) => (body.to_string(), Some(code)),
+            Err(_) => (stdout.to_string(), None),
+        },
+        None => (stdout.to_string(), None),
+    }
+}
+
 /// Execute a curl GET request with an Authorization header.
 /// The header is passed via stdin (`--config -`) to keep the token out of
-/// the process argument list (`ps`).
+/// the process argument list (`ps`). Auth failures are detected from the
+/// HTTP status code, never by sniffing stderr text.
 fn curl_get_auth(url: &str, token: &str) -> Result<String, OAuthError> {
     use std::process::Command;
 
@@ -194,22 +213,38 @@ fn curl_get_auth(url: &str, token: &str) -> Result<String, OAuthError> {
     );
 
     let mut cmd = Command::new("curl");
-    cmd.args(["-sS", "-f", "--config", "-", url]);
+    cmd.args(["-sS", "--config", "-", url]);
     cmd.args(["--connect-timeout", "10", "--max-time", "30"]);
+    cmd.args(["-w", "\n__ARK_HTTP_CODE__:%{http_code}"]);
     let output = run_command_with_input(cmd, config.as_bytes())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let (body, status) = split_body_and_status(&stdout);
+
+    // HTTP status is authoritative: 401/403 means the token is invalid.
+    if matches!(status, Some(401) | Some(403)) {
+        return Err(OAuthError::Auth);
+    }
+    if let Some(code) = status {
+        if !(200..300).contains(&code) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OAuthError::Network(format!(
+                "GitHub request failed with HTTP {}: {}",
+                code,
+                stderr.trim()
+            )));
+        }
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr_trim = stderr.trim();
-        // curl with -f exits non-zero on 4xx/5xx. Distinguish 401/403
-        // (auth errors) from other HTTP failures so callers can react.
-        if stderr_trim.contains("401") || stderr_trim.contains("403") {
-            return Err(OAuthError::Auth);
-        }
-        return Err(OAuthError::Network(format!("curl failed: {}", stderr_trim)));
+        return Err(OAuthError::Network(format!(
+            "curl failed: {}",
+            stderr.trim()
+        )));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(body)
 }
 
 // ── Public API ──────────────────────────────────────────────────
@@ -253,6 +288,23 @@ pub fn request_device_code() -> Result<DeviceFlowInfo, OAuthError> {
 ///
 /// The `should_cancel` callback is checked between polls; if it returns
 /// `true`, polling stops with `Err(Cancelled)`.
+/// Sleep interruptibly, polling `should_cancel` every 200ms.
+/// Returns true if cancellation was requested, so a long poll interval or
+/// the multi-minute device-code lifetime never blocks shutdown/cancel.
+fn sleep_cancellable(duration: Duration, should_cancel: &dyn Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        if should_cancel() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return should_cancel();
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(200)));
+    }
+}
+
 pub fn poll_for_token(
     device_code: &str,
     interval: u64,
@@ -294,11 +346,15 @@ pub fn poll_for_token(
         match resp.error.as_deref() {
             Some("authorization_pending") => {
                 // User hasn't approved yet — keep polling
-                std::thread::sleep(current_interval);
+                if sleep_cancellable(current_interval, should_cancel) {
+                    return Err(OAuthError::Cancelled);
+                }
             }
             Some("slow_down") => {
                 current_interval = (current_interval + Duration::from_secs(5)).min(Duration::from_secs(30));
-                std::thread::sleep(current_interval);
+                if sleep_cancellable(current_interval, should_cancel) {
+                    return Err(OAuthError::Cancelled);
+                }
             }
             Some("expired_token") => return Err(OAuthError::Expired),
             Some("access_denied") => return Err(OAuthError::Denied),

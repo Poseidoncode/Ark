@@ -85,6 +85,17 @@ describe('GitService', () => {
       await expect(gitService.getStatus()).rejects.toThrow('Backend error');
     });
 
+    it('should share one in-flight fetch for concurrent calls', async () => {
+      vi.mocked(invoke).mockImplementation(
+        () => new Promise((r) => setTimeout(() => r([]), 50)),
+      );
+
+      const [a, b] = await Promise.all([gitService.getStatus(), gitService.getStatus()]);
+
+      expect(a).toEqual(b);
+      expect(invoke).toHaveBeenCalledTimes(1);
+    });
+
     it('should return stale cache on backend error', async () => {
       vi.mocked(invoke).mockResolvedValue([{ path: 'file.txt', status: ' M', staged: true }]);
       const result1 = await gitService.getStatus();
@@ -94,6 +105,27 @@ describe('GitService', () => {
       vi.mocked(invoke).mockRejectedValue(new Error('Backend error'));
       const result2 = await gitService.getStatus();
       expect(result2).toEqual([{ path: 'file.txt', status: ' M', staged: true }]);
+    });
+  });
+
+  describe('Pagination', () => {
+    it('should paginate history with limit/offset over the backend window', async () => {
+      const commits = Array.from({ length: 5 }, (_, i) => ({ sha: `${i}` }));
+      vi.mocked(invoke).mockResolvedValue(commits);
+
+      const page = await gitService.getHistory(2, 1);
+
+      expect(invoke).toHaveBeenCalledWith('get_commit_history', { limit: 3 });
+      expect(page).toEqual([{ sha: '1' }, { sha: '2' }]);
+    });
+
+    it('should paginate stashes client-side with limit/offset', async () => {
+      const stashes = Array.from({ length: 5 }, (_, i) => ({ index: i }));
+      vi.mocked(invoke).mockResolvedValue(stashes);
+
+      const page = await gitService.listStashes(2, 1);
+
+      expect(page).toEqual([{ index: 1 }, { index: 2 }]);
     });
   });
 });

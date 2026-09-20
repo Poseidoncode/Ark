@@ -124,7 +124,41 @@ fn shell_escape_single_quotes(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
-fn build_git_ssh_command(ssh_key_path: Option<&str>) -> Result<Option<String>, String> {
+/// Returns true if `sshpass` resolves to an executable file on PATH.
+fn sshpass_available() -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        let candidate = dir.join("sshpass");
+        matches!(
+            fs::symlink_metadata(&candidate).map(|m| m.is_file()),
+            Ok(true)
+        )
+    })
+}
+
+/// Wraps a `ssh -i ...` command with `sshpass -e` when a passphrase is
+/// supplied, returning the extra `SSHPASS` env to set alongside it.
+/// Falls back to the plain command when no passphrase is given or when
+/// `sshpass` is unavailable (ssh-agent then covers the passphrase).
+pub(crate) fn apply_ssh_passphrase(
+    command: String,
+    passphrase: Option<&str>,
+) -> (String, Option<(&'static str, String)>) {
+    let Some(pass) = passphrase else {
+        return (command, None);
+    };
+    if pass.is_empty() || !sshpass_available() {
+        return (command, None);
+    }
+    (
+        format!("sshpass -e {}", command),
+        Some(("SSHPASS", pass.to_string())),
+    )
+}
+
+pub(crate) fn build_git_ssh_command(ssh_key_path: Option<&str>) -> Result<Option<String>, String> {
     let Some(key) = ssh_key_path else {
         return Ok(None);
     };
@@ -156,7 +190,7 @@ pub fn clone_repository(
     url: &str,
     path: &str,
     ssh_key_path: Option<&str>,
-    _ssh_passphrase: Option<&str>,
+    ssh_passphrase: Option<&str>,
     https_token: Option<&str>,
 ) -> Result<Repository, String> {
     if !is_safe_remote_url(url) {
@@ -165,7 +199,11 @@ pub fn clone_repository(
 
     let mut envs = Vec::new();
     if let Some(command) = build_git_ssh_command(ssh_key_path)? {
+        let (command, extra) = apply_ssh_passphrase(command, ssh_passphrase);
         envs.push(("GIT_SSH_COMMAND", command));
+        if let Some((key, val)) = extra {
+            envs.push((key, val));
+        }
     }
 
     // For HTTPS URLs with a token, pass it via GIT_CONFIG_* env vars to keep
@@ -241,6 +279,7 @@ pub fn get_repository_info(repo: &Repository) -> Result<RepositoryInfo, String> 
         is_dirty,
         ahead,
         behind,
+        error: None,
     })
 }
 
@@ -314,45 +353,50 @@ fn validate_repo_path(repo: &Repository, path: &str) -> Result<PathBuf, String> 
         .map_err(|e| format!("Failed to resolve repository path: {}", e))?;
     let full_path = workdir.join(relative_path);
 
-    let mut current = workdir.to_path_buf();
+    // Lexical containment check on the normalized components (no fs access):
+    // after rejecting `..`, the joined path must stay under the workdir.
+    let mut normalized = workdir.to_path_buf();
     for component in relative_path.components() {
         match component {
             Component::CurDir => continue,
-            Component::Normal(part) => {
-                current.push(part);
-
-                match fs::symlink_metadata(&current) {
-                    Ok(_) => {
-                        let canonical_path = current
-                            .canonicalize()
-                            .map_err(|e| format!("Failed to resolve path '{}': {}", path, e))?;
-
-                        if !canonical_path.starts_with(&canonical_workdir) {
-                            return Err(format!("Path '{}' resolves outside the repository", path));
-                        }
-                    }
-                    Err(err) if err.kind() == ErrorKind::NotFound => {
-                        let parent = current.parent().unwrap_or(workdir);
-                        let canonical_parent = parent.canonicalize().map_err(|e| {
-                            format!("Failed to resolve parent for '{}': {}", path, e)
-                        })?;
-
-                        if !canonical_parent.starts_with(&canonical_workdir) {
-                            return Err(format!("Path '{}' resolves outside the repository", path));
-                        }
-
-                        break;
-                    }
-                    Err(err) => {
-                        return Err(format!("Failed to inspect path '{}': {}", path, err));
-                    }
-                }
-            }
+            Component::Normal(part) => normalized.push(part),
             Component::ParentDir => return Err("Path traversal is not allowed".to_string()),
             Component::RootDir | Component::Prefix(_) => {
                 return Err("Absolute paths are not allowed".to_string())
             }
         }
+    }
+    if normalized != full_path && !normalized.starts_with(workdir) {
+        return Err(format!("Path '{}' resolves outside the repository", path));
+    }
+
+    // Single fs resolution: canonicalize the longest existing ancestor once
+    // (this resolves any intermediate symlinks in one call) and require it
+    // to stay inside the repository. Remaining non-existent components are
+    // plain names validated above, so no further canonicalization is needed.
+    let mut ancestor: &Path = &full_path;
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = ancestor.parent() {
+                    // Stop at the workdir itself to avoid walking above it.
+                    if ancestor == workdir {
+                        break;
+                    }
+                    ancestor = parent;
+                    continue;
+                }
+                return Err(format!("Failed to inspect path '{}': {}", path, err));
+            }
+            Err(err) => return Err(format!("Failed to inspect path '{}': {}", path, err)),
+        }
+    }
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve path '{}': {}", path, e))?;
+    if !canonical_ancestor.starts_with(&canonical_workdir) {
+        return Err(format!("Path '{}' resolves outside the repository", path));
     }
 
     Ok(full_path)
@@ -728,6 +772,39 @@ pub fn create_branch(repo: &Repository, name: &str, start_sha: Option<&str>) -> 
     checkout_branch(repo, name)
 }
 
+/// Maximum patch text kept per file in diff results. Diffs are unbounded
+/// by nature; without a cap a single huge file can exhaust memory by
+/// concatenating every line into one string.
+const MAX_DIFF_TEXT_BYTES: usize = 200_000;
+const DIFF_TRUNCATED_MARKER: &str = "\n... [diff truncated]";
+
+/// Appends one diff line to `entry`, truncating at MAX_DIFF_TEXT_BYTES.
+/// Line counts still increment after truncation; only the text is capped.
+fn push_diff_line(entry: &mut DiffInfo, prefix: Option<char>, content: &str) {
+    if entry.diff_text.len() >= MAX_DIFF_TEXT_BYTES {
+        if !entry.diff_text.ends_with(DIFF_TRUNCATED_MARKER) {
+            entry.diff_text.push_str(DIFF_TRUNCATED_MARKER);
+        }
+        return;
+    }
+    if let Some(prefix) = prefix {
+        entry.diff_text.push(prefix);
+    }
+    let remaining = MAX_DIFF_TEXT_BYTES - entry.diff_text.len();
+    let bytes = content.as_bytes();
+    if bytes.len() > remaining {
+        // Keep the text valid UTF-8 by cutting at a char boundary.
+        let mut end = remaining;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        entry.diff_text.push_str(&content[..end]);
+        entry.diff_text.push_str(DIFF_TRUNCATED_MARKER);
+    } else {
+        entry.diff_text.push_str(content);
+    }
+}
+
 pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, String> {
     let commit = match repo.find_commit(git2::Oid::from_str(sha).map_err(|e| e.to_string())?) {
         Ok(commit) => commit,
@@ -784,18 +861,17 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
             }
         };
 
-        let prefix_char = match line.origin() {
-            '+' => '+',
-            '-' => '-',
-            ' ' => ' ',
-            _ => '\0',
+        let prefix = match line.origin() {
+            '+' => Some('+'),
+            '-' => Some('-'),
+            ' ' => Some(' '),
+            _ => None,
         };
-        if prefix_char != '\0' {
-            diff_infos[idx].diff_text.push(prefix_char);
-        }
-        diff_infos[idx]
-            .diff_text
-            .push_str(std::str::from_utf8(line.content()).unwrap_or("<binary>"));
+        push_diff_line(
+            &mut diff_infos[idx],
+            prefix,
+            std::str::from_utf8(line.content()).unwrap_or("<binary>"),
+        );
         match line.origin() {
             '+' => diff_infos[idx].additions += 1,
             '-' => diff_infos[idx].deletions += 1,
@@ -929,7 +1005,11 @@ pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitI
     // Pre-compute the set of pushed commit OIDs by walking from upstream.
     // All commits reachable from upstream are pushed. This is O(n) once
     // instead of O(n²) with per-commit graph_descendant_of calls.
+    // The walk is capped so a huge upstream history cannot grow the set
+    // without bound; the revwalk below is already bounded by `limit`, so a
+    // commit beyond the cap is conservatively reported as unpushed.
     use std::collections::HashSet;
+    const MAX_UPSTREAM_WALK: usize = 20_000;
     let pushed_oids: Option<HashSet<git2::Oid>> = if let Some(u_oid) = upstream_oid {
         let mut walk = repo
             .revwalk()
@@ -938,6 +1018,9 @@ pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitI
             .map_err(|e| format!("Failed to push upstream: {}", e))?;
         let mut set = HashSet::new();
         for oid_result in walk {
+            if set.len() >= MAX_UPSTREAM_WALK {
+                break;
+            }
             match oid_result {
                 Ok(oid) => { set.insert(oid); }
                 Err(_) => break,
@@ -1028,18 +1111,17 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
             }
         };
 
-        let prefix_char = match line.origin() {
-            '+' => '+',
-            '-' => '-',
-            ' ' => ' ',
-            _ => '\0',
+        let prefix = match line.origin() {
+            '+' => Some('+'),
+            '-' => Some('-'),
+            ' ' => Some(' '),
+            _ => None,
         };
-        if prefix_char != '\0' {
-            diff_infos[idx].diff_text.push(prefix_char);
-        }
-        diff_infos[idx]
-            .diff_text
-            .push_str(std::str::from_utf8(line.content()).unwrap_or("<binary>"));
+        push_diff_line(
+            &mut diff_infos[idx],
+            prefix,
+            std::str::from_utf8(line.content()).unwrap_or("<binary>"),
+        );
         match line.origin() {
             '+' => diff_infos[idx].additions += 1,
             '-' => diff_infos[idx].deletions += 1,
@@ -1297,7 +1379,9 @@ pub fn resolve_conflict(repo: &Repository, path: &str, use_ours: bool) -> Result
             .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
             .unwrap_or_default();
 
-        if conflict_path != path {
+        // Compare normalized paths: the caller-supplied path may use
+        // platform separators while git reports forward slashes.
+        if conflict_path.replace('\\', "/") != path.replace('\\', "/") {
             continue;
         }
 
@@ -1546,50 +1630,57 @@ pub fn merge_commit(repo: &Repository, sha: &str) -> Result<(), String> {
 pub fn list_tags(repo: &Repository) -> Result<Vec<TagInfo>, String> {
     let mut tags = Vec::new();
 
-    let tag_names = repo.tag_names(None).map_err(|e| format!("Failed to get tag names: {}", e))?;
+    // Single batched glob pass over refs/tags/*: each reference already
+    // carries its target, so no per-tag find_reference lookup is needed.
+    let references = repo
+        .references_glob("refs/tags/*")
+        .map_err(|e| format!("Failed to list tags: {}", e))?;
 
-    for i in 0..tag_names.len() {
-        if let Some(tag_name) = tag_names.get(i) {
-            let name = tag_name.to_string();
+    for reference in references {
+        let reference = match reference {
+            Ok(reference) => reference,
+            Err(_) => continue,
+        };
+        let full_name = reference.name().unwrap_or_default().to_string();
+        let name = full_name
+            .strip_prefix("refs/tags/")
+            .unwrap_or(&full_name)
+            .to_string();
 
-            let (sha, message, date) = if let Ok(reference) = repo.find_reference(&format!("refs/tags/{}", name)) {
-                if let Some(oid) = reference.target() {
-                    // Check if this is an annotated tag (peel to the tag object first)
-                    if let Ok(tag_obj) = repo.find_tag(oid) {
-                        // Annotated tag: use tag message and date, peel to commit for sha
-                        let commit = match tag_obj.target().and_then(|t| t.peel_to_commit()) {
-                            Ok(commit) => commit,
-                            _ => continue, // Skip tags with broken targets
-                        };
-                        let sha_str = commit.id().to_string();
-                        let message = tag_obj.message().map(|m| m.to_string());
-                        let date = tag_obj.tagger()
-                            .map(|s| s.when().seconds())
-                            .unwrap_or_else(|| commit.time().seconds());
-                        (sha_str, message, date)
-                    } else if let Ok(commit) = repo.find_commit(oid) {
-                        // Lightweight tag: use commit message and date
-                        let sha_str = oid.to_string();
-                        let message = commit.message().map(|m| m.to_string());
-                        let date = commit.time().seconds();
-                        (sha_str, message, date)
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
+        let oid = match reference.target() {
+            Some(oid) => oid,
+            None => continue,
+        };
+
+        // Check if this is an annotated tag (peel to the tag object first)
+        let (sha, message, date) = if let Ok(tag_obj) = repo.find_tag(oid) {
+            // Annotated tag: use tag message and date, peel to commit for sha
+            let commit = match tag_obj.target().and_then(|t| t.peel_to_commit()) {
+                Ok(commit) => commit,
+                _ => continue, // Skip tags with broken targets
             };
+            let sha_str = commit.id().to_string();
+            let message = tag_obj.message().map(|m| m.to_string());
+            let date = tag_obj.tagger()
+                .map(|s| s.when().seconds())
+                .unwrap_or_else(|| commit.time().seconds());
+            (sha_str, message, date)
+        } else if let Ok(commit) = repo.find_commit(oid) {
+            // Lightweight tag: use commit message and date
+            let sha_str = oid.to_string();
+            let message = commit.message().map(|m| m.to_string());
+            let date = commit.time().seconds();
+            (sha_str, message, date)
+        } else {
+            continue;
+        };
 
-            tags.push(TagInfo {
-                name,
-                message,
-                sha,
-                date,
-            });
-        }
+        tags.push(TagInfo {
+            name,
+            message,
+            sha,
+            date,
+        });
     }
 
     Ok(tags)

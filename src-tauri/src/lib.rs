@@ -12,6 +12,7 @@ use models::{
 };
 use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -130,6 +131,7 @@ struct AppState {
     watcher: Option<notify::RecommendedWatcher>,
     watched_paths: Vec<std::path::PathBuf>,
     branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
+    recent_info_cache: HashMap<String, (RepositoryInfo, std::time::Instant)>,
 }
 
 impl Default for AppState {
@@ -140,6 +142,7 @@ impl Default for AppState {
             watcher: None,
             watched_paths: Vec::new(),
             branch_cache: None,
+            recent_info_cache: HashMap::new(),
         }
     }
 }
@@ -150,6 +153,55 @@ type AppResult<T> = Result<T, AppError>;
 
 fn require_open_repository(repo: Option<&git2::Repository>) -> AppResult<&git2::Repository> {
     repo.ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))
+}
+
+/// Snapshot the open repository's workdir path under a short lock, then reopen
+/// a private handle without holding the global Mutex. Keeps the critical
+/// section tiny and moves slow git2 scans off the shared lock.
+fn open_repo_snapshot(state: &State<'_, App>) -> AppResult<git2::Repository> {
+    let path = {
+        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        let repo = require_open_repository(state.repo.as_ref())?;
+        repo.workdir()
+            .ok_or(AppError::Git(GitError::InvalidRef("No workdir".to_string())))?
+            .to_path_buf()
+    };
+    git_operations::open_repository_by_path(&path).map_err(|e| AppError::Git(GitError::Other(e)))
+}
+
+/// Resolve a stash SHA to its index and re-verify, while still holding the
+/// state lock, that the entry at that index still carries the expected SHA.
+/// Makes find-and-use atomic against external stash mutation.
+fn resolve_stash_index_verified(repo: &mut git2::Repository, sha: &str) -> AppResult<usize> {
+    let index = git_operations::find_stash_index_by_sha(repo, sha)?;
+    let current = git_operations::stash_list(repo)?;
+    match current.get(index) {
+        Some(entry) if entry.sha == sha => Ok(index),
+        _ => Err(AppError::Git(GitError::NotFound(format!(
+            "Stash with SHA {} not found",
+            sha
+        )))),
+    }
+}
+
+/// Persist a settings snapshot without holding the global Mutex (covers the
+/// keychain read and the file write).
+fn save_settings_snapshot(settings: &Settings, app_handle: &tauri::AppHandle) -> AppResult<()> {
+    let path = get_settings_path(app_handle)?;
+    let ssh_passphrase = settings
+        .ssh_key_path
+        .as_deref()
+        .map(CredentialStore::get_passphrase)
+        .transpose()
+        .map_err(AppError::Config)?
+        .flatten();
+    save_settings_payload_to_path(
+        &SettingsPayload {
+            settings: settings.clone(),
+            ssh_passphrase,
+        },
+        &path,
+    )
 }
 
 fn stop_watcher(watcher: Option<notify::RecommendedWatcher>, watched_paths: &[std::path::PathBuf]) {
@@ -426,24 +478,6 @@ fn get_https_token() -> Option<String> {
     CredentialStore::get_oauth_token().ok().flatten()
 }
 
-fn save_settings_to_disk(state: &AppState, app_handle: &tauri::AppHandle) -> AppResult<()> {
-    let path = get_settings_path(app_handle)?;
-    save_settings_payload_to_path(
-        &SettingsPayload {
-            settings: state.settings.clone(),
-            ssh_passphrase: state
-                .settings
-                .ssh_key_path
-                .as_deref()
-                .map(CredentialStore::get_passphrase)
-                .transpose()
-                .map_err(AppError::Config)?
-                .flatten(),
-        },
-        &path,
-    )
-}
-
 fn load_settings_from_disk(app_handle: &tauri::AppHandle) -> Settings {
     if let Ok(path) = get_settings_path(app_handle) {
         if let Ok(settings) = load_settings_from_path(&path) {
@@ -459,41 +493,51 @@ fn open_repository(
     app_handle: tauri::AppHandle,
     path: String,
 ) -> AppResult<RepositoryInfo> {
-    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    match git_operations::open_repository(&path) {
-        Ok(repo) => {
-            let info = git_operations::get_repository_info(&repo)?;
-            state.repo = Some(repo);
-            // Invalidate all caches when changing repo
-            state.branch_cache = None;
-            stop_watcher(state.watcher.take(), &state.watched_paths);
-            let (watcher, watched_paths) = start_watcher(app_handle.clone(), &path);
-            state.watcher = watcher;
-            state.watched_paths = watched_paths;
-
-            // Add to recent repositories if not already there
-            if !state.settings.recent_repositories.contains(&path) {
-                state.settings.recent_repositories.insert(0, path.clone());
-                if state.settings.recent_repositories.len() > 10 {
-                    state.settings.recent_repositories.truncate(10);
-                }
-            }
-            state.settings.last_opened_repository = Some(path);
-            save_settings_to_disk(&state, &app_handle)?;
-            Ok(info)
-        }
+    // Open and inspect without holding the global lock; only state mutation
+    // takes the lock, and disk persistence happens after it is released.
+    let repo = match git_operations::open_repository(&path) {
+        Ok(repo) => repo,
         Err(e) => {
             if !std::path::Path::new(&path).exists() {
-                state.settings.recent_repositories.retain(|p| p != &path);
-                if state.settings.last_opened_repository == Some(path) {
-                    state.settings.last_opened_repository = None;
-                }
-                let _ = save_settings_to_disk(&state, &app_handle);
+                let settings = {
+                    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+                    state.settings.recent_repositories.retain(|p| p != &path);
+                    if state.settings.last_opened_repository == Some(path.clone()) {
+                        state.settings.last_opened_repository = None;
+                    }
+                    state.recent_info_cache.remove(&path);
+                    state.settings.clone()
+                };
+                let _ = save_settings_snapshot(&settings, &app_handle);
                 return Err(AppError::Git(GitError::NotFound("Repository path not found. Removed from list.".to_string())));
             }
-            Err(AppError::Git(GitError::Other(e)))
+            return Err(AppError::Git(GitError::Other(e)));
         }
-    }
+    };
+    let info = git_operations::get_repository_info(&repo).map_err(|e| AppError::Git(e.into()))?;
+    let settings = {
+        let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        state.repo = Some(repo);
+        // Invalidate all caches when changing repo
+        state.branch_cache = None;
+        state.recent_info_cache.insert(path.clone(), (info.clone(), std::time::Instant::now()));
+        stop_watcher(state.watcher.take(), &state.watched_paths);
+        let (watcher, watched_paths) = start_watcher(app_handle.clone(), &path);
+        state.watcher = watcher;
+        state.watched_paths = watched_paths;
+
+        // Add to recent repositories if not already there
+        if !state.settings.recent_repositories.contains(&path) {
+            state.settings.recent_repositories.insert(0, path.clone());
+            if state.settings.recent_repositories.len() > 10 {
+                state.settings.recent_repositories.truncate(10);
+            }
+        }
+        state.settings.last_opened_repository = Some(path);
+        state.settings.clone()
+    };
+    save_settings_snapshot(&settings, &app_handle)?;
+    Ok(info)
 }
 
 #[tauri::command]
@@ -526,127 +570,138 @@ async fn clone_repository(
     .map_err(|e| AppError::Git(GitError::Other(format!("Spawn error: {}", e))))?
     .map_err(|e| AppError::Git(e.into()))?;
 
-    // Re-acquire lock to update state
-    let mut state_lock = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    
-    // Re-open repo in state
-    match git_operations::open_repository(&path) {
-        Ok(repo) => {
-            state_lock.repo = Some(repo);
-            stop_watcher(state_lock.watcher.take(), &state_lock.watched_paths);
-            let (watcher, watched_paths) = start_watcher(app_handle.clone(), &path);
-            state_lock.watcher = watcher;
-            state_lock.watched_paths = watched_paths;
+    // Re-acquire lock to update state; persist settings after release.
+    let settings = {
+        let mut state_lock = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
 
-            if !state_lock.settings.recent_repositories.contains(&path) {
-                state_lock.settings.recent_repositories.insert(0, path.clone());
+        // Re-open repo in state
+        match git_operations::open_repository(&path) {
+            Ok(repo) => {
+                state_lock.repo = Some(repo);
+                state_lock.branch_cache = None;
+                stop_watcher(state_lock.watcher.take(), &state_lock.watched_paths);
+                let (watcher, watched_paths) = start_watcher(app_handle.clone(), &path);
+                state_lock.watcher = watcher;
+                state_lock.watched_paths = watched_paths;
+
+                if !state_lock.settings.recent_repositories.contains(&path) {
+                    state_lock.settings.recent_repositories.insert(0, path.clone());
+                }
+                state_lock.settings.last_opened_repository = Some(path.clone());
+                state_lock.settings.clone()
             }
-            state_lock.settings.last_opened_repository = Some(path.clone());
-            save_settings_to_disk(&state_lock, &app_handle)?;
-            Ok(path)
+            Err(e) => return Err(AppError::Git(GitError::Other(e))),
         }
-        Err(e) => Err(AppError::Git(GitError::Other(e))),
-    }
+    };
+    save_settings_snapshot(&settings, &app_handle)?;
+    Ok(path)
 }
 
 #[tauri::command]
 fn get_repository_status(state: State<'_, App>) -> AppResult<Vec<FileStatus>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::get_status(repo).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::get_status(&repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn create_commit(state: State<'_, App>, options: CommitOptions) -> AppResult<String> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    let stage_result = git_operations::stage_files(repo, options.files)?;
-    if stage_result.staged.is_empty() && !stage_result.warnings.is_empty() {
-        return Err(AppError::Git(GitError::Other(format!("No files could be staged: {}", stage_result.warnings.join("; ")))));
+    if options.message.trim().is_empty() {
+        return Err(AppError::Git(GitError::Other("Commit message cannot be empty".to_string())));
     }
-    git_operations::create_commit(repo, &options.message).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    // Stage first; any staging failure aborts the commit instead of
+    // committing a partial selection.
+    let stage_result = git_operations::stage_files(&repo, options.files)?;
+    if !stage_result.warnings.is_empty() {
+        return Err(AppError::Git(GitError::Other(format!("Staging failed, commit aborted: {}", stage_result.warnings.join("; ")))));
+    }
+    git_operations::create_commit(&repo, &options.message).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn stage_files(state: State<'_, App>, files: Vec<String>) -> AppResult<StageResult> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::stage_files(repo, files).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::stage_files(&repo, files).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn unstage_files(state: State<'_, App>, files: Vec<String>) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::unstage_files(repo, files).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::unstage_files(&repo, files).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn discard_changes(state: State<'_, App>, file_path: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::discard_changes(repo, &file_path).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::discard_changes(&repo, &file_path).map_err(|e| AppError::Git(e.into()))
+}
+
+fn invalidate_branch_cache(state: &State<'_, App>) {
+    if let Ok(mut state) = state.0.lock() {
+        state.branch_cache = None;
+    }
 }
 
 #[tauri::command]
 fn get_branches(state: State<'_, App>) -> AppResult<Vec<BranchInfo>> {
-    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-
-    // Check cache first (cache for 5 seconds)
-    if let Some((ref branches, ref time)) = state.branch_cache {
-        if time.elapsed().as_secs() < 5 {
-            return Ok(branches.clone());
+    // Fast path: cache hit under a short lock, no repo scan at all.
+    {
+        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        if let Some((ref branches, ref time)) = state.branch_cache {
+            if time.elapsed().as_secs() < 5 {
+                return Ok(branches.clone());
+            }
         }
     }
 
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    let branches = git_operations::get_branches(repo).map_err(|e| AppError::Git(e.into()))?;
+    let repo = open_repo_snapshot(&state)?;
+    let branches = git_operations::get_branches(&repo).map_err(|e| AppError::Git(e.into()))?;
 
-    // Update cache
-    state.branch_cache = Some((branches.clone(), std::time::Instant::now()));
+    // Publish to cache under a short lock.
+    {
+        let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        state.branch_cache = Some((branches.clone(), std::time::Instant::now()));
+    }
 
     Ok(branches)
 }
 
 #[tauri::command]
 fn create_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()> {
-    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::create_branch(repo, &options.name, options.start_sha.as_deref()).map_err(|e| AppError::Git(e.into()))?;
-    // Invalidate branch cache
-    state.branch_cache = None;
-    Ok(())
+    let repo = open_repo_snapshot(&state)?;
+    let result = git_operations::create_branch(&repo, &options.name, options.start_sha.as_deref()).map_err(|e| AppError::Git(e.into()));
+    // Invalidate branch cache on writes (also on failure: HEAD may have moved).
+    invalidate_branch_cache(&state);
+    result
 }
 
 #[tauri::command]
 fn checkout_branch(state: State<'_, App>, options: BranchOptions) -> AppResult<()> {
-    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::checkout_branch(repo, &options.name).map_err(|e| AppError::Git(e.into()))?;
-    // Invalidate caches
-    state.branch_cache = None;
-    Ok(())
+    let repo = open_repo_snapshot(&state)?;
+    let result = git_operations::checkout_branch(&repo, &options.name).map_err(|e| AppError::Git(e.into()));
+    // Invalidate caches on writes (also on failure: HEAD may have moved).
+    invalidate_branch_cache(&state);
+    result
 }
 
 #[tauri::command]
 fn get_commit_diff(state: State<'_, App>, sha: String) -> AppResult<Vec<DiffInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::get_commit_diff(repo, &sha).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::get_commit_diff(&repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn get_commit_history(state: State<'_, App>, limit: usize) -> AppResult<Vec<CommitInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::get_commit_history(repo, limit).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    // Bound the walk so a huge history cannot stall the command.
+    let limit = limit.min(500);
+    git_operations::get_commit_history(&repo, limit).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn get_diff(state: State<'_, App>, file_path: Option<String>) -> AppResult<Vec<DiffInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::get_diff(repo, file_path.as_deref()).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::get_diff(&repo, file_path.as_deref()).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
@@ -738,7 +793,8 @@ fn stash_save(state: State<'_, App>, options: StashOptions) -> AppResult<()> {
 fn stash_pop(state: State<'_, App>, sha: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
+    // Lookup and use are one atomic step under the lock, with re-verification.
+    let index = resolve_stash_index_verified(repo, &sha)?;
     git_operations::stash_pop(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
@@ -751,44 +807,41 @@ fn list_stashes(state: State<'_, App>) -> AppResult<Vec<StashInfo>> {
 
 #[tauri::command]
 fn get_conflicts(state: State<'_, App>) -> AppResult<Vec<ConflictInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::get_conflicts(repo).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::get_conflicts(&repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn resolve_conflict(state: State<'_, App>, path: String, use_ours: bool) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::resolve_conflict(repo, &path, use_ours).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::resolve_conflict(&repo, &path, use_ours).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn amend_commit(state: State<'_, App>, message: String) -> AppResult<String> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::amend_last_commit(repo, &message).map_err(|e| AppError::Git(e.into()))
+    if message.trim().is_empty() {
+        return Err(AppError::Git(GitError::Other("Commit message cannot be empty".to_string())));
+    }
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::amend_last_commit(&repo, &message).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn cherry_pick(state: State<'_, App>, sha: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::cherry_pick(repo, &sha).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::cherry_pick(&repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn revert_commit(state: State<'_, App>, sha: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = require_open_repository(state.repo.as_ref())?;
-    git_operations::revert_commit(repo, &sha).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::revert_commit(&repo, &sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn discard_all_changes(state: State<'_, App>) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::discard_all_changes(repo).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::discard_all_changes(&repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
@@ -803,31 +856,43 @@ fn save_settings(
     app_handle: tauri::AppHandle,
     settings: SettingsPayload,
 ) -> AppResult<()> {
-    let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let previous_key_path = state.settings.ssh_key_path.clone();
+    // Read the previous key path under a short lock; keychain and disk IO run
+    // without holding the global Mutex.
+    let previous_key_path = {
+        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        state.settings.ssh_key_path.clone()
+    };
     persist_passphrase(
         previous_key_path.as_deref(),
         settings.settings.ssh_key_path.as_deref(),
         settings.ssh_passphrase.as_deref(),
     )?;
-    state.settings = settings.settings;
-    save_settings_to_disk(&state, &app_handle)?;
+    {
+        let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        state.settings = settings.settings.clone();
+    }
+    save_settings_snapshot(&settings.settings, &app_handle)?;
     Ok(())
 }
 
 #[tauri::command]
 fn set_remote_url(state: State<'_, App>, name: String, url: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::set_remote_url(repo, &name, &url).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::set_remote_url(&repo, &name, &url).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn get_remote_url(state: State<'_, App>, name: String) -> AppResult<String> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::get_remote_url(repo, &name).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::get_remote_url(&repo, &name).map_err(|e| AppError::Git(e.into()))
 }
+
+/// Upper bound for one `get_repositories_info` batch (pagination cap).
+/// The recent list itself is capped at 10 entries; anything beyond this is a
+/// programming error, not a page the UI renders.
+const RECENT_INFO_LIMIT: usize = 20;
+/// TTL for cached per-repo entries backing the recent list.
+const RECENT_INFO_TTL_SECS: u64 = 5;
 
 #[tauri::command]
 async fn get_repositories_info(
@@ -835,38 +900,126 @@ async fn get_repositories_info(
     app_handle: tauri::AppHandle,
     paths: Vec<String>,
 ) -> AppResult<Vec<RepositoryInfo>> {
-    let mut results = Vec::new();
-    let mut to_remove = Vec::new();
-
-    for path in paths {
-        match git_operations::open_repository(&path) {
-            Ok(repo) => {
-                if let Ok(info) = git_operations::get_repository_info(&repo) {
-                    results.push(info);
-                    continue;
-                }
-            }
-            Err(_) => {
-                if !std::path::Path::new(&path).exists() {
-                    to_remove.push(path.clone());
-                    continue;
+    // Bound the batch, then serve fresh cache hits without reopening repos.
+    let paths: Vec<String> = paths.into_iter().take(RECENT_INFO_LIMIT).collect();
+    let mut cached: HashMap<String, RepositoryInfo> = HashMap::new();
+    {
+        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        for path in &paths {
+            if let Some((info, time)) = state.recent_info_cache.get(path) {
+                if time.elapsed().as_secs() < RECENT_INFO_TTL_SECS {
+                    cached.insert(path.clone(), info.clone());
                 }
             }
         }
-        // Fallback for valid paths that can't be opened or other errors
-        results.push(RepositoryInfo {
-            path,
-            current_branch: "unknown".to_string(),
-            is_dirty: false,
-            ahead: 0,
-            behind: 0,
-        });
     }
 
-    if !to_remove.is_empty() {
+    // Scan uncached repos concurrently in blocking threads instead of
+    // serially under the global lock; input order is preserved below.
+    let mut pending: Vec<(String, tauri::async_runtime::JoinHandle<(String, Option<RepositoryInfo>, Option<String>)>)> =
+        Vec::new();
+    for path in &paths {
+        if cached.contains_key(path) {
+            continue;
+        }
+        let p = path.clone();
+        let handle = tauri::async_runtime::spawn_blocking(move || {
+            match git_operations::open_repository(&p) {
+                Ok(repo) => match git_operations::get_repository_info(&repo) {
+                    Ok(mut info) => {
+                        info.error = None;
+                        (p, Some(info), None)
+                    }
+                    Err(e) => (p.clone(), None, Some(e)),
+                },
+                Err(e) => {
+                    if !std::path::Path::new(&p).exists() {
+                        // Signal removal with an empty message marker handled below.
+                        (p, None, Some(String::new()))
+                    } else {
+                        (p.clone(), None, Some(e))
+                    }
+                }
+            }
+        });
+        pending.push((path.clone(), handle));
+    }
+
+    let mut scanned: HashMap<String, (Option<RepositoryInfo>, Option<String>)> = HashMap::new();
+    for (path, handle) in pending {
+        let (_, info, err) = handle
+            .await
+            .map_err(|e| AppError::Lock(format!("Task failed: {}", e)))?;
+        scanned.insert(path, (info, err));
+    }
+
+    // Merge cache hits and fresh scans in input order. Per-repo failures are
+    // reported in-band via `error` instead of a fabricated success.
+    let mut results = Vec::with_capacity(paths.len());
+    let mut to_remove = Vec::new();
+    let mut fresh: Vec<(String, RepositoryInfo)> = Vec::new();
+    for path in &paths {
+        if let Some(info) = cached.remove(path) {
+            results.push(info);
+            continue;
+        }
+        match scanned.remove(path) {
+            Some((Some(info), _)) => {
+                fresh.push((path.clone(), info.clone()));
+                results.push(info);
+            }
+            Some((None, Some(msg))) if msg.is_empty() => {
+                to_remove.push(path.clone());
+            }
+            Some((None, Some(msg))) => {
+                let entry = RepositoryInfo {
+                    path: path.clone(),
+                    current_branch: "unknown".to_string(),
+                    is_dirty: false,
+                    ahead: 0,
+                    behind: 0,
+                    error: Some(msg),
+                };
+                fresh.push((path.clone(), entry.clone()));
+                results.push(entry);
+            }
+            _ => {
+                let entry = RepositoryInfo {
+                    path: path.clone(),
+                    current_branch: "unknown".to_string(),
+                    is_dirty: false,
+                    ahead: 0,
+                    behind: 0,
+                    error: Some("Unknown repository error".to_string()),
+                };
+                results.push(entry);
+            }
+        }
+    }
+
+    // Publish fresh entries and prune missing paths under short locks; disk
+    // persistence runs after the lock is released.
+    let settings = {
         let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-        state.settings.recent_repositories.retain(|p| !to_remove.contains(p));
-        let _ = save_settings_to_disk(&state, &app_handle);
+        let now = std::time::Instant::now();
+        for (path, info) in fresh {
+            state.recent_info_cache.insert(path, (info, now));
+        }
+        for path in &to_remove {
+            state.recent_info_cache.remove(path);
+        }
+        if !to_remove.is_empty() {
+            state
+                .settings
+                .recent_repositories
+                .retain(|p| !to_remove.contains(p));
+            Some(state.settings.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(settings) = settings {
+        let _ = save_settings_snapshot(&settings, &app_handle);
     }
 
     Ok(results)
@@ -874,13 +1027,16 @@ async fn get_repositories_info(
 
 #[tauri::command]
 fn get_current_repo_info(state: State<'_, App>) -> AppResult<Option<RepositoryInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    if let Some(repo) = state.repo.as_ref() {
-        let info = git_operations::get_repository_info(repo).map_err(|e| AppError::Git(e.into()))?;
-        Ok(Some(info))
-    } else {
-        Ok(None)
+    let has_repo = {
+        let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+        state.repo.is_some()
+    };
+    if !has_repo {
+        return Ok(None);
     }
+    let repo = open_repo_snapshot(&state)?;
+    let info = git_operations::get_repository_info(&repo).map_err(|e| AppError::Git(e.into()))?;
+    Ok(Some(info))
 }
 
 #[tauri::command]
@@ -952,15 +1108,13 @@ fn reveal_in_finder(state: State<'_, App>, path: String) -> AppResult<()> {
 
 #[tauri::command]
 fn add_to_gitignore(state: State<'_, App>, file_path: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::add_to_gitignore(repo, &file_path).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::add_to_gitignore(&repo, &file_path).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn resolve_repo_file(state: State<'_, App>, file_path: String) -> AppResult<String> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
+    let repo = open_repo_snapshot(&state)?;
     let workdir = repo.workdir().ok_or(AppError::Git(GitError::InvalidRef("No working directory found".to_string())))?;
     let input = if std::path::Path::new(&file_path).is_absolute() {
         match std::path::Path::new(&file_path).strip_prefix(workdir) {
@@ -977,29 +1131,28 @@ fn resolve_repo_file(state: State<'_, App>, file_path: String) -> AppResult<Stri
     } else {
         file_path
     };
-    let validated = git_operations::resolve_repo_relative_path(repo, &input).map_err(|e| AppError::Git(e.into()))?;
+    let validated = git_operations::resolve_repo_relative_path(&repo, &input).map_err(|e| AppError::Git(e.into()))?;
     Ok(validated.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
 fn read_file(state: State<'_, App>, file_path: String) -> AppResult<String> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::read_file(repo, &file_path).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::read_file(&repo, &file_path).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn create_tag(state: State<'_, App>, options: TagOptions) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::create_tag(repo, &options.name, &options.message, &options.sha).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::create_tag(&repo, &options.name, &options.message, &options.sha).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn drop_stash(state: State<'_, App>, sha: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
+    // Lookup and use are one atomic step under the lock, with re-verification.
+    let index = resolve_stash_index_verified(repo, &sha)?;
     git_operations::stash_drop(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
@@ -1007,7 +1160,8 @@ fn drop_stash(state: State<'_, App>, sha: String) -> AppResult<()> {
 fn apply_stash(state: State<'_, App>, sha: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
+    // Lookup and use are one atomic step under the lock, with re-verification.
+    let index = resolve_stash_index_verified(repo, &sha)?;
     git_operations::stash_apply(repo, index).map_err(|e| AppError::Git(e.into()))
 }
 
@@ -1015,22 +1169,25 @@ fn apply_stash(state: State<'_, App>, sha: String) -> AppResult<()> {
 fn branch_from_stash(state: State<'_, App>, sha: String, branch_name: String) -> AppResult<()> {
     let mut state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
     let repo = state.repo.as_mut().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    let index = git_operations::find_stash_index_by_sha(repo, &sha)?;
+    // Lookup and use are one atomic step under the lock, with re-verification.
+    let index = resolve_stash_index_verified(repo, &sha)?;
     git_operations::stash_branch(repo, index, &branch_name).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn reset_branch(state: State<'_, App>, sha: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::reset_branch(repo, &sha).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    let result = git_operations::reset_branch(&repo, &sha).map_err(|e| AppError::Git(e.into()));
+    invalidate_branch_cache(&state);
+    result
 }
 
 #[tauri::command]
 fn merge_commit(state: State<'_, App>, sha: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::merge_commit(repo, &sha).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    let result = git_operations::merge_commit(&repo, &sha).map_err(|e| AppError::Git(e.into()));
+    invalidate_branch_cache(&state);
+    result
 }
 
 #[tauri::command]
@@ -1051,30 +1208,26 @@ async fn list_tags(state: State<'_, App>) -> AppResult<Vec<TagInfo>> {
 
 #[tauri::command]
 fn delete_tag(state: State<'_, App>, name: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::delete_tag(repo, &name).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::delete_tag(&repo, &name).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn list_remotes(state: State<'_, App>) -> AppResult<Vec<RemoteInfo>> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::list_remotes(repo).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::list_remotes(&repo).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn add_remote(state: State<'_, App>, name: String, url: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::add_remote(repo, &name, &url).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::add_remote(&repo, &name, &url).map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
 fn remove_remote(state: State<'_, App>, name: String) -> AppResult<()> {
-    let state = state.0.lock().map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
-    let repo = state.repo.as_ref().ok_or(AppError::Git(GitError::NotFound("No repository open".to_string())))?;
-    git_operations::remove_remote(repo, &name).map_err(|e| AppError::Git(e.into()))
+    let repo = open_repo_snapshot(&state)?;
+    git_operations::remove_remote(&repo, &name).map_err(|e| AppError::Git(e.into()))
 }
 
 // ── GitHub OAuth Device Flow commands ─────────────────────────────
@@ -1198,6 +1351,7 @@ pub fn run() {
                 watcher,
                 watched_paths,
                 branch_cache: None,
+                recent_info_cache: HashMap::new(),
             })));
 
             // Cleanup on app exit
@@ -1291,6 +1445,17 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn test_repository_info_without_error_field_parses_for_backward_compat() {
+        // G3: `error` is additive — payloads written before it existed must parse.
+        let info: RepositoryInfo = serde_json::from_str(
+            r#"{"path":"/tmp/repo","current_branch":"main","is_dirty":false,"ahead":0,"behind":0}"#,
+        )
+        .unwrap();
+        assert_eq!(info.path, "/tmp/repo");
+        assert!(info.error.is_none());
     }
 
     #[test]

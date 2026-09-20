@@ -7,6 +7,12 @@ pub struct RepositoryInfo {
     pub is_dirty: bool,
     pub ahead: usize,
     pub behind: usize,
+    /// Per-repo error for batch queries (`get_repositories_info`).
+    /// `None` means the entry was read successfully; `Some(msg)` carries the
+    /// underlying failure instead of a fabricated "unknown" success.
+    /// Additive/optional: old clients ignore it, old payloads parse via default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

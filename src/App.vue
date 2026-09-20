@@ -43,6 +43,11 @@ const uiStore = useUIStore();
 const settingsStore = useSettingsStore();
 const { withLock } = useOperationMutex();
 
+// Per-repo lock scope so operations on different repositories do not block
+// each other, with the open repo's path as the lock key.
+const withRepoLock = <T>(operationName: string, fn: () => Promise<T>): Promise<T> =>
+  withLock(operationName, fn, { scope: repoStore.repoInfo?.path ?? 'global' });
+
 onErrorCaptured((err, _instance, info) => {
   console.error('Error captured in component:', err, info);
   toast.error(err instanceof Error ? err.message : String(err), { title: 'Component Error' });
@@ -152,7 +157,14 @@ const handleDiscardAllChanges = async () => {
 };
 
 const refreshRepo = async () => {
-  await repoStore.refreshRepo();
+  try {
+    await repoStore.refreshRepo();
+  } catch (err) {
+    // Partial refresh failure: the store keeps previous data marked stale;
+    // surface the error instead of failing silently.
+    console.error('Partial refresh failed:', err);
+    toast.error(err instanceof Error ? err.message : String(err), { title: 'Refresh incomplete' });
+  }
   if (repoStore.conflicts.length > 0 && uiStore.view !== "conflicts") {
     uiStore.setView("conflicts");
   }
@@ -303,7 +315,7 @@ const handleCloneRepo = async () => {
 
 const handlePush = async () => {
   try {
-    await withLock('push', async () => {
+    await withRepoLock('push', async () => {
       uiStore.setLoading(true, "Pushing changes to remote...", true);
       uiStore.clearError();
       await gitService.push();
@@ -322,7 +334,7 @@ const handlePush = async () => {
 
 const handlePull = async () => {
   try {
-    await withLock('pull', async () => {
+    await withRepoLock('pull', async () => {
       uiStore.setLoading(true, "Pulling from remote...", true);
       uiStore.clearError();
       await gitService.pull();
@@ -346,7 +358,7 @@ const handleOAuthAuthenticated = (_user: { login: string; name: string | null; e
 
 const handleFetch = async () => {
   try {
-    await withLock('fetch', async () => {
+    await withRepoLock('fetch', async () => {
       uiStore.setLoading(true, "Fetching from remote...", false);
       uiStore.clearError();
       await gitService.fetch();
@@ -416,7 +428,7 @@ const handleCommit = async () => {
     return;
   }
   try {
-    await withLock('commit', async () => {
+    await withRepoLock('commit', async () => {
       uiStore.setLoading(true, "Creating commit...", true);
       uiStore.clearError();
       if (uiStore.amendCommit) {
@@ -490,7 +502,7 @@ const handleCherryPick = async (sha: string) => {
   const confirmed = await ask(`Cherry-pick commit ${sha.substring(0, 7)}?`, { title: 'Cherry-pick', kind: 'info' });
   if (!confirmed) return;
   try {
-    await withLock('cherry-pick', async () => {
+    await withRepoLock('cherry-pick', async () => {
       uiStore.setLoading(true, "Cherry-picking commit...", false);
       await gitService.cherryPick(sha);
       await repoStore.refreshRepo();
@@ -509,7 +521,7 @@ const handleRevertCommit = async (sha: string) => {
   const confirmed = await ask(`Revert commit ${sha.substring(0, 7)}?`, { title: 'Revert Commit', kind: 'warning' });
   if (!confirmed) return;
   try {
-    await withLock('revert', async () => {
+    await withRepoLock('revert', async () => {
       uiStore.setLoading(true, "Reverting commit...", false);
       await gitService.revertCommit(sha);
       await repoStore.refreshRepo();

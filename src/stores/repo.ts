@@ -18,6 +18,12 @@ export const useRepoStore = defineStore('repo', () => {
   const recentRepoInfos = ref<RepositoryInfo[]>([]);
   const diffs = ref<DiffInfo[]>([]);
 
+  // Per-section staleness + last error from the most recent refreshRepo().
+  // A section is stale when its last refresh failed and the displayed data
+  // may no longer reflect the repository state.
+  const staleSections = ref<Record<string, boolean>>({});
+  const lastRefreshErrors = ref<Record<string, string>>({});
+
   // Selection state
   const selectedFile = ref<string | null>(null);
   const selectedCommit = ref<CommitInfo | null>(null);
@@ -46,35 +52,60 @@ export const useRepoStore = defineStore('repo', () => {
 
   const refreshRepo = async () => {
     if (!repoInfo.value) return;
-    const results = await Promise.allSettled([
-      gitService.getStatus(),
-      gitService.getBranches(),
-      gitService.listStashes(),
-      gitService.getConflicts(),
-      gitService.getCurrentRepoInfo()
-    ]);
-    if (results[0].status === 'fulfilled') fileStatuses.value = results[0].value;
-    else console.error('Failed to get status:', results[0].reason);
-    if (results[1].status === 'fulfilled') branches.value = results[1].value;
-    else console.error('Failed to get branches:', results[1].reason);
-    if (results[2].status === 'fulfilled') stashes.value = results[2].value.slice(0, MAX_STASHES);
-    else console.error('Failed to list stashes:', results[2].reason);
-    if (results[3].status === 'fulfilled') conflicts.value = results[3].value;
-    else console.error('Failed to get conflicts:', results[3].reason);
-    if (results[4].status === 'fulfilled' && results[4].value) {
-      repoInfo.value = results[4].value;
-    } else if (results[4].status === 'rejected') {
-      console.error('Failed to get repo info:', results[4].reason);
-    }
-    if (results.every((r) => r.status === 'rejected')) {
-      throw results[0].status === 'rejected' ? results[0].reason : new Error('Refresh failed');
+    const sections = [
+      {
+        key: 'status',
+        apply: (v: FileStatus[]) => { fileStatuses.value = v; },
+        load: () => gitService.getStatus(),
+      },
+      {
+        key: 'branches',
+        apply: (v: BranchInfo[]) => { branches.value = v; },
+        load: () => gitService.getBranches(),
+      },
+      {
+        key: 'stashes',
+        apply: (v: StashInfo[]) => { stashes.value = v; },
+        load: () => gitService.listStashes(MAX_STASHES, 0),
+      },
+      {
+        key: 'conflicts',
+        apply: (v: ConflictInfo[]) => { conflicts.value = v; },
+        load: () => gitService.getConflicts(),
+      },
+      {
+        key: 'repoInfo',
+        apply: (v: RepositoryInfo | null) => { if (v) repoInfo.value = v; },
+        load: () => gitService.getCurrentRepoInfo(),
+      },
+    ] as const;
+    const results = await Promise.allSettled(sections.map((s) => s.load()));
+    const failures: string[] = [];
+    results.forEach((r, i) => {
+      const section = sections[i];
+      if (r.status === 'fulfilled') {
+        (section.apply as (v: unknown) => void)(r.value);
+        staleSections.value[section.key] = false;
+        delete lastRefreshErrors.value[section.key];
+      } else {
+        // Partial failure: keep the previous data but mark it stale and
+        // record the error instead of silently showing outdated state.
+        staleSections.value[section.key] = true;
+        const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        lastRefreshErrors.value[section.key] = message;
+        console.error(`Failed to refresh ${section.key}:`, r.reason);
+        failures.push(`${section.key}: ${message}`);
+      }
+    });
+    if (failures.length > 0) {
+      throw new Error(`Refresh incomplete (${failures.length}/${sections.length} failed): ${failures.join('; ')}`);
     }
   };
 
-  const refreshCommits = async () => {
+  const refreshCommits = async (limit: number = MAX_COMMITS, offset: number = 0) => {
     commitsLoading.value = true;
     try {
-      commits.value = await gitService.getHistory(MAX_COMMITS);
+      commits.value = await gitService.getHistory(limit, offset);
     } finally {
       commitsLoading.value = false;
     }
@@ -140,6 +171,8 @@ export const useRepoStore = defineStore('repo', () => {
     conflicts,
     recentRepoInfos,
     diffs,
+    staleSections,
+    lastRefreshErrors,
     selectedFile,
     selectedCommit,
     selectedCommitFile,

@@ -104,41 +104,97 @@ type CacheValue<T> = { data: T; until: number };
 
 class GitService {
   private cache = new Map<string, CacheValue<unknown>>();
-  private static SHORT_TTL = 1500;  // status, branches
-  private static MEDIUM_TTL = 5000;  // conflicts (stashes uncached)
-  private static LONG_TTL = 15000;   // settings, tags, remotes, commit diffs
-  private static MAX_CACHE_SIZE = 50;
+  private pending = new Map<string, Promise<unknown>>();
+  private epoch = 0;
+  private static SHORT_TTL = 5000;  // status, branches, history
+  private static MEDIUM_TTL = 15000;  // conflicts (stashes uncached)
+  private static LONG_TTL = 60000;   // settings, tags, remotes, commit diffs
+  private static MAX_CACHE_SIZE = 100;
+  // Per-partition key cap so one namespace (e.g. per-file diffs) cannot
+  // evict everything else. Partition = key segment before the first ':'.
+  private static MAX_PER_PARTITION = 30;
+
+  private partitionOf(key: string): string {
+    const i = key.indexOf(':');
+    return i < 0 ? key : key.slice(0, i);
+  }
+
+  /** Refresh recency so hits count as recently used (LRU, not FIFO). */
+  private touch(key: string, entry: CacheValue<unknown>): void {
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+  }
+
+  /** Evict the LRU key within the partition first, else the global LRU key. */
+  private evictFor(partition: string): void {
+    let count = 0;
+    let oldestInPartition: string | undefined;
+    for (const k of this.cache.keys()) {
+      if (this.partitionOf(k) === partition) {
+        count++;
+        if (oldestInPartition === undefined) oldestInPartition = k;
+      }
+    }
+    if (oldestInPartition !== undefined && count >= GitService.MAX_PER_PARTITION) {
+      this.cache.delete(oldestInPartition);
+      return;
+    }
+    if (this.cache.size >= GitService.MAX_CACHE_SIZE) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) this.cache.delete(oldestKey);
+    }
+  }
 
   private async cached<T>(key: string, fetch: () => Promise<T>, ttl = GitService.SHORT_TTL): Promise<T> {
     const now = Date.now();
     const entry = this.cache.get(key) as CacheValue<T> | undefined;
-    if (entry && entry.until > now) return entry.data;
-    try {
-      const data = await fetch();
-      // Evict oldest entries when cache is full
-      if (this.cache.size >= GitService.MAX_CACHE_SIZE) {
-        const oldestKey = this.cache.keys().next().value;
-        if (oldestKey) this.cache.delete(oldestKey);
-      }
-      this.cache.set(key, { data, until: now + ttl });
-      return data;
-    } catch (error) {
-      // Only fall back to cache if the entry is still within its TTL.
-      // Serving an expired entry would mask real errors and can leak data
-      // from a previous repository state (e.g. phantom stashes).
-      if (entry && entry.until > now) {
-        console.warn('Cache fallback for ' + key + ':', error);
-        return entry.data;
-      }
-      throw error;
+    if (entry && entry.until > now) {
+      this.touch(key, entry);
+      return entry.data;
     }
+    // Same-key in-flight dedup: concurrent callers share one promise.
+    const inFlight = this.pending.get(key) as Promise<T> | undefined;
+    if (inFlight) return inFlight;
+    const startEpoch = this.epoch;
+    let task!: Promise<T>;
+    task = (async (): Promise<T> => {
+      try {
+        const data = await fetch();
+        // Skip caching when an invalidation landed mid-flight so a
+        // pre-mutation response cannot repopulate the cache as fresh.
+        if (this.epoch !== startEpoch) return data;
+        this.evictFor(this.partitionOf(key));
+        this.cache.set(key, { data, until: Date.now() + ttl });
+        return data;
+      } catch (error) {
+        // Only fall back to cache if the entry is still within its TTL.
+        // An expired entry is never served: it would mask real errors and
+        // can leak data from a previous repository state (e.g. phantom
+        // stashes). Expired entries are dropped so the error surfaces.
+        if (entry && entry.until > Date.now()) {
+          console.warn('Cache fallback for ' + key + ':', error);
+          return entry.data;
+        }
+        if (entry) this.cache.delete(key);
+        throw error;
+      } finally {
+        if (this.pending.get(key) === task) this.pending.delete(key);
+      }
+    })();
+    this.pending.set(key, task);
+    return task;
   }
 
   invalidate(prefix?: string): void {
-    if (!prefix) { this.cache.clear(); return; }
+    if (!prefix) { this.cache.clear(); this.pending.clear(); this.epoch++; return; }
+    let dropped = false;
     for (const key of this.cache.keys()) {
-      if (key.startsWith(prefix)) this.cache.delete(key);
+      if (key.startsWith(prefix)) { this.cache.delete(key); dropped = true; }
     }
+    for (const key of this.pending.keys()) {
+      if (key.startsWith(prefix)) { this.pending.delete(key); dropped = true; }
+    }
+    if (dropped) this.epoch++;
   }
 
   /**
@@ -263,10 +319,23 @@ class GitService {
   }
 
   /**
-   * Get commit history
+   * Get commit history with limit/offset pagination. The backend walks from
+   * HEAD with a limit, so offset pages are served client-side from a
+   * (limit + offset) window and cached per page.
    */
-  async getHistory(limit: number = 200): Promise<CommitInfo[]> {
-    return await this.cached(`repo:history:${limit}`, () => invoke("get_commit_history", { limit }), GitService.SHORT_TTL);
+  async getHistory(limit: number = 200, offset: number = 0): Promise<CommitInfo[]> {
+    const safeLimit = Math.max(0, Math.min(Math.floor(limit), 500));
+    const safeOffset = Math.max(0, Math.floor(offset));
+    return await this.cached(
+      `repo:history:${safeLimit}:${safeOffset}`,
+      async () => {
+        const all = (await invoke("get_commit_history", {
+          limit: Math.min(safeLimit + safeOffset, 500),
+        })) as CommitInfo[];
+        return all.slice(safeOffset, safeOffset + safeLimit);
+      },
+      GitService.SHORT_TTL,
+    );
   }
 
   /**
@@ -319,14 +388,18 @@ class GitService {
   }
 
   /**
-   * List stashes
+   * List stashes with limit/offset pagination (applied client-side).
+   * Stash list must always reflect the real repository state.
+   * External tools (terminal, other GUIs) can modify stashes at any time,
+   * and the file watcher will trigger refreshes — caching here would serve
+   * stale data that makes ARK show non-existent stashes.
    */
-  async listStashes(): Promise<StashInfo[]> {
-    // Stash list must always reflect the real repository state.
-    // External tools (terminal, other GUIs) can modify stashes at any time,
-    // and the file watcher will trigger refreshes — caching here would serve
-    // stale data that makes ARK show non-existent stashes.
-    return await invoke("list_stashes");
+  async listStashes(limit?: number, offset: number = 0): Promise<StashInfo[]> {
+    const all = (await invoke("list_stashes")) as StashInfo[];
+    const safeOffset = Math.max(0, Math.floor(offset));
+    if (limit === undefined) return safeOffset === 0 ? all : all.slice(safeOffset);
+    const safeLimit = Math.max(0, Math.floor(limit));
+    return all.slice(safeOffset, safeOffset + safeLimit);
   }
 
   /**
