@@ -7,8 +7,8 @@ mod models;
 
 use models::{
     BranchInfo, BranchOptions, CloneOptions, CommitInfo, CommitOptions, ConflictInfo, DiffInfo,
-    FileStatus, RemoteInfo, RepositoryInfo, Settings, SettingsPayload, StageResult, StashInfo, StashOptions,
-    TagInfo, TagOptions,
+    FileStatus, RemoteInfo, RepoSnapshot, RepositoryInfo, Settings, SettingsPayload, StageResult,
+    StashInfo, StashOptions, TagInfo, TagOptions,
 };
 use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,9 @@ struct AppState {
     watched_paths: Vec<std::path::PathBuf>,
     branch_cache: Option<(Vec<BranchInfo>, std::time::Instant)>,
     recent_info_cache: HashMap<String, (RepositoryInfo, std::time::Instant)>,
+    /// Cached upstream-reachable OID set keyed by upstream tip OID (P2).
+    /// Keyed by tip OID so push/fetch self-invalidate; TTL is a backstop.
+    pushed_cache: Option<(git2::Oid, std::collections::HashSet<git2::Oid>, std::time::Instant)>,
 }
 
 impl Default for AppState {
@@ -143,6 +146,7 @@ impl Default for AppState {
             watched_paths: Vec::new(),
             branch_cache: None,
             recent_info_cache: HashMap::new(),
+            pushed_cache: None,
         }
     }
 }
@@ -603,6 +607,26 @@ fn get_repository_status(state: State<'_, App>) -> AppResult<Vec<FileStatus>> {
     git_operations::get_status(&repo).map_err(|e| AppError::Git(e.into()))
 }
 
+/// Single-open snapshot of the refreshable sections: one repository handle
+/// and one status scan instead of one handle per section plus a duplicate
+/// scan inside `get_repository_info` (P1). Stashes are excluded on purpose —
+/// they must always be read fresh (see `list_stashes`).
+#[tauri::command]
+fn get_repo_snapshot(state: State<'_, App>) -> AppResult<RepoSnapshot> {
+    let repo = open_repo_snapshot(&state)?;
+    let status = git_operations::get_status(&repo).map_err(|e| AppError::Git(e.into()))?;
+    let branches = git_operations::get_branches(&repo).map_err(|e| AppError::Git(e.into()))?;
+    let conflicts = git_operations::get_conflicts(&repo).map_err(|e| AppError::Git(e.into()))?;
+    let info = git_operations::get_repository_info_with_dirty(&repo, !status.is_empty())
+        .map_err(|e| AppError::Git(e.into()))?;
+    Ok(RepoSnapshot {
+        status,
+        branches,
+        conflicts,
+        info,
+    })
+}
+
 #[tauri::command]
 fn create_commit(state: State<'_, App>, options: CommitOptions) -> AppResult<String> {
     if options.message.trim().is_empty() {
@@ -695,7 +719,37 @@ fn get_commit_history(state: State<'_, App>, limit: usize) -> AppResult<Vec<Comm
     let repo = open_repo_snapshot(&state)?;
     // Bound the walk so a huge history cannot stall the command.
     let limit = limit.min(500);
-    git_operations::get_commit_history(&repo, limit).map_err(|e| AppError::Git(e.into()))
+    // P2: reuse the cached upstream-reachable set when the upstream tip is
+    // unchanged. The walk itself runs outside the global lock; only the
+    // cache read/publish take short locks.
+    let upstream_oid = git_operations::resolve_upstream_oid(&repo);
+    if let Some(u_oid) = upstream_oid {
+        let cached = {
+            let state = state
+                .0
+                .lock()
+                .map_err(|_| AppError::Lock("Failed to acquire lock".to_string()))?;
+            match state.pushed_cache.as_ref() {
+                Some((oid, set, time)) if *oid == u_oid && time.elapsed().as_secs() < 30 => {
+                    Some(set.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(set) = cached {
+            return git_operations::get_commit_history_with_pushed_set(&repo, limit, Some(&set))
+                .map_err(|e| AppError::Git(e.into()));
+        }
+        let set = git_operations::build_pushed_set(&repo, u_oid)?;
+        let commits = git_operations::get_commit_history_with_pushed_set(&repo, limit, Some(&set))
+            .map_err(|e| AppError::Git(e.into()))?;
+        if let Ok(mut state) = state.0.lock() {
+            state.pushed_cache = Some((u_oid, set, std::time::Instant::now()));
+        }
+        return Ok(commits);
+    }
+    git_operations::get_commit_history_with_pushed_set(&repo, limit, None)
+        .map_err(|e| AppError::Git(e.into()))
 }
 
 #[tauri::command]
@@ -1352,6 +1406,7 @@ pub fn run() {
                 watched_paths,
                 branch_cache: None,
                 recent_info_cache: HashMap::new(),
+                pushed_cache: None,
             })));
 
             // Cleanup on app exit
@@ -1372,6 +1427,7 @@ pub fn run() {
             open_repository,
             clone_repository,
             get_repository_status,
+            get_repo_snapshot,
             create_commit,
             amend_commit,
             cherry_pick,

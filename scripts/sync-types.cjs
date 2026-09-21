@@ -56,8 +56,9 @@ function extractTSInterfaces(content) {
     const interfaceName = match[1];
     const body = match[2];
 
-    // Extract field names from fieldName: type patterns (ignore comments)
-    const fieldRegex = /^\s*(\w+)\s*:/gm;
+    // Extract field names from fieldName: type patterns (ignore comments).
+    // Optional fields (`name?: type`) count as present.
+    const fieldRegex = /^\s*(\w+)\??\s*:/gm;
     const fields = [];
     let fieldMatch;
 

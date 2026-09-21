@@ -12,6 +12,13 @@ export interface LockOptions {
   scope?: string;
   /** Auto-release + reject after this long. Defaults to 120s. */
   timeoutMs?: number;
+  /**
+   * Queue same-scope calls FIFO instead of deduping/throwing.
+   * Required for parameterized mutations (stage [a] vs stage [b]): dedup
+   * would silently drop the second call's work, and throwing would surface
+   * spurious errors on rapid clicks. Queued calls run strictly one at a time.
+   */
+  serialize?: boolean;
 }
 
 interface LockState {
@@ -24,6 +31,8 @@ interface LockState {
 const DEFAULT_TIMEOUT_MS = 120_000;
 
 const locks = new Map<string, LockState>();
+/** FIFO tail per scope for serialized calls. Never rejects. */
+const tails = new Map<string, Promise<unknown>>();
 const isOperating = ref(false);
 const currentOperation = ref<string | null>(null);
 
@@ -71,14 +80,71 @@ export function useOperationMutex() {
     syncRefs();
   };
 
+  /** FIFO path: every same-scope call runs to completion in arrival order. */
+  const withLockSerialized = <T>(
+    key: string,
+    operationName: string,
+    fn: () => Promise<T>,
+    timeoutMs: number,
+  ): Promise<T> => {
+    const prevTail = tails.get(key) ?? Promise.resolve();
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    // This link resolves when the gate opens (settle or timeout-abandon),
+    // so abandoning never stalls the rest of the queue.
+    const myTail = prevTail.then(
+      () => gate,
+      () => gate,
+    );
+    tails.set(key, myTail);
+
+    const gated = (async (): Promise<T> => {
+      await prevTail.catch(() => undefined);
+      const state: LockState = { owner: operationName, timer: null, current: null };
+      locks.set(key, state);
+      syncRefs();
+      try {
+        return await fn();
+      } finally {
+        if (locks.get(key) === state) {
+          locks.delete(key);
+          syncRefs();
+        }
+      }
+    })();
+    // The task may outlive the waiter's timeout; never let it reject unhandled.
+    void gated.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new OperationTimeoutError(operationName, timeoutMs)), timeoutMs);
+    });
+    return (async (): Promise<T> => {
+      try {
+        return await Promise.race([gated, timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        openGate();
+        if (tails.get(key) === myTail) tails.delete(key);
+      }
+    })();
+  };
+
   const withLock = async <T>(operationName: string, fn: () => Promise<T>, options?: LockOptions): Promise<T> => {
     const key = keyOf(options?.scope);
     const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (options?.serialize) {
+      return withLockSerialized(key, operationName, fn, timeoutMs);
+    }
     const existing = locks.get(key);
     if (existing) {
-      // Same-key in-flight dedup: share the running promise instead of
-      // throwing or launching a duplicate operation.
-      if (existing.current) return existing.current as Promise<T>;
+      // Same-operation in-flight dedup: share the running promise instead of
+      // throwing or launching a duplicate. A *different* operation must never
+      // receive another operation's result, so it is rejected as blocked.
+      if (existing.current && existing.owner === operationName) return existing.current as Promise<T>;
       throw new Error(`Operation "${operationName}" blocked by "${existing.owner}"`);
     }
     const state: LockState = { owner: operationName, timer: null, current: null };
@@ -101,8 +167,10 @@ export function useOperationMutex() {
     const timeout = new Promise<never>((_, reject) => {
       rejectTimeout = reject;
     });
-    // Single timeout timer: auto-release the lock and reject the waiter so a
-    // hung operation can never hold its scope forever.
+    // Timeout releases the scope (liveness: a hung backend call must not brick
+    // the UI forever) while the task runs detached. Stale side effects from the
+    // detached task are discarded by generation/path guards at the state layer
+    // (see repo store), and concurrent git writes fail safely on index.lock.
     state.timer = setTimeout(() => {
       if (locks.get(key) === state) {
         locks.delete(key);
@@ -129,4 +197,19 @@ export function useOperationMutex() {
     release,
     withLock,
   };
+}
+
+/**
+ * Per-repo serialized runner: all mutations for one repository execute
+ * strictly one at a time in arrival order. Use this for every repo-scoped
+ * git mutation so rapid UI actions queue instead of racing.
+ */
+export function useRepoLock() {
+  const { withLock } = useOperationMutex();
+  const withRepoLock = <T>(
+    operationName: string,
+    repoPath: string | null | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> => withLock(operationName, fn, { scope: repoPath ?? 'global', serialize: true });
+  return { withRepoLock };
 }

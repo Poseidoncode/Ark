@@ -9,6 +9,7 @@ export interface RepositoryInfo {
   is_dirty: boolean;
   ahead: number;
   behind: number;
+  error?: string | null;
 }
 
 export interface FileStatus {
@@ -38,6 +39,14 @@ export interface DiffInfo {
   additions: number;
   deletions: number;
   diff_text: string;
+  truncated: boolean;
+}
+
+export interface RepoSnapshot {
+  status: FileStatus[];
+  branches: BranchInfo[];
+  conflicts: ConflictInfo[];
+  info: RepositoryInfo;
 }
 
 export interface StashInfo {
@@ -221,6 +230,16 @@ class GitService {
   }
 
   /**
+   * Single-IPC snapshot of status/branches/conflicts/repoInfo, computed by
+   * the backend with one repository handle and one status scan.
+   * Any mutation that previously invalidated one of the covered sections
+   * must also invalidate 'repo:snapshot'.
+   */
+  async getRepoSnapshot(): Promise<RepoSnapshot> {
+    return await this.cached('repo:snapshot', () => invoke("get_repo_snapshot"), GitService.SHORT_TTL);
+  }
+
+  /**
    * Create commit
    */
   async createCommit(message: string, files: string[]): Promise<string> {
@@ -257,6 +276,7 @@ class GitService {
    */
   async stageFiles(files: string[]): Promise<StageResult> {
     this.invalidate('repo:status');
+    this.invalidate('repo:snapshot');
     this.invalidate('diff:');
     return await invoke("stage_files", { files });
   }
@@ -266,6 +286,7 @@ class GitService {
    */
   async unstageFiles(files: string[]): Promise<void> {
     this.invalidate('repo:status');
+    this.invalidate('repo:snapshot');
     this.invalidate('diff:');
     return await invoke("unstage_files", { files });
   }
@@ -300,6 +321,7 @@ class GitService {
    */
   async createBranch(name: string, startSha?: string): Promise<void> {
     this.invalidate('repo:branches');
+    this.invalidate('repo:snapshot');
     return await invoke("create_branch", { options: { name, start_sha: startSha } });
   }
 
@@ -376,6 +398,7 @@ class GitService {
   async stashSave(message?: string): Promise<void> {
     this.invalidate('repo:stash');
     this.invalidate('repo:status');
+    this.invalidate('repo:snapshot');
     return await invoke("stash_save", { options: { message } });
   }
 
@@ -415,6 +438,7 @@ class GitService {
   async resolveConflict(path: string, useOurs: boolean): Promise<void> {
     this.invalidate('repo:conflicts');
     this.invalidate('repo:status');
+    this.invalidate('repo:snapshot');
     this.invalidate('diff:');
     return await invoke("resolve_conflict", { path, useOurs });
   }
@@ -438,6 +462,7 @@ class GitService {
    * Set remote URL
    */
   async setRemoteUrl(name: string, url: string): Promise<void> {
+    this.invalidate('repo:remotes');
     return await invoke("set_remote_url", { name, url });
   }
 
@@ -473,6 +498,8 @@ class GitService {
    * Add to gitignore
    */
   async addToGitignore(filePath: string): Promise<void> {
+    this.invalidate('repo:status');
+    this.invalidate('repo:snapshot');
     return await invoke("add_to_gitignore", { filePath });
   }
 
@@ -521,6 +548,7 @@ class GitService {
     this.invalidate('repo:branches');
     this.invalidate('repo:stash');
     this.invalidate('repo:status');
+    this.invalidate('repo:snapshot');
     return await invoke("branch_from_stash", { sha, branchName });
   }
 

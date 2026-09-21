@@ -2,28 +2,30 @@
 import { useUIStore } from '../stores/ui';
 import { useRepoStore } from '../stores/repo';
 import { gitService } from '../services/git';
+import { useRepoLock } from '../composables/useOperationMutex';
 
 const uiStore = useUIStore();
 const repoStore = useRepoStore();
-
-const emit = defineEmits<{
-  (e: 'close'): void;
-  (e: 'checkout', branchName: string): void;
-  (e: 'createBranch'): void;
-}>();
+const { withRepoLock } = useRepoLock();
 
 const checkoutBranch = async (branchName: string) => {
+  let mutated = false;
   try {
     uiStore.setLoading(true, "Checking out branch...", false);
     uiStore.clearError();
-    await gitService.checkoutBranch(branchName);
+    await withRepoLock('checkout', repoStore.repoInfo?.path, async () => {
+      await gitService.checkoutBranch(branchName);
+    });
+    mutated = true;
     uiStore.closeModal('branch');
     repoStore.clearSelection();
     await repoStore.refreshRepo();
     uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => emit('checkout', branchName);
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await checkoutBranch(branchName);
   } finally {
     uiStore.setLoading(false);
   }
@@ -31,16 +33,26 @@ const checkoutBranch = async (branchName: string) => {
 
 const handleCreateBranch = async () => {
   if (!uiStore.newBranchName.trim()) return;
+  const name = uiStore.newBranchName.trim();
+  let mutated = false;
   try {
     uiStore.setLoading(true, "Creating branch...", false);
-    await gitService.createBranch(uiStore.newBranchName.trim());
+    await withRepoLock('create-branch', repoStore.repoInfo?.path, async () => {
+      await gitService.createBranch(name);
+    });
+    mutated = true;
     uiStore.setNewBranchName("");
     uiStore.closeModal('branch');
     await repoStore.refreshRepo();
     uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => emit('createBranch');
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => {
+          uiStore.setNewBranchName(name);
+          await handleCreateBranch();
+        };
   } finally {
     uiStore.setLoading(false);
   }

@@ -216,6 +216,19 @@ pub fn clone_repository(
 }
 
 pub fn get_repository_info(repo: &Repository) -> Result<RepositoryInfo, String> {
+    let statuses = repo
+        .statuses(None)
+        .map_err(|e| format!("Failed to get statuses: {}", e))?;
+    get_repository_info_with_dirty(repo, !statuses.is_empty())
+}
+
+/// Builds `RepositoryInfo` reusing a caller-supplied dirty flag so the
+/// snapshot command can derive it from its single status scan instead of
+/// scanning a second time (P1).
+pub fn get_repository_info_with_dirty(
+    repo: &Repository,
+    is_dirty: bool,
+) -> Result<RepositoryInfo, String> {
     let mut ahead = 0;
     let mut behind = 0;
     let mut current_branch = "unknown".to_string();
@@ -256,12 +269,6 @@ pub fn get_repository_info(repo: &Repository) -> Result<RepositoryInfo, String> 
             }
         }
     }
-
-    let statuses = repo
-        .statuses(None)
-        .map_err(|e| format!("Failed to get statuses: {}", e))?;
-
-    let is_dirty = !statuses.is_empty();
 
     let mut path = repo
         .workdir()
@@ -331,6 +338,22 @@ pub fn get_status(repo: &Repository) -> Result<Vec<FileStatus>, String> {
 }
 
 fn validate_repo_path(repo: &Repository, path: &str) -> Result<PathBuf, String> {
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve repository path: {}", e))?;
+    validate_repo_path_with_workdir(repo, path, workdir, &canonical_workdir)
+}
+
+/// Batch-friendly path validation: `workdir`/`canonical_workdir` are resolved
+/// once by the caller instead of once per path (P9: staging N files used to
+/// canonicalize the workdir N times).
+fn validate_repo_path_with_workdir(
+    _repo: &Repository,
+    path: &str,
+    workdir: &Path,
+    canonical_workdir: &Path,
+) -> Result<PathBuf, String> {
     if path.is_empty() {
         return Err("Path cannot be empty".to_string());
     }
@@ -347,10 +370,6 @@ fn validate_repo_path(repo: &Repository, path: &str) -> Result<PathBuf, String> 
         return Err("Path traversal is not allowed".to_string());
     }
 
-    let workdir = repo.workdir().ok_or("No working directory found")?;
-    let canonical_workdir = workdir
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve repository path: {}", e))?;
     let full_path = workdir.join(relative_path);
 
     // Lexical containment check on the normalized components (no fs access):
@@ -443,17 +462,21 @@ pub fn stage_files(repo: &Repository, paths: Vec<String>) -> Result<StageResult,
         .map_err(|e| format!("Failed to get index: {}", e))?;
 
     let workdir = repo.workdir().ok_or("No working directory found")?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve repository path: {}", e))?;
     let mut staged = Vec::new();
     let mut warnings = Vec::new();
 
     for path in paths {
-        let full_path = match validate_repo_path(repo, &path) {
-            Ok(full_path) => full_path,
-            Err(err) => {
-                warnings.push(format!("Skipped '{}': {}", path, err));
-                continue;
-            }
-        };
+        let full_path =
+            match validate_repo_path_with_workdir(repo, &path, workdir, &canonical_workdir) {
+                Ok(full_path) => full_path,
+                Err(err) => {
+                    warnings.push(format!("Skipped '{}': {}", path, err));
+                    continue;
+                }
+            };
         let relative_path = full_path
             .strip_prefix(workdir)
             .map_err(|_| format!("Validated path '{}' is outside the repository", path))?;
@@ -479,10 +502,14 @@ pub fn stage_files(repo: &Repository, paths: Vec<String>) -> Result<StageResult,
 
 pub fn unstage_files(repo: &Repository, paths: Vec<String>) -> Result<(), String> {
     let workdir = repo.workdir().ok_or("No working directory found")?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve repository path: {}", e))?;
     let validated_paths = paths
         .iter()
         .map(|path| {
-            let full_path = validate_repo_path(repo, path)?;
+            let full_path =
+                validate_repo_path_with_workdir(repo, path, workdir, &canonical_workdir)?;
             let relative_path = full_path
                 .strip_prefix(workdir)
                 .map_err(|_| format!("Validated path '{}' is outside the repository", path))?;
@@ -735,9 +762,13 @@ pub fn discard_all_changes(repo: &Repository) -> Result<(), String> {
         .statuses(Some(&mut status_opts))
         .map_err(|e| format!("Failed to get status: {}", e))?;
 
+    let workdir = repo.workdir().ok_or("No working directory found")?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve repository path: {}", e))?;
     for entry in statuses.iter() {
         if let Some(path) = entry.path() {
-            validate_repo_path(repo, path)?;
+            validate_repo_path_with_workdir(repo, path, workdir, &canonical_workdir)?;
         }
     }
 
@@ -776,21 +807,36 @@ pub fn create_branch(repo: &Repository, name: &str, start_sha: Option<&str>) -> 
 /// by nature; without a cap a single huge file can exhaust memory by
 /// concatenating every line into one string.
 const MAX_DIFF_TEXT_BYTES: usize = 200_000;
+/// Global text budget across all files in one diff response. Per-file caps
+/// alone still allow `#files x 200KB` through IPC; the global budget bounds
+/// the total payload. Counting continues after the budget is spent — only
+/// stored text is capped, and capped files are flagged via `truncated`.
+const MAX_DIFF_TOTAL_BYTES: usize = 1_000_000;
 const DIFF_TRUNCATED_MARKER: &str = "\n... [diff truncated]";
 
-/// Appends one diff line to `entry`, truncating at MAX_DIFF_TEXT_BYTES.
-/// Line counts still increment after truncation; only the text is capped.
-fn push_diff_line(entry: &mut DiffInfo, prefix: Option<char>, content: &str) {
-    if entry.diff_text.len() >= MAX_DIFF_TEXT_BYTES {
+/// Appends one diff line to `entry`, truncating at MAX_DIFF_TEXT_BYTES per
+/// file and at the shared `budget` across files. Line counts still increment
+/// after truncation; only the text is capped and `truncated` is set.
+fn push_diff_line(entry: &mut DiffInfo, prefix: Option<char>, content: &str, budget: &mut usize) {
+    if *budget == 0 {
+        entry.truncated = true;
         if !entry.diff_text.ends_with(DIFF_TRUNCATED_MARKER) {
             entry.diff_text.push_str(DIFF_TRUNCATED_MARKER);
         }
         return;
     }
+    if entry.diff_text.len() >= MAX_DIFF_TEXT_BYTES {
+        entry.truncated = true;
+        if !entry.diff_text.ends_with(DIFF_TRUNCATED_MARKER) {
+            entry.diff_text.push_str(DIFF_TRUNCATED_MARKER);
+        }
+        return;
+    }
+    let before = entry.diff_text.len();
     if let Some(prefix) = prefix {
         entry.diff_text.push(prefix);
     }
-    let remaining = MAX_DIFF_TEXT_BYTES - entry.diff_text.len();
+    let remaining = (MAX_DIFF_TEXT_BYTES - entry.diff_text.len()).min(*budget);
     let bytes = content.as_bytes();
     if bytes.len() > remaining {
         // Keep the text valid UTF-8 by cutting at a char boundary.
@@ -800,9 +846,11 @@ fn push_diff_line(entry: &mut DiffInfo, prefix: Option<char>, content: &str) {
         }
         entry.diff_text.push_str(&content[..end]);
         entry.diff_text.push_str(DIFF_TRUNCATED_MARKER);
+        entry.truncated = true;
     } else {
         entry.diff_text.push_str(content);
     }
+    *budget = budget.saturating_sub(entry.diff_text.len() - before);
 }
 
 pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, String> {
@@ -837,6 +885,7 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
     use std::collections::HashMap;
     let mut diff_infos = Vec::new();
     let mut path_index: HashMap<String, usize> = HashMap::new();
+    let mut budget = MAX_DIFF_TOTAL_BYTES;
 
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let file_path = delta
@@ -855,6 +904,7 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
                     diff_text: String::new(),
                     additions: 0,
                     deletions: 0,
+                    truncated: false,
                 });
                 path_index.insert(file_path, i);
                 i
@@ -871,6 +921,7 @@ pub fn get_commit_diff(repo: &Repository, sha: &str) -> Result<Vec<DiffInfo>, St
             &mut diff_infos[idx],
             prefix,
             std::str::from_utf8(line.content()).unwrap_or("<binary>"),
+            &mut budget,
         );
         match line.origin() {
             '+' => diff_infos[idx].additions += 1,
@@ -975,25 +1026,67 @@ pub fn checkout_branch(repo: &Repository, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, String> {
-    let head = repo.head().ok();
+/// Resolves the current branch's upstream tip OID, if any. Cheap: no walk.
+pub fn resolve_upstream_oid(repo: &Repository) -> Option<git2::Oid> {
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let name = head.name()?;
+    let upstream = repo.branch_upstream_name(name).ok()?;
+    let upstream_name = upstream.as_str()?;
+    repo.find_reference(upstream_name).ok()?.target()
+}
 
-    // Get upstream OID to check for pushed status
-    let upstream_oid = head.as_ref().and_then(|h| {
-        if h.is_branch() {
-            h.name().and_then(|name| {
-                repo.branch_upstream_name(name).ok().and_then(|upstream| {
-                    upstream
-                        .as_str()
-                        .and_then(|u_name| repo.find_reference(u_name).ok())
-                        .and_then(|r| r.target())
-                })
-            })
-        } else {
-            None
+const MAX_UPSTREAM_WALK: usize = 20_000;
+
+/// Builds the set of upstream-reachable commit OIDs. All commits in the set
+/// count as pushed. This is O(n) once instead of O(n²) with per-commit
+/// graph_descendant_of calls. The walk is capped so a huge upstream history
+/// cannot grow the set without bound; commits beyond the cap are
+/// conservatively reported as unpushed.
+pub fn build_pushed_set(
+    repo: &Repository,
+    upstream_oid: git2::Oid,
+) -> Result<std::collections::HashSet<git2::Oid>, String> {
+    let mut walk = repo
+        .revwalk()
+        .map_err(|e| format!("Failed to create pushed walk: {}", e))?;
+    walk.push(upstream_oid)
+        .map_err(|e| format!("Failed to push upstream: {}", e))?;
+    let mut set = std::collections::HashSet::new();
+    for oid_result in walk {
+        if set.len() >= MAX_UPSTREAM_WALK {
+            break;
         }
-    });
+        match oid_result {
+            Ok(oid) => {
+                set.insert(oid);
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(set)
+}
 
+/// Uncached convenience wrapper (used by tests; production goes through the
+/// cached command path in `lib.rs`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    let pushed_oids = match resolve_upstream_oid(repo) {
+        Some(u_oid) => Some(build_pushed_set(repo, u_oid)?),
+        None => None,
+    };
+    get_commit_history_with_pushed_set(repo, limit, pushed_oids.as_ref())
+}
+
+/// History walk reusing a caller-supplied pushed set so the command layer can
+/// cache the expensive upstream walk across refreshes (P2).
+pub fn get_commit_history_with_pushed_set(
+    repo: &Repository,
+    limit: usize,
+    pushed_oids: Option<&std::collections::HashSet<git2::Oid>>,
+) -> Result<Vec<CommitInfo>, String> {
     let mut revwalk = repo
         .revwalk()
         .map_err(|e| format!("Failed to create revwalk: {}", e))?;
@@ -1001,35 +1094,6 @@ pub fn get_commit_history(repo: &Repository, limit: usize) -> Result<Vec<CommitI
     revwalk
         .push_head()
         .map_err(|e| format!("Failed to push HEAD: {}", e))?;
-
-    // Pre-compute the set of pushed commit OIDs by walking from upstream.
-    // All commits reachable from upstream are pushed. This is O(n) once
-    // instead of O(n²) with per-commit graph_descendant_of calls.
-    // The walk is capped so a huge upstream history cannot grow the set
-    // without bound; the revwalk below is already bounded by `limit`, so a
-    // commit beyond the cap is conservatively reported as unpushed.
-    use std::collections::HashSet;
-    const MAX_UPSTREAM_WALK: usize = 20_000;
-    let pushed_oids: Option<HashSet<git2::Oid>> = if let Some(u_oid) = upstream_oid {
-        let mut walk = repo
-            .revwalk()
-            .map_err(|e| format!("Failed to create pushed walk: {}", e))?;
-        walk.push(u_oid)
-            .map_err(|e| format!("Failed to push upstream: {}", e))?;
-        let mut set = HashSet::new();
-        for oid_result in walk {
-            if set.len() >= MAX_UPSTREAM_WALK {
-                break;
-            }
-            match oid_result {
-                Ok(oid) => { set.insert(oid); }
-                Err(_) => break,
-            }
-        }
-        Some(set)
-    } else {
-        None
-    };
 
     let mut commits = Vec::new();
 
@@ -1087,6 +1151,7 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
     use std::collections::HashMap;
     let mut diff_infos = Vec::new();
     let mut path_index: HashMap<String, usize> = HashMap::new();
+    let mut budget = MAX_DIFF_TOTAL_BYTES;
 
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         let file_path = delta
@@ -1105,6 +1170,7 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
                     diff_text: String::new(),
                     additions: 0,
                     deletions: 0,
+                    truncated: false,
                 });
                 path_index.insert(file_path, i);
                 i
@@ -1121,6 +1187,7 @@ pub fn get_diff(repo: &Repository, path: Option<&str>) -> Result<Vec<DiffInfo>, 
             &mut diff_infos[idx],
             prefix,
             std::str::from_utf8(line.content()).unwrap_or("<binary>"),
+            &mut budget,
         );
         match line.origin() {
             '+' => diff_infos[idx].additions += 1,
@@ -3309,6 +3376,121 @@ mod tests {
 
         let err = add_to_gitignore(&repo, "../outside.txt").unwrap_err();
         assert!(err.contains("traversal") || err.contains("outside") || err.contains("Invalid"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_push_diff_line_sets_truncated_on_per_file_cap() {
+        let mut entry = DiffInfo {
+            path: "big.txt".to_string(),
+            diff_text: String::new(),
+            additions: 0,
+            deletions: 0,
+            truncated: false,
+        };
+        let mut budget = usize::MAX;
+        push_diff_line(
+            &mut entry,
+            Some('+'),
+            &"x".repeat(MAX_DIFF_TEXT_BYTES + 64),
+            &mut budget,
+        );
+        assert!(entry.truncated, "over-cap line must flag truncation");
+        assert!(entry.diff_text.ends_with(DIFF_TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn test_push_diff_line_respects_shared_global_budget() {
+        let mut budget = 10usize;
+        let mut first = DiffInfo {
+            path: "a.txt".to_string(),
+            diff_text: String::new(),
+            additions: 0,
+            deletions: 0,
+            truncated: false,
+        };
+        push_diff_line(&mut first, Some('+'), "hello", &mut budget);
+        assert!(!first.truncated);
+        assert_eq!(budget, 10 - "+hello".len());
+
+        let mut second = DiffInfo {
+            path: "b.txt".to_string(),
+            diff_text: String::new(),
+            additions: 0,
+            deletions: 0,
+            truncated: false,
+        };
+        push_diff_line(&mut second, Some('+'), "world, this is long", &mut budget);
+        assert!(
+            second.truncated,
+            "budget-exhausted file must flag truncation"
+        );
+        assert!(second.diff_text.ends_with(DIFF_TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn test_batch_path_validation_matches_single_path_validation() {
+        let (root, repo, _) = create_committed_repo();
+        let workdir = repo.workdir().unwrap();
+        let canonical = workdir.canonicalize().unwrap();
+
+        let single = validate_repo_path(&repo, "base.txt").unwrap();
+        let batched =
+            validate_repo_path_with_workdir(&repo, "base.txt", workdir, &canonical).unwrap();
+        assert_eq!(single, batched);
+
+        for bad in ["", "../escape.txt", "/abs.txt", "a/../../b.txt"] {
+            assert!(
+                validate_repo_path_with_workdir(&repo, bad, workdir, &canonical).is_err(),
+                "batch validator must reject {bad:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_upstream_oid_and_pushed_set_cover_only_pushed_commits() {
+        let root = get_temp_dir();
+        let seed_path = root.join("seed");
+        let origin_path = root.join("origin.git");
+        let repo = init_working_repo(&seed_path);
+        commit_file(&seed_path, "a.txt", "one", "first");
+
+        fs::create_dir_all(&origin_path).unwrap();
+        init_bare_remote(&origin_path);
+        run_git_command(
+            vec!["remote", "add", "origin", origin_path.to_str().unwrap()],
+            Some(seed_path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        run_git_command(
+            vec!["push", "-u", "origin", &branch],
+            Some(seed_path.to_str().unwrap()),
+            vec![],
+        )
+        .unwrap();
+        commit_file(&seed_path, "a.txt", "two", "second");
+
+        let repo = open_repository(seed_path.to_str().unwrap()).unwrap();
+        let upstream = resolve_upstream_oid(&repo).expect("upstream oid should resolve");
+        let set = build_pushed_set(&repo, upstream).unwrap();
+
+        let first_oid = repo.revparse_single("HEAD~1").unwrap().id();
+        let second_oid = repo.revparse_single("HEAD").unwrap().id();
+        assert!(set.contains(&first_oid), "pushed commit must be in the set");
+        assert!(
+            !set.contains(&second_oid),
+            "local-only commit must not be in the set"
+        );
+
+        let history = get_commit_history_with_pushed_set(&repo, 10, Some(&set)).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(!history[0].is_pushed, "HEAD (local-only) must be unpushed");
+        assert!(history[1].is_pushed, "HEAD~1 (pushed) must be pushed");
 
         let _ = fs::remove_dir_all(root);
     }

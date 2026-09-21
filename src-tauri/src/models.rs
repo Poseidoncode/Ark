@@ -46,6 +46,23 @@ pub struct DiffInfo {
     pub additions: usize,
     pub deletions: usize,
     pub diff_text: String,
+    /// True when `diff_text` was capped (per-file or global budget) and does
+    /// not contain the full patch. Counts (`additions`/`deletions`) still
+    /// reflect the real diff.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Single-open snapshot of the refreshable repo sections (P1: one repository
+/// handle, one status scan — replaces 5 parallel commands that each reopened
+/// the repo and scanned status twice). Stashes are intentionally excluded:
+/// they must never be served from cache.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RepoSnapshot {
+    pub status: Vec<FileStatus>,
+    pub branches: Vec<BranchInfo>,
+    pub conflicts: Vec<ConflictInfo>,
+    pub info: RepositoryInfo,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

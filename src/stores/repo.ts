@@ -50,104 +50,120 @@ export const useRepoStore = defineStore('repo', () => {
     recentRepoInfos.value = infos;
   };
 
+  // Generation counters + repo-path guards discard stale async responses:
+  // rapid selection changes, overlapping refreshes, or a repo switch
+  // mid-flight must never let an older response overwrite newer state.
+  let refreshGen = 0;
+  let commitsGen = 0;
+  let fileDiffGen = 0;
+  let commitDiffGen = 0;
+
   const refreshRepo = async () => {
     if (!repoInfo.value) return;
-    const sections = [
-      {
-        key: 'status',
-        apply: (v: FileStatus[]) => { fileStatuses.value = v; },
-        load: () => gitService.getStatus(),
-      },
-      {
-        key: 'branches',
-        apply: (v: BranchInfo[]) => { branches.value = v; },
-        load: () => gitService.getBranches(),
-      },
-      {
-        key: 'stashes',
-        apply: (v: StashInfo[]) => { stashes.value = v; },
-        load: () => gitService.listStashes(MAX_STASHES, 0),
-      },
-      {
-        key: 'conflicts',
-        apply: (v: ConflictInfo[]) => { conflicts.value = v; },
-        load: () => gitService.getConflicts(),
-      },
-      {
-        key: 'repoInfo',
-        apply: (v: RepositoryInfo | null) => { if (v) repoInfo.value = v; },
-        load: () => gitService.getCurrentRepoInfo(),
-      },
-    ] as const;
-    const results = await Promise.allSettled(sections.map((s) => s.load()));
+    const path = repoInfo.value.path;
+    const myGen = ++refreshGen;
+    // One snapshot IPC (status/branches/conflicts/repoInfo, single backend
+    // open + single status scan) plus the always-fresh stash list.
+    const [snapshotResult, stashResult] = await Promise.allSettled([
+      gitService.getRepoSnapshot(),
+      gitService.listStashes(MAX_STASHES, 0),
+    ]);
+    // Stale: repo switched or a newer refresh started — drop silently.
+    if (repoInfo.value?.path !== path || myGen !== refreshGen) return;
     const failures: string[] = [];
-    results.forEach((r, i) => {
-      const section = sections[i];
-      if (r.status === 'fulfilled') {
-        (section.apply as (v: unknown) => void)(r.value);
-        staleSections.value[section.key] = false;
-        delete lastRefreshErrors.value[section.key];
-      } else {
-        // Partial failure: keep the previous data but mark it stale and
-        // record the error instead of silently showing outdated state.
-        staleSections.value[section.key] = true;
-        const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
-        lastRefreshErrors.value[section.key] = message;
-        console.error(`Failed to refresh ${section.key}:`, r.reason);
-        failures.push(`${section.key}: ${message}`);
-      }
-    });
+    const markFresh = (key: string) => {
+      staleSections.value[key] = false;
+      delete lastRefreshErrors.value[key];
+    };
+    const markStale = (key: string, reason: unknown) => {
+      staleSections.value[key] = true;
+      const message = reason instanceof Error ? reason.message : String(reason);
+      lastRefreshErrors.value[key] = message;
+      console.error(`Failed to refresh ${key}:`, reason);
+      failures.push(`${key}: ${message}`);
+    };
+    if (snapshotResult.status === 'fulfilled') {
+      const snap = snapshotResult.value;
+      fileStatuses.value = snap.status;
+      branches.value = snap.branches;
+      conflicts.value = snap.conflicts;
+      repoInfo.value = snap.info;
+      markFresh('status');
+      markFresh('branches');
+      markFresh('conflicts');
+      markFresh('repoInfo');
+    } else {
+      markStale('status', snapshotResult.reason);
+      markStale('branches', snapshotResult.reason);
+      markStale('conflicts', snapshotResult.reason);
+      markStale('repoInfo', snapshotResult.reason);
+    }
+    if (stashResult.status === 'fulfilled') {
+      stashes.value = stashResult.value;
+      markFresh('stashes');
+    } else {
+      markStale('stashes', stashResult.reason);
+    }
     if (failures.length > 0) {
-      throw new Error(`Refresh incomplete (${failures.length}/${sections.length} failed): ${failures.join('; ')}`);
+      throw new Error(`Refresh incomplete: ${failures.join('; ')}`);
     }
   };
 
   const refreshCommits = async (limit: number = MAX_COMMITS, offset: number = 0) => {
+    const path = repoInfo.value?.path;
+    const myGen = ++commitsGen;
     commitsLoading.value = true;
     try {
-      commits.value = await gitService.getHistory(limit, offset);
+      const list = await gitService.getHistory(limit, offset);
+      if (repoInfo.value?.path !== path || myGen !== commitsGen) return;
+      commits.value = list;
     } finally {
-      commitsLoading.value = false;
+      // Only the latest call for the current repo may clear the flag.
+      if (repoInfo.value?.path === path && myGen === commitsGen) {
+        commitsLoading.value = false;
+      }
     }
   };
 
   const setSelectedFile = async (filePath: string | null) => {
     selectedFile.value = filePath;
-    if (filePath) {
-      try {
-        const d = await gitService.getDiff(filePath);
-        diffs.value = d;
-      } catch (err) {
-        console.error('Failed to get diff:', err);
-        diffs.value = [];
-      }
-    } else {
+    if (!filePath) {
+      diffs.value = [];
+      return;
+    }
+    const path = repoInfo.value?.path;
+    const myGen = ++fileDiffGen;
+    try {
+      const d = await gitService.getDiff(filePath);
+      if (myGen !== fileDiffGen || repoInfo.value?.path !== path || selectedFile.value !== filePath) return;
+      diffs.value = d;
+    } catch (err) {
+      if (myGen !== fileDiffGen || repoInfo.value?.path !== path || selectedFile.value !== filePath) return;
+      console.error('Failed to get diff:', err);
       diffs.value = [];
     }
   };
 
   const setSelectedCommit = async (commit: CommitInfo | null) => {
     selectedCommit.value = commit;
-    if (commit) {
-      try {
-        const d = await gitService.getCommitDiff(commit.sha);
-        diffs.value = d;
-        if (d.length > 0) {
-          selectedCommitFile.value = d[0].path;
-        } else {
-          selectedCommitFile.value = null;
-        }
-      } catch (err) {
-        const errMsg = String(err);
-        if (errMsg.includes("Commit not found")) {
-          console.warn("Selected commit not found, diff unavailable:", err);
-          diffs.value = [];
-          selectedCommitFile.value = null;
-        } else {
-          throw err;
-        }
-      }
-    } else {
+    if (!commit) {
+      diffs.value = [];
+      selectedCommitFile.value = null;
+      return;
+    }
+    const path = repoInfo.value?.path;
+    const sha = commit.sha;
+    const myGen = ++commitDiffGen;
+    try {
+      const d = await gitService.getCommitDiff(sha);
+      if (myGen !== commitDiffGen || repoInfo.value?.path !== path || selectedCommit.value?.sha !== sha) return;
+      diffs.value = d;
+      selectedCommitFile.value = d.length > 0 ? d[0].path : null;
+    } catch (err) {
+      if (myGen !== commitDiffGen || repoInfo.value?.path !== path || selectedCommit.value?.sha !== sha) return;
+      // A selection change must never throw into the watcher: a missing or
+      // unreadable commit simply yields an empty diff view.
+      console.warn('Commit diff unavailable:', err);
       diffs.value = [];
       selectedCommitFile.value = null;
     }

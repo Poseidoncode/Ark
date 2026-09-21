@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
+import { reactive, computed, onMounted, onUnmounted, watch, onErrorCaptured } from 'vue';
 import { gitService, type CommitInfo, type StageResult } from './services/git';
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { useToast } from './composables/useToast';
@@ -34,19 +34,15 @@ import InputModal from './components/InputModal.vue';
 
 // Helper functions
 import { getRepoName } from './utils/path';
-import { useOperationMutex } from './composables/useOperationMutex';
-import { useDebouncedAsync } from './composables/useDebouncedAsync';
+import { useOperationMutex, useRepoLock } from './composables/useOperationMutex';
 
 // Initialize stores
 const repoStore = useRepoStore();
 const uiStore = useUIStore();
 const settingsStore = useSettingsStore();
 const { withLock } = useOperationMutex();
-
-// Per-repo lock scope so operations on different repositories do not block
-// each other, with the open repo's path as the lock key.
-const withRepoLock = <T>(operationName: string, fn: () => Promise<T>): Promise<T> =>
-  withLock(operationName, fn, { scope: repoStore.repoInfo?.path ?? 'global' });
+// Serialized per-repo runner: mutations for one repo execute one at a time.
+const { withRepoLock } = useRepoLock();
 
 onErrorCaptured((err, _instance, info) => {
   console.error('Error captured in component:', err, info);
@@ -121,15 +117,18 @@ const handleInputModalCancel = () => {
 const toggleAllStaged = async () => {
   if (repoStore.fileStatuses.length === 0) return;
   try {
-    const paths = repoStore.fileStatuses.map(f => f.path);
-    if (repoStore.allStaged) {
-      await gitService.unstageFiles(paths);
-    } else {
-      const result: StageResult = await gitService.stageFiles(paths);
-      if (result.warnings.length > 0) {
-        uiStore.setError(result.warnings.join('\n'));
+    // Decide inside the lock so queued toggles alternate correctly.
+    await withRepoLock('toggle-all-staged', repoStore.repoInfo?.path, async () => {
+      const paths = repoStore.fileStatuses.map(f => f.path);
+      if (repoStore.allStaged) {
+        await gitService.unstageFiles(paths);
+      } else {
+        const result: StageResult = await gitService.stageFiles(paths);
+        if (result.warnings.length > 0) {
+          uiStore.setError(result.warnings.join('\n'));
+        }
       }
-    }
+    });
     await repoStore.refreshRepo();
   } catch (err) {
     uiStore.setError(String(err));
@@ -142,15 +141,21 @@ const handleDiscardAllChanges = async () => {
     kind: 'warning'
   });
   if (!confirmed) return;
+  let mutated = false;
   try {
     uiStore.setLoading(true, "Discarding all changes...", false);
-    await gitService.discardAllChanges();
+    await withRepoLock('discard-all', repoStore.repoInfo?.path, async () => {
+      await gitService.discardAllChanges();
+    });
+    mutated = true;
     repoStore.selectedFile = null;
     await repoStore.refreshRepo();
     uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleDiscardAllChanges();
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handleDiscardAllChanges();
   } finally {
     uiStore.setLoading(false);
   }
@@ -178,9 +183,6 @@ const refreshRepo = async () => {
   }
 };
 
-// Debounced version for watcher events to coalesce rapid file-system notifications
-const { trigger: debouncedRefresh, cancel: cancelDebouncedRefresh } = useDebouncedAsync(refreshRepo, 300);
-
 let unlisten: (() => void) | null = null;
 
 onMounted(async () => {
@@ -197,15 +199,15 @@ onMounted(async () => {
   } catch (err) {
     console.error("Failed to fetch initial repo info", err);
   }
+  // The backend watcher already debounces (300ms) and drains bursts; a second
+  // frontend debounce would only add up to 300ms of lag (P8).
   unlisten = await listen('git-state-changed', () => {
-    // Use debounced refresh to coalesce rapid watcher events into a single refresh
-    debouncedRefresh().catch((err: unknown) => console.error('git-state-changed refresh failed:', err));
+    refreshRepo().catch((err: unknown) => console.error('git-state-changed refresh failed:', err));
   });
 });
 
 onUnmounted(() => {
   if (unlisten) unlisten();
-  cancelDebouncedRefresh();
 });
 
 // ── Watchers ──
@@ -253,29 +255,40 @@ watch(() => uiStore.showRecentRepos, async (isOpen) => {
 
 // ── Repo actions ──
 const handleOpenRepo = async (path?: string) => {
-  try {
-    uiStore.setLoading(true, "Opening repository...", true);
-    uiStore.clearError();
-    let selectedPath = path;
-    if (!selectedPath) {
-      const selected = await open({ directory: true, multiple: false, title: "Open Repository" });
-      if (selected && typeof selected === "string") selectedPath = selected;
-    }
-    if (selectedPath) {
+  // Pick the directory outside the lock; only the repo switch is serialized.
+  let selectedPath = path;
+  if (!selectedPath) {
+    const selected = await open({ directory: true, multiple: false, title: "Open Repository" });
+    if (selected && typeof selected === "string") selectedPath = selected;
+  }
+  if (!selectedPath) {
+    uiStore.closeModal('recentRepos');
+    return;
+  }
+  // Serialize repo switches: overlapping opens would leave the backend and
+  // the frontend pointing at different repositories (B3).
+  await withLock('open-repo', async () => {
+    let mutated = false;
+    try {
+      uiStore.setLoading(true, "Opening repository...", true);
+      uiStore.clearError();
       const info = await gitService.openRepository(selectedPath);
       repoStore.setRepoInfo(info);
       repoStore.clearSelection();
       await settingsStore.fetchSettings();
+      mutated = true;
       await refreshRepo();
+      uiStore.clearError();
+    } catch (err) {
+      uiStore.setError(String(err));
+      uiStore.lastFailedOperation = mutated
+        ? async () => { await refreshRepo(); }
+        : async () => await handleOpenRepo(selectedPath);
+    } finally {
+      uiStore.setLoading(false);
+      uiStore.closeModal('recentRepos');
     }
-    uiStore.clearError();
-  } catch (err) {
-    uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleOpenRepo(path);
-  } finally {
-    uiStore.setLoading(false);
-    uiStore.closeModal('recentRepos');
-  }
+  }, { scope: 'open-repo', serialize: true });
 };
 
 const triggerCloneModal = () => uiStore.openModal('clone');
@@ -294,58 +307,78 @@ const handleCloneRepo = async () => {
   const url = uiStore.cloneUrl;
   const path = uiStore.clonePath;
   uiStore.closeModal('clone');
-  try {
-    uiStore.setLoading(true, '', true);
-    uiStore.clearError();
-    await gitService.cloneRepository(url, path);
-    const info = await gitService.openRepository(path);
-    repoStore.setRepoInfo(info);
-    repoStore.clearSelection();
-    await settingsStore.fetchSettings();
-    await refreshRepo();
-    uiStore.clearError();
-  } catch (err) {
-    uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleCloneRepo();
-    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
-  } finally {
-    uiStore.setLoading(false);
-  }
+  await withLock('clone-repo', async () => {
+    let mutated = false;
+    try {
+      uiStore.setLoading(true, '', true);
+      uiStore.clearError();
+      await gitService.cloneRepository(url, path);
+      const info = await gitService.openRepository(path);
+      repoStore.setRepoInfo(info);
+      repoStore.clearSelection();
+      await settingsStore.fetchSettings();
+      mutated = true;
+      await refreshRepo();
+      uiStore.clearError();
+    } catch (err) {
+      uiStore.setError(String(err));
+      uiStore.lastFailedOperation = mutated
+        ? async () => { await refreshRepo(); }
+        : async () => await handleCloneRepo();
+      if (!mutated) {
+        setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
+      }
+    } finally {
+      uiStore.setLoading(false);
+    }
+  }, { scope: 'open-repo', serialize: true });
 };
 
 const handlePush = async () => {
+  let mutated = false;
   try {
-    await withRepoLock('push', async () => {
-      uiStore.setLoading(true, "Pushing changes to remote...", true);
+    uiStore.setLoading(true, "Pushing changes to remote...", true);
+    await withRepoLock('push', repoStore.repoInfo?.path, async () => {
       uiStore.clearError();
       await gitService.push();
       toast.success("Pushed successfully!", { title: "Success" });
-      await repoStore.refreshRepo();
-      uiStore.clearError();
     });
+    mutated = true;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handlePush();
-    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handlePush();
+    if (!mutated) {
+      setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
+    }
   } finally {
     uiStore.setLoading(false);
   }
 };
 
 const handlePull = async () => {
+  let mutated = false;
   try {
-    await withRepoLock('pull', async () => {
-      uiStore.setLoading(true, "Pulling from remote...", true);
+    uiStore.setLoading(true, "Pulling from remote...", true);
+    await withRepoLock('pull', repoStore.repoInfo?.path, async () => {
       uiStore.clearError();
       await gitService.pull();
       toast.success("Pulled successfully!", { title: "Success" });
-      await repoStore.refreshRepo();
-      uiStore.clearError();
     });
+    mutated = true;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handlePull();
-    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handlePull();
+    if (!mutated) {
+      setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
+    }
   } finally {
     uiStore.setLoading(false);
   }
@@ -357,19 +390,25 @@ const handleOAuthAuthenticated = (_user: { login: string; name: string | null; e
 };
 
 const handleFetch = async () => {
+  let mutated = false;
   try {
-    await withRepoLock('fetch', async () => {
-      uiStore.setLoading(true, "Fetching from remote...", false);
+    uiStore.setLoading(true, "Fetching from remote...", false);
+    await withRepoLock('fetch', repoStore.repoInfo?.path, async () => {
       uiStore.clearError();
       await gitService.fetch();
       toast.success("Fetch completed!", { title: "Success" });
-      await repoStore.refreshRepo();
-      uiStore.clearError();
     });
+    mutated = true;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleFetch();
-    setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handleFetch();
+    if (!mutated) {
+      setTimeout(() => refreshRepo().catch(err => console.error('Delayed refresh failed:', err)), 500);
+    }
   } finally {
     uiStore.setLoading(false);
   }
@@ -383,15 +422,21 @@ const handleStashSave = () => {
     inputType: 'textarea',
     required: false,
     onConfirm: async (message) => {
+      let mutated = false;
       try {
         uiStore.setLoading(true, "Saving stash...", false);
-        await gitService.stashSave(message || undefined);
+        await withRepoLock('stash-save', repoStore.repoInfo?.path, async () => {
+          await gitService.stashSave(message || undefined);
+        });
+        mutated = true;
         repoStore.selectedFile = null;
         await repoStore.refreshRepo();
         uiStore.clearError();
       } catch (err) {
         uiStore.setError(String(err));
-        uiStore.lastFailedOperation = async () => { await gitService.stashSave(message || undefined); };
+        uiStore.lastFailedOperation = mutated
+          ? async () => { await repoStore.refreshRepo(); }
+          : async () => { await gitService.stashSave(message || undefined); await repoStore.refreshRepo(); };
       } finally {
         uiStore.setLoading(false);
       }
@@ -427,10 +472,17 @@ const handleCommit = async () => {
     toast.error("Please select files to commit", { title: "Commit Error" });
     return;
   }
+  let mutated = false;
   try {
-    await withRepoLock('commit', async () => {
-      uiStore.setLoading(true, "Creating commit...", true);
+    uiStore.setLoading(true, "Creating commit...", true);
+    await withRepoLock('commit', repoStore.repoInfo?.path, async () => {
       uiStore.clearError();
+      // Re-check inside the lock: a queued earlier commit may have consumed
+      // the staged files already. Bail out quietly — nothing to commit.
+      if (!uiStore.amendCommit && repoStore.stagedFiles.length === 0) {
+        toast.error("Please select files to commit", { title: "Commit Error" });
+        return;
+      }
       if (uiStore.amendCommit) {
         await gitService.amendCommit(uiStore.commitMessage);
         toast.success("Commit amended successfully!", { title: "Success" });
@@ -441,12 +493,17 @@ const handleCommit = async () => {
       }
       uiStore.setCommitMessage("");
       repoStore.selectedFile = null;
-      await repoStore.refreshRepo();
-      uiStore.clearError();
     });
+    mutated = true;
+    await repoStore.refreshRepo();
+    uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleCommit();
+    // Never retry the mutation after it succeeded: that would create a
+    // duplicate commit. Retry only the refresh (B2).
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handleCommit();
   } finally {
     uiStore.setLoading(false);
   }
@@ -460,13 +517,20 @@ const handleRequestCreateBranch = (commit: CommitInfo) => {
     placeholder: 'feature/new-branch',
     required: true,
     onConfirm: async (name) => {
+      let mutated = false;
       try {
         uiStore.setLoading(true, '', false);
-        await gitService.createBranch(name, commit.sha);
+        await withRepoLock('create-branch', repoStore.repoInfo?.path, async () => {
+          await gitService.createBranch(name, commit.sha);
+        });
+        mutated = true;
         await repoStore.refreshRepo();
         toast.success(`Created branch ${name}`, { title: 'Success' });
       } catch (e) {
         uiStore.setError(String(e));
+        uiStore.lastFailedOperation = mutated
+          ? async () => { await repoStore.refreshRepo(); }
+          : async () => { await gitService.createBranch(name, commit.sha); await repoStore.refreshRepo(); };
       } finally {
         uiStore.setLoading(false);
       }
@@ -483,13 +547,20 @@ const handleRequestCreateTag = (commit: CommitInfo) => {
     secondLabel: 'Tag Message (optional)',
     secondPlaceholder: 'Describe this tag...',
     onConfirm: async (tagName, tagMessage) => {
+      let mutated = false;
       try {
         uiStore.setLoading(true, '', false);
-        await gitService.createTag(tagName, tagMessage || '', commit.sha);
+        await withRepoLock('create-tag', repoStore.repoInfo?.path, async () => {
+          await gitService.createTag(tagName, tagMessage || '', commit.sha);
+        });
+        mutated = true;
         await repoStore.refreshRepo();
         toast.success(`Created tag ${tagName}`, { title: 'Success' });
       } catch (e) {
         uiStore.setError(String(e));
+        uiStore.lastFailedOperation = mutated
+          ? async () => { await repoStore.refreshRepo(); }
+          : async () => { await gitService.createTag(tagName, tagMessage || '', commit.sha); await repoStore.refreshRepo(); };
       } finally {
         uiStore.setLoading(false);
       }
@@ -501,17 +572,21 @@ const handleRequestCreateTag = (commit: CommitInfo) => {
 const handleCherryPick = async (sha: string) => {
   const confirmed = await ask(`Cherry-pick commit ${sha.substring(0, 7)}?`, { title: 'Cherry-pick', kind: 'info' });
   if (!confirmed) return;
+  let mutated = false;
   try {
-    await withRepoLock('cherry-pick', async () => {
-      uiStore.setLoading(true, "Cherry-picking commit...", false);
+    uiStore.setLoading(true, "Cherry-picking commit...", false);
+    await withRepoLock('cherry-pick', repoStore.repoInfo?.path, async () => {
       await gitService.cherryPick(sha);
-      await repoStore.refreshRepo();
-      toast.success("Cherry-pick successful", { title: "Success" });
-      uiStore.clearError();
     });
+    mutated = true;
+    await repoStore.refreshRepo();
+    toast.success("Cherry-pick successful", { title: "Success" });
+    uiStore.clearError();
   } catch (e) {
     uiStore.setError(String(e));
-    uiStore.lastFailedOperation = async () => await handleCherryPick(sha);
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handleCherryPick(sha);
   } finally {
     uiStore.setLoading(false);
   }
@@ -520,17 +595,21 @@ const handleCherryPick = async (sha: string) => {
 const handleRevertCommit = async (sha: string) => {
   const confirmed = await ask(`Revert commit ${sha.substring(0, 7)}?`, { title: 'Revert Commit', kind: 'warning' });
   if (!confirmed) return;
+  let mutated = false;
   try {
-    await withRepoLock('revert', async () => {
-      uiStore.setLoading(true, "Reverting commit...", false);
+    uiStore.setLoading(true, "Reverting commit...", false);
+    await withRepoLock('revert', repoStore.repoInfo?.path, async () => {
       await gitService.revertCommit(sha);
-      await repoStore.refreshRepo();
-      toast.success("Revert successful", { title: "Success" });
-      uiStore.clearError();
     });
+    mutated = true;
+    await repoStore.refreshRepo();
+    toast.success("Revert successful", { title: "Success" });
+    uiStore.clearError();
   } catch (e) {
     uiStore.setError(String(e));
-    uiStore.lastFailedOperation = async () => await handleRevertCommit(sha);
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handleRevertCommit(sha);
   } finally {
     uiStore.setLoading(false);
   }
@@ -544,14 +623,20 @@ const handleRequestStashBranch = (stash: { sha: string; message: string }) => {
     placeholder: 'stash-branch',
     required: true,
     onConfirm: async (branchName) => {
+      let mutated = false;
       try {
         uiStore.setLoading(true, "Creating branch from stash...", false);
-        await gitService.branchFromStash(stash.sha, branchName);
+        await withRepoLock('stash-branch', repoStore.repoInfo?.path, async () => {
+          await gitService.branchFromStash(stash.sha, branchName);
+        });
+        mutated = true;
         await repoStore.refreshRepo();
         toast.success(`Branch ${branchName} created from stash`, { title: 'Success' });
       } catch (err) {
         uiStore.setError(String(err));
-        uiStore.lastFailedOperation = async () => await gitService.branchFromStash(stash.sha, branchName);
+        uiStore.lastFailedOperation = mutated
+          ? async () => { await repoStore.refreshRepo(); }
+          : async () => { await gitService.branchFromStash(stash.sha, branchName); await repoStore.refreshRepo(); };
       } finally {
         uiStore.setLoading(false);
       }
@@ -572,10 +657,6 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
           toast.error('Failed to copy path', { title: 'Clipboard Error' });
         }
       }
-    },
-    {
-      label: 'View File History',
-      action: () => uiStore.setSearchCommitQuery(filePath)
     },
     { divider: true },
     {
@@ -603,6 +684,12 @@ const onCommitFileContextMenu = (event: MouseEvent, filePath: string) => {
     }
   ]);
 };
+
+// Selected commit's diff, memoized so the filter (and DiffPanel's re-parse)
+// only re-runs when the diff list or selection actually changes (P4).
+const filteredCommitDiff = computed(() =>
+  repoStore.diffs.filter(d => d.path === repoStore.selectedCommitFile)
+);
 
 // ── Keyboard shortcuts ──
 useKeyboardShortcuts([
@@ -649,7 +736,7 @@ useKeyboardShortcuts([
     <div v-if="uiStore.showCloneModal || uiStore.showSettingsModal || uiStore.showBranchModal || uiStore.showTagsModal || uiStore.showRemotesModal || uiStore.showAuthModal" class="fixed inset-0 flex items-center justify-center z-[100] p-4" style="background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);">
       <CloneModal v-if="uiStore.showCloneModal" @browse="handleBrowseClonePath" @clone="handleCloneRepo" />
       <SettingsModal v-if="uiStore.showSettingsModal" />
-      <BranchModal v-if="uiStore.showBranchModal" @checkout="(name) => gitService.checkoutBranch(name).then(() => { uiStore.closeModal('branch'); repoStore.refreshRepo(); }).catch(err => { uiStore.setError(String(err)); })" @createBranch="() => gitService.createBranch(uiStore.newBranchName).then(() => { uiStore.setNewBranchName(''); uiStore.closeModal('branch'); repoStore.refreshRepo(); }).catch(err => { uiStore.setError(String(err)); })" />
+      <BranchModal v-if="uiStore.showBranchModal" />
       <TagsModal v-if="uiStore.showTagsModal" />
       <RemotesModal v-if="uiStore.showRemotesModal" />
       <AuthModal v-if="uiStore.showAuthModal" @close="uiStore.closeModal('auth')" @authenticated="handleOAuthAuthenticated" />
@@ -688,7 +775,7 @@ useKeyboardShortcuts([
           </button>
         </div>
 
-        <div class="flex-1 overflow-auto p-3">
+        <div class="flex-1 flex flex-col overflow-hidden p-3 min-h-0">
           <ChangesPanel v-if="uiStore.view === 'changes'" @toggleAllStaged="toggleAllStaged" @handleDiscardAllChanges="handleDiscardAllChanges" />
           <HistoryPanel v-else-if="uiStore.view === 'history'" @requestCreateBranch="handleRequestCreateBranch" @requestCreateTag="handleRequestCreateTag" />
           <StashPanel v-else-if="uiStore.view === 'stashes'" @requestStashBranch="handleRequestStashBranch" />
@@ -751,7 +838,7 @@ useKeyboardShortcuts([
 
             <!-- Right: Diff -->
             <div class="flex-1 overflow-auto bg-background">
-              <DiffPanel :diffs="repoStore.diffs.filter(d => d.path === repoStore.selectedCommitFile)" />
+              <DiffPanel :diffs="filteredCommitDiff" />
             </div>
           </div>
         </div>

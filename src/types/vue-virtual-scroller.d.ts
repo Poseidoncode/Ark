@@ -18,4 +18,26 @@ declare module 'vue-virtual-scroller' {
   }
 
   export const RecycleScroller: DefineComponent<RecycleScrollerProps>;
+
+  interface DynamicScrollerProps {
+    items: unknown[];
+    minItemSize?: number | string;
+    keyField?: string;
+    direction?: 'vertical' | 'horizontal';
+    listTag?: string;
+    itemTag?: string;
+    buffer?: number;
+    [key: string]: unknown;
+  }
+
+  interface DynamicScrollerItemProps {
+    item: unknown;
+    active: boolean;
+    dataIndex?: number;
+    sizeDependencies?: unknown[];
+    [key: string]: unknown;
+  }
+
+  export const DynamicScroller: DefineComponent<DynamicScrollerProps>;
+  export const DynamicScrollerItem: DefineComponent<DynamicScrollerItemProps>;
 }

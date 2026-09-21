@@ -6,7 +6,21 @@ const props = defineProps<{
   diffs: DiffInfo[];
 }>();
 
-const getLineType = (line: string): 'added' | 'deleted' | 'hunk' | 'normal' => {
+type LineType = 'added' | 'deleted' | 'hunk' | 'normal';
+
+interface ParsedLine {
+  text: string;
+  type: LineType;
+}
+
+interface ParsedDiff extends DiffInfo {
+  lines: { visible: ParsedLine[]; truncated: boolean; count: number };
+  ext: string;
+  extStyle: { background: string; color: string; border: string };
+  changeType: 'added' | 'deleted' | 'modified';
+}
+
+const getLineType = (line: string): LineType => {
   if (line.startsWith('+')) return 'added';
   if (line.startsWith('-')) return 'deleted';
   if (line.startsWith('@@')) return 'hunk';
@@ -14,38 +28,15 @@ const getLineType = (line: string): 'added' | 'deleted' | 'hunk' | 'normal' => {
 };
 
 const parseLine = (line: string) => {
-  if (!line) return '\u00A0';
+  if (!line) return ' ';
   const firstChar = line.charAt(0);
   if (firstChar === '+' || firstChar === '-' || firstChar === ' ') {
-    return line.substring(1) || '\u00A0';
+    return line.substring(1) || ' ';
   }
   return line;
 };
 
 const MAX_LINES_PER_FILE = 500;
-
-const getLines = (diffText: string) => {
-  const lines = diffText.split('\n');
-  if (lines.length > MAX_LINES_PER_FILE) {
-    return {
-      visible: lines.slice(0, MAX_LINES_PER_FILE),
-      truncated: true,
-      count: lines.length
-    };
-  }
-  return {
-    visible: lines,
-    truncated: false,
-    count: lines.length
-  };
-};
-
-const parsedDiffs = computed(() => {
-  return props.diffs.map(diff => ({
-    ...diff,
-    lines: getLines(diff.diff_text)
-  }));
-});
 
 const extColors: Record<string, string> = {
   ts: 'hsl(210, 80%, 55%)', tsx: 'hsl(210, 80%, 55%)',
@@ -58,22 +49,38 @@ const extColors: Record<string, string> = {
 const getExtColor = (ext: string) => extColors[ext] || 'hsl(0, 0%, 50%)';
 
 const getExtFileStyle = (path: string) => {
-  const color = getExtColor(getFileExt(path));
+  const parts = path.split('.');
+  const ext = parts.length > 1 ? parts[parts.length - 1].toLowerCase() : '';
+  const color = getExtColor(ext);
   const bg = color.replace(/(\d+)%/, '15%');
   const border = color.replace(/(\d+)%/, '25%');
-  return { background: bg, color, border: `1px solid ${border}` };
+  return { ext, style: { background: bg, color, border: `1px solid ${border}` } };
 };
 
-const getFileExt = (path: string) => {
-  const parts = path.split('.');
-  return parts.length > 1 ? parts[parts.length - 1].toLowerCase() : '';
-};
-
-const getChangeType = (diff: { additions: number; deletions: number }) => {
-  if (diff.additions > 0 && diff.deletions === 0) return 'added';
-  if (diff.deletions > 0 && diff.additions === 0) return 'deleted';
-  return 'modified';
-};
+// Everything the template needs is computed once per diff list — the old
+// template called getLineType() ~6x per line and restyled every file header
+// on each render (P3).
+const parsedDiffs = computed<ParsedDiff[]>(() => {
+  return props.diffs.map(diff => {
+    const rawLines = diff.diff_text.split('\n');
+    const lineCapped = rawLines.length > MAX_LINES_PER_FILE;
+    const visible = (lineCapped ? rawLines.slice(0, MAX_LINES_PER_FILE) : rawLines)
+      .map(raw => ({ text: parseLine(raw), type: getLineType(raw) }));
+    const { ext, style } = getExtFileStyle(diff.path);
+    const changeType = diff.additions > 0 && diff.deletions === 0
+      ? 'added'
+      : diff.deletions > 0 && diff.additions === 0
+        ? 'deleted'
+        : 'modified';
+    return {
+      ...diff,
+      lines: { visible, truncated: lineCapped, count: rawLines.length },
+      ext,
+      extStyle: style,
+      changeType,
+    };
+  });
+});
 </script>
 
 <template>
@@ -91,7 +98,7 @@ const getChangeType = (diff: { additions: number; deletions: number }) => {
   </div>
 
   <div v-else class="diff-viewer bg-background select-text">
-    <div v-for="(diff, i) in parsedDiffs" :key="i" class="diff-file border-b border-border last:border-b-0">
+    <div v-for="diff in parsedDiffs" :key="diff.path" class="diff-file border-b border-border last:border-b-0">
 
       <!-- File Header -->
       <div class="diff-file-header sticky top-0 z-10 flex items-center justify-between px-4 py-2.5 border-b border-border shadow-sm"
@@ -99,16 +106,16 @@ const getChangeType = (diff: { additions: number; deletions: number }) => {
         <div class="flex items-center gap-3 min-w-0">
           <!-- File type avatar -->
           <div class="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center text-[9px] font-bold uppercase"
-               :style="getExtFileStyle(diff.path)">
-            {{ getFileExt(diff.path) || 'f' }}
+               :style="diff.extStyle">
+            {{ diff.ext || 'f' }}
           </div>
 
           <!-- Change type indicator -->
           <div class="flex-shrink-0">
-            <span v-if="getChangeType(diff) === 'added'"
+            <span v-if="diff.changeType === 'added'"
                   class="badge text-[10px] px-1.5 py-0.5 rounded font-bold"
                   style="background: var(--success-bg); color: var(--success)">A</span>
-            <span v-else-if="getChangeType(diff) === 'deleted'"
+            <span v-else-if="diff.changeType === 'deleted'"
                   class="badge text-[10px] px-1.5 py-0.5 rounded font-bold"
                   style="background: var(--error-bg); color: var(--error)">D</span>
             <span v-else
@@ -138,19 +145,19 @@ const getChangeType = (diff: { additions: number; deletions: number }) => {
         <div v-for="(line, j) in diff.lines.visible" :key="j"
              class="flex group relative"
              :class="{
-               'diff-line-added': getLineType(line) === 'added',
-               'diff-line-deleted': getLineType(line) === 'deleted',
-               'diff-line-hunk': getLineType(line) === 'hunk',
-               'diff-line-normal': getLineType(line) === 'normal',
+               'diff-line-added': line.type === 'added',
+               'diff-line-deleted': line.type === 'deleted',
+               'diff-line-hunk': line.type === 'hunk',
+               'diff-line-normal': line.type === 'normal',
              }">
           <!-- Gutter indicator -->
           <span class="diff-gutter w-8 flex-shrink-0 select-none flex items-center justify-center text-[10px] font-bold"
                 :class="{
-                  'text-success opacity-90': getLineType(line) === 'added',
-                  'text-error opacity-90': getLineType(line) === 'deleted',
-                  'opacity-0': getLineType(line) === 'normal' || getLineType(line) === 'hunk',
+                  'text-success opacity-90': line.type === 'added',
+                  'text-error opacity-90': line.type === 'deleted',
+                  'opacity-0': line.type === 'normal' || line.type === 'hunk',
                 }">
-            {{ getLineType(line) === 'added' ? '+' : (getLineType(line) === 'deleted' ? '−' : '') }}
+            {{ line.type === 'added' ? '+' : (line.type === 'deleted' ? '−' : '') }}
           </span>
 
           <!-- Line number -->
@@ -160,17 +167,18 @@ const getChangeType = (diff: { additions: number; deletions: number }) => {
           </span>
 
           <!-- Line content -->
-          <span class="flex-1 px-3 py-0.5 whitespace-pre-wrap break-all" style="word-break: break-all;">{{ parseLine(line) }}</span>
+          <span class="flex-1 px-3 py-0.5 whitespace-pre-wrap break-all" style="word-break: break-all;">{{ line.text }}</span>
         </div>
 
         <!-- Truncation notice -->
-        <div v-if="diff.lines.truncated"
+        <div v-if="diff.lines.truncated || diff.truncated"
              class="flex items-center justify-center gap-2 py-4 text-[11px] border-t"
              style="color: var(--muted-foreground); border-color: var(--border); background: var(--muted);">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
           </svg>
-          Showing {{ MAX_LINES_PER_FILE }} of {{ diff.lines.count }} lines — file too large to display fully
+          <template v-if="diff.lines.truncated">Showing {{ MAX_LINES_PER_FILE }} of {{ diff.lines.count }} lines — file too large to display fully</template>
+          <template v-else>Diff text truncated by size limit — counts reflect the full diff</template>
         </div>
       </div>
     </div>

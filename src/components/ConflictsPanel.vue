@@ -4,23 +4,31 @@ import { useUIStore } from '../stores/ui';
 import { gitService, type ConflictInfo } from '../services/git';
 import { useToast } from '../composables/useToast';
 import { useContextMenu } from '../composables/useContextMenu';
+import { useRepoLock } from '../composables/useOperationMutex';
 import { openPath } from '@tauri-apps/plugin-opener';
 
 const repoStore = useRepoStore();
 const uiStore = useUIStore();
 const toast = useToast();
 const { showContextMenu } = useContextMenu();
+const { withRepoLock } = useRepoLock();
 
 const handleResolve = async (path: string, ours: boolean) => {
+  let mutated = false;
   try {
     uiStore.setLoading(true, "Resolving conflict...", false);
     uiStore.clearError();
-    await gitService.resolveConflict(path, ours);
+    await withRepoLock('resolve-conflict', repoStore.repoInfo?.path, async () => {
+      await gitService.resolveConflict(path, ours);
+    });
+    mutated = true;
     await repoStore.refreshRepo();
     uiStore.clearError();
   } catch (err) {
     uiStore.setError(String(err));
-    uiStore.lastFailedOperation = async () => await handleResolve(path, ours);
+    uiStore.lastFailedOperation = mutated
+      ? async () => { await repoStore.refreshRepo(); }
+      : async () => await handleResolve(path, ours);
   } finally {
     uiStore.setLoading(false);
   }
@@ -75,7 +83,7 @@ const onConflictContextMenu = (event: MouseEvent, conflict: ConflictInfo) => {
 </script>
 
 <template>
-  <div class="space-y-2">
+  <div class="flex-1 overflow-auto min-h-0 space-y-2">
     <div v-for="conflict in repoStore.conflicts" :key="conflict.path"
          @contextmenu.prevent="onConflictContextMenu($event, conflict)"
          class="p-3 bg-error/5 rounded-lg border border-error/20">
