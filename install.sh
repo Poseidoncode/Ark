@@ -46,6 +46,8 @@ fi
 cd src-tauri && cargo fetch && cd ..
 
 echo "Building $APP (this may take a while)..."
+# Remove stale bundle outputs: bundle_dmg.sh fails if a previous .dmg exists
+rm -rf src-tauri/target/release/bundle
 npx tauri build --ci
 
 fail() { echo "Build finished but no installer artifact found in $1" >&2; exit 1; }
