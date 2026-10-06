@@ -32,7 +32,7 @@ The install script requires the following tools to be installed beforehand:
 
 | Tool | macOS | Windows | Linux |
 |------|-------|---------|-------|
-| [Node.js](https://nodejs.org) ≥ 18 | ✅ | ✅ | ✅ |
+| [Node.js](https://nodejs.org) 22.22.2+ (22.x), 24.15.0+ (24.x), or ≥ 26 | ✅ | ✅ | ✅ |
 | [Rust](https://rustup.rs) (stable) | ✅ | ✅ | ✅ |
 | [Git](https://git-scm.com) | ✅ | ✅ | ✅ |
 
