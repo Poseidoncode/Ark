@@ -6,8 +6,14 @@ A modern, lightweight, and intuitive Git GUI client inspired by GitHub Desktop.
 
 ## 🚀 Quick Install
 
-The fastest way to install **Ark** is via our one-line install script.
-It auto-detects your operating system and builds a native bundle for you.
+The one-line script builds **Ark** from source on your machine.
+It downloads dependencies, compiles Rust, and packages a native bundle. The first
+release build can take many minutes, especially during compilation and linking.
+The script labels five stages: source download, npm dependencies, frontend build,
+Rust compilation, and installer packaging. npm download activity and verbose
+Tauri build output are shown live.
+Each stage prints its elapsed time every 30 seconds; this indicates that the
+command is still running, not that it is necessarily making progress.
 
 ### macOS / Linux
 
@@ -25,6 +31,17 @@ curl.exe -fsSL https://raw.githubusercontent.com/Poseidoncode/Ark/main/install.s
 > which provide the `sh` and `curl` utilities. Windows 10/11 ships with
 > `curl.exe` built-in — use `curl.exe` (not `curl`) to avoid aliasing to
 > `Invoke-WebRequest`.
+
+If a build fails or is interrupted, use the printed `cd ... && sh install.sh`
+command to retry in the same directory and reuse the Rust compilation cache.
+Running the curl command again outside that directory creates a fresh checkout.
+The build directory is kept after completion so the installer remains available.
+
+If Cargo prints `Blocking waiting for file lock on artifact directory`, another
+build is using the same output directory. `Ctrl+Z` suspends a build and can leave
+its lock held. In the original terminal, use `jobs -l` to identify suspended jobs
+and `fg %N` to resume one (replace `N` with its job number). Use `Ctrl+C` to cancel
+duplicate builds; keep only one build running. Do not delete the Cargo lock file.
 
 ### Prerequisites
 
