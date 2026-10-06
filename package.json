@@ -20,10 +20,10 @@
     "vue-virtual-scroller": "^2.0.0-beta.8"
   },
   "overrides": {
-    "minimatch": "9.0.7",
-    "js-cookie": "3.0.7",
-    "brace-expansion": "2.1.4",
-    "undici": "7.29.0"
+    "minimatch": "9.0.9",
+    "js-cookie": "3.0.8",
+    "brace-expansion": "2.1.7",
+    "undici": "7.30.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",
