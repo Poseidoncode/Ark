@@ -375,8 +375,8 @@ pub fn build_auth_header_envs(url: &str, token: Option<&str>) -> Vec<(&'static s
     }
     vec![
         ("GIT_CONFIG_COUNT", "1".to_string()),
-        ("GIT_CONFIG_KEY_1", "http.extraHeader".to_string()),
-        ("GIT_CONFIG_VALUE_1", format!("Authorization: Bearer {}", token)),
+        ("GIT_CONFIG_KEY_0", "http.extraHeader".to_string()),
+        ("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {}", token)),
     ]
 }
 
@@ -385,6 +385,35 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_auth_header_envs_are_accepted_by_git() {
+        let mut command = std::process::Command::new("git");
+        // Isolate command-level config without changing the test process environment.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_CONFIG_") {
+                command.env_remove(key);
+            }
+        }
+        let output = command
+            .envs(build_auth_header_envs(
+                "https://github.com/example/repo.git",
+                Some("test-token"),
+            ))
+            .args(["config", "--get", "http.extraHeader"])
+            .output()
+            .expect("git should be available");
+
+        assert!(
+            output.status.success(),
+            "git rejected auth config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "Authorization: Bearer test-token"
+        );
+    }
 
     fn get_temp_dir() -> PathBuf {
         let mut path = std::env::temp_dir();
